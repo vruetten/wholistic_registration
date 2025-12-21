@@ -1,5 +1,7 @@
-# Welcome to WHOLISTIC-registration
+# Welcome to WHOLISTIC-registration (vmsr branch)
 **A fast, accurate, and non-rigid image registration method for Whole-Body cellular activity Imaging.**
+
+> **Note**: This is the `vmsr` development branch with additional features and improvements.
 
 
 ## Introduction
