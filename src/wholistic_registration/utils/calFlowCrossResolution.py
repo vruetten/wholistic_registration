@@ -275,6 +275,19 @@ def compute_new_grid(grid, r, motion_shape):
 ####################################################################################################
 
 
+def _free_pool():
+    """Return cupy's cached (unreferenced) blocks to the device.
+
+    The continuous-reference sampler re-runs an order-3 spline prefilter on
+    every call, each leaving a full-volume temporary cached in the pool. Across
+    the many iterations / correction passes at the finest layer these caches add
+    up and can exhaust the device even though they are reclaimable. Calling this
+    at pass boundaries bounds the footprint. No-op when cupy is unavailable.
+    """
+    if hasattr(cp, "get_default_memory_pool"):
+        cp.get_default_memory_pool().free_all_blocks()
+
+
 def _softmax_stable(x, axis=-1, eps=1e-8):
     """
     Numerically stable softmax.
@@ -1866,6 +1879,53 @@ def compose_phase_from_motion(phase_current, motion_current, zRatio, zRatio_hr):
     return phase_new
 
 
+def imresize_xy(vol, out_x, out_y, method="bicubic", work_dtype=cp.float32, z_chunk=32):
+    """
+    Resize a 3D volume in X and Y only, keeping Z, processing Z in chunks.
+
+    This exists for memory reasons. ``imresize`` rescales all three axes at once
+    and, when downsampling, materialises an ``(out_x, P, Y, Z)`` gather buffer
+    spanning the *full* Y and Z (P grows with the downsample factor), which is
+    the dominant GPU peak that OOMs commodity cards on full-size reference
+    volumes.
+
+    Because this pipeline never rescales Z (moving Z = K, reference Z = Zref are
+    fixed across the pyramid), the Z pass of ``imresize`` is an identity cubic
+    resample. Resizing X/Y one Z-chunk at a time is therefore *exactly* equal to
+    the full 3D ``imresize`` (a given output plane depends only on the matching
+    input plane), but the gather buffer is bounded by ``z_chunk`` instead of Z.
+
+    Parameters
+    ----------
+    vol : cp.ndarray, shape (X, Y, Z)
+    out_x, out_y : int
+        Target X, Y sizes. Z is preserved.
+    z_chunk : int
+        Number of Z planes resized per iteration.
+
+    Returns
+    -------
+    cp.ndarray, shape (out_x, out_y, Z)
+    """
+    x_in, y_in, z_in = vol.shape
+    if (out_x, out_y) == (x_in, y_in):
+        return vol
+
+    out_dtype = vol.dtype if vol.dtype == cp.uint8 else work_dtype
+    out = cp.empty((out_x, out_y, z_in), dtype=out_dtype)
+
+    for z0 in range(0, z_in, int(z_chunk)):
+        z1 = min(z0 + int(z_chunk), z_in)
+        sub = vol[:, :, z0:z1]
+        out[:, :, z0:z1] = imresize(
+            sub, output_shape=(out_x, out_y, z1 - z0), method=method, work_dtype=work_dtype
+        )
+        if hasattr(cp, "get_default_memory_pool"):
+            cp.get_default_memory_pool().free_all_blocks()
+
+    return out
+
+
 def resample_exclude_mask(mask, output_shape, threshold=0.5):
     """
     Resize exclusion mask.
@@ -1886,7 +1946,16 @@ def resample_exclude_mask(mask, output_shape, threshold=0.5):
     mask_out : cp.ndarray, bool
         True = exclude, False = keep
     """
-    mask_rs = imresize(cp.asarray(mask, dtype=cp.float32), output_shape=output_shape)
+    mask = cp.asarray(mask, dtype=cp.float32)
+    out_x, out_y, out_z = output_shape
+    if (out_x, out_y, out_z) == tuple(mask.shape):
+        return mask > threshold
+    # Z is not rescaled in this pipeline; resize X/Y chunked over Z to bound the
+    # gather buffer (memory). Equivalent to a full imresize when out_z == in_z.
+    if out_z == mask.shape[2]:
+        mask_rs = imresize_xy(mask, out_x, out_y, work_dtype=cp.float32)
+    else:
+        mask_rs = imresize(mask, output_shape=output_shape, work_dtype=cp.float32)
     return mask_rs > threshold
 
 
@@ -2342,6 +2411,7 @@ def correct_wrong_regions_one_layer(
     # -----------------------------------------------------
     # Pass 2: robust rerun using corrected mask
     # -----------------------------------------------------
+    _free_pool()
     res1 = optimize_layer_cross_resolution(
         data_mov_layer=data_mov_layer,
         data_ref_layer=data_ref_layer,
@@ -2367,6 +2437,11 @@ def correct_wrong_regions_one_layer(
     # -----------------------------------------------------
     # Pass 3: refinement with original moving mask
     # -----------------------------------------------------
+    # The corrected-mask interpolant (and the full-volume masks behind it) are
+    # only needed for pass 2; drop them before the third pass to free a couple
+    # of full-reference-sized buffers at the finest layer.
+    del H_mask_ref_layer_corrected, corrected_mask_ref, trap_mask_ref
+    _free_pool()
     res2 = optimize_layer_cross_resolution(
         data_mov_layer=data_mov_layer,
         data_ref_layer=data_ref_layer,
@@ -2391,6 +2466,7 @@ def correct_wrong_regions_one_layer(
     # visualization.visualize_2d_image(res0["data_ref_sampled"].get(),title="first processed")
     # visualization.visualize_2d_image(res1["data_ref_sampled"].get(),title="after mask")
     # visualization.visualize_2d_image(res2["data_ref_sampled"].get(),title="removed mask")
+    _free_pool()
     current_error2 = res2["current_error"]
 
     if verbose:
@@ -2493,11 +2569,31 @@ def getMotion_v2(data_mov, data_ref, option, verbose=False):
         y_hr = int(SZ_HR[1] / (2**layer))
         z_hr = SZ_HR[2]
 
-        data_mov_layer = imresize(data_mov, output_shape=(x, y, z))
-        data_ref_layer = imresize(data_ref, output_shape=(x_hr, y_hr, z_hr))
+        # At the finest layer the resize target equals the source shape, so
+        # imresize is a (near) no-op cubic resample -- but it still allocates a
+        # large float64 temporary inside imresizevec, which is the dominant peak
+        # that OOMs commodity GPUs. Skip it there and otherwise drop back to
+        # float32 (imresize upcasts to float64) to halve the persistent layer
+        # arrays and the continuous-H interpolant built from them.
+        # Z is never rescaled (z == SZ[2], z_hr == SZ_HR[2]), so resize X/Y
+        # chunked over Z. This is exactly equivalent to a full imresize but
+        # bounds the multi-GB float64 gather buffer that otherwise OOMs the GPU
+        # when downsampling the full-size reference (see imresize_xy).
+        data_mov_layer = imresize_xy(data_mov, x, y, work_dtype=cp.float32)
+        data_ref_layer = imresize_xy(data_ref, x_hr, y_hr, work_dtype=cp.float32)
+
+        # Each imresize leaves a multi-GB gather buffer cached in the cupy pool.
+        # Return those cached blocks to the device between the (sequential)
+        # large resizes so the next one can allocate, instead of letting them
+        # accumulate to the full pyramid's worth of temporaries.
+        if hasattr(cp, "get_default_memory_pool"):
+            cp.get_default_memory_pool().free_all_blocks()
 
         mask_mov_layer = resample_exclude_mask(option["mask_mov"], output_shape=(x, y, z))
         mask_ref_layer = resample_exclude_mask(option["mask_ref"], output_shape=(x_hr, y_hr, z_hr))
+
+        if hasattr(cp, "get_default_memory_pool"):
+            cp.get_default_memory_pool().free_all_blocks()
 
         zRatio = zRatio_raw / (2**layer)
         zRatio_hr = zRatio_HR / (2**layer)
@@ -2587,6 +2683,15 @@ def getMotion_v2(data_mov, data_ref, option, verbose=False):
         motion_current = result["motion"]
         phase_new = result["phase_new"]
         data_ref_sampled = result["data_ref_sampled"]
+
+        # Release this layer's large temporaries (layer images, continuous
+        # interpolants, dense error maps held in `result`) before building the
+        # next, finer layer, so peak GPU memory tracks a single layer rather
+        # than accumulating across the whole pyramid.
+        del data_mov_layer, data_ref_layer, mask_mov_layer, mask_ref_layer
+        del H_ref_layer, H_mask_ref_layer, result
+        if hasattr(cp, "get_default_memory_pool"):
+            cp.get_default_memory_pool().free_all_blocks()
 
     # -----------------------------------------------------
     # Return as numpy
