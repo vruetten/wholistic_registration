@@ -768,9 +768,13 @@ def estimate_rest_state_motion(
     scale=5.0,
     use_gpu="auto",
     max_mad_t=21,
+    return_median=False,
 ):
     """
     Estimate resting-state motion fluctuation.
+
+    Uses Median Absolute Deviation (MAD) from a local spatiotemporal median:
+        restMotion = scale * 1.4826 * median(|motionMag - median_local|)
 
     If CuPy is available, use GPU median filters, matching the old implementation.
 
@@ -780,6 +784,10 @@ def estimate_rest_state_motion(
         Cap on the MAD temporal window. Default 21 prevents the MAD filter
         from becoming excessively expensive on long recordings (where
         T//4 could be 100+).
+    return_median : bool
+        If True, also return the local median motion (needed by getMotionUnit
+        when use_abs_dev=True, so abs_dev = |motionMag - median_local| can be
+        compared against restMotion instead of raw motionMag).
     """
     use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
 
@@ -807,7 +815,10 @@ def estimate_rest_state_motion(
         )
 
         rest_state_motion = scale * 1.4826 * mad_local
-        return cp.asnumpy(rest_state_motion).astype(np.float32)
+        result = cp.asnumpy(rest_state_motion).astype(np.float32)
+        if return_median:
+            return result, cp.asnumpy(median_local).astype(np.float32)
+        return result
 
     # CPU fallback
     median_local = ndi.median_filter(
@@ -824,7 +835,10 @@ def estimate_rest_state_motion(
         mode="reflect",
     )
 
-    return (scale * 1.4826 * mad_local).astype(np.float32)
+    result = (scale * 1.4826 * mad_local).astype(np.float32)
+    if return_median:
+        return result, median_local
+    return result
 
 
 def getMotionUnit(
@@ -835,6 +849,10 @@ def getMotionUnit(
     save_motion=False,
     use_gpu="auto",
     close_gap_frames=0,
+    use_abs_dev=True,
+    median_local=None,
+    median_window_t=21,
+    median_window_xy=5,
 ):
     """
     Extract active intervals for each patch.
@@ -853,6 +871,22 @@ def getMotionUnit(
         start/end detection. This merges nearby active intervals separated
         by gaps <= close_gap_frames, dramatically reducing CPU loop time
         when using noisy signals like cumulative displacement.
+    use_abs_dev : bool
+        If True (default), the active condition is:
+            |motionMag - median_local| > restMotion
+        i.e. deviation from local baseline exceeds MAD threshold.
+        If False (old behavior), the condition is:
+            motionMag > restMotion
+    median_local : ndarray or None
+        Precomputed local median of motionMag, shape (T, X, Y). Only used
+        when use_abs_dev=True. If None, it is computed inside this function.
+        Pass the second return value of estimate_rest_state_motion(..., return_median=True).
+    median_window_t : int
+        Temporal window for median_local computation (only used when
+        use_abs_dev=True and median_local is not provided).
+    median_window_xy : int
+        Spatial window for median_local computation (only used when
+        use_abs_dev=True and median_local is not provided).
     """
     use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
 
@@ -866,7 +900,21 @@ def getMotionUnit(
         motionMag_gpu = cp.asarray(motionMag_np)
         rest_gpu = cp.asarray(rest_np)
 
-        active = motionMag_gpu > rest_gpu  # (T, X, Y)
+        if use_abs_dev:
+            # active: deviation from local baseline exceeds threshold
+            if median_local is not None:
+                median_gpu = cp.asarray(median_local, dtype=np.float32)
+            else:
+                wt = int(max(3, min(int(median_window_t), T if T % 2 == 1 else max(T - 1, 3))))
+                median_gpu = cupy_ndi.median_filter(
+                    motionMag_gpu,
+                    size=(wt, int(median_window_xy), int(median_window_xy)),
+                    mode="reflect",
+                )
+            abs_dev_gpu = cp.abs(motionMag_gpu - median_gpu)
+            active = abs_dev_gpu > rest_gpu  # (T, X, Y)
+        else:
+            active = motionMag_gpu > rest_gpu  # (T, X, Y)
 
         # Merge nearby active gaps on GPU to reduce CPU loop iterations
         if close_gap_frames is not None and close_gap_frames > 0:
@@ -962,8 +1010,21 @@ def getMotionUnit(
 
         return units_map, active_mask
 
-    # CPU fallback: original simple version
-    active = motionMag_np > rest_np
+    # CPU fallback
+    if use_abs_dev:
+        if median_local is not None:
+            median_np = np.asarray(median_local, dtype=np.float32)
+        else:
+            wt = int(max(3, min(int(median_window_t), T if T % 2 == 1 else max(T - 1, 3))))
+            median_np = ndi.median_filter(
+                motionMag_np,
+                size=(wt, int(median_window_xy), int(median_window_xy)),
+                mode="reflect",
+            )
+        abs_dev_np = np.abs(motionMag_np - median_np)
+        active = abs_dev_np > rest_np
+    else:
+        active = motionMag_np > rest_np
 
     units_map = [[[] for _ in range(Y)] for _ in range(X)]
     active_mask = np.zeros((T, X, Y), dtype=bool)
@@ -1405,17 +1466,6 @@ def filter_episodes_artifacts(
 # =============================================================================
 
 
-def _second_diff_matrix(T):
-    if T < 3:
-        return np.zeros((0, T), dtype=np.float32)
-    D2 = np.zeros((T - 2, T), dtype=np.float32)
-    for i in range(T - 2):
-        D2[i, i] = 1.0
-        D2[i, i + 1] = -2.0
-        D2[i, i + 2] = 1.0
-    return D2
-
-
 def _initialize_modes_spatial_seed(Y_data, valid_coords, Kmax=4, rng=None, min_seed_dist=3.0, eps=1e-12):
     if rng is None:
         rng = np.random.default_rng(0)
@@ -1461,334 +1511,307 @@ def _initialize_modes_spatial_seed(Y_data, valid_coords, Kmax=4, rng=None, min_s
     return H.astype(np.float32), B.astype(np.float32), seeds
 
 
+def _normalize_spatial_coords(valid_coords, mask_shape):
+    """Map patch coordinates to [0, 1]^2 for a dimensionless compactness loss."""
+    coords = np.asarray(valid_coords, dtype=np.float64)
+    scale = np.maximum(np.asarray(mask_shape, dtype=np.float64) - 1.0, 1.0)
+    return (coords / scale[None, :]).astype(np.float64)
+
+
+def _normalize_H_rows(H, reference=None, eps=1e-12):
+    """Retract every row of H onto the unit sphere without rescaling B."""
+    H = np.asarray(H, dtype=np.float64).copy()
+    norms = np.linalg.norm(H, axis=1, keepdims=True)
+    bad = norms[:, 0] <= eps
+    if np.any(bad):
+        if reference is None:
+            raise ValueError("Cannot normalize a zero row of H without a reference.")
+        H[bad] = np.asarray(reference, dtype=np.float64)[bad]
+        norms = np.linalg.norm(H, axis=1, keepdims=True)
+    return H / np.maximum(norms, eps)
+
+
+def _compute_mode_centroids(B, spatial_coords, previous=None, eps=1e-12):
+    """Return the amplitude-weighted spatial centroid of every mode."""
+    B = np.asarray(B, dtype=np.float64)
+    coords = np.asarray(spatial_coords, dtype=np.float64)
+    N = B.shape[0] // 2
+    amplitude = np.hypot(B[:N], B[N:])
+    mass = np.sum(amplitude, axis=0)
+    centers = np.empty((B.shape[1], 2), dtype=np.float64)
+    for k in range(B.shape[1]):
+        if mass[k] > eps:
+            centers[k] = np.sum(amplitude[:, k, None] * coords, axis=0) / mass[k]
+        elif previous is not None:
+            centers[k] = np.asarray(previous, dtype=np.float64)[k]
+        else:
+            centers[k] = np.mean(coords, axis=0)
+    return centers
+
+
+def _spatial_compact_penalty(
+    B,
+    spatial_coords,
+    centers,
+    rho=1.0,
+    kappa=4.0,
+    B_scale=1.0,
+    eps=1e-12,
+):
+    """Dimensionless sparse-compact penalty and its per-patch weights."""
+    B = np.asarray(B, dtype=np.float64)
+    coords = np.asarray(spatial_coords, dtype=np.float64)
+    centers = np.asarray(centers, dtype=np.float64)
+    N = B.shape[0] // 2
+    K = B.shape[1]
+    amplitude = np.hypot(B[:N], B[N:])
+    distance_sq = np.sum((coords[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+    weights = float(rho) + float(kappa) * distance_sq
+    raw = float(np.sum(weights * amplitude) / max(N * K * B_scale, eps))
+    return raw, weights
+
+
 def _group_soft_threshold_B(B, thresh, eps=1e-12):
-    B = np.asarray(B, dtype=np.float32).copy()
+    """Weighted group soft-thresholding of each vector b_ik=(bx_ik, by_ik)."""
+    B = np.asarray(B, dtype=np.float64).copy()
     N2, K = B.shape
     N = N2 // 2
     Bx = B[:N, :]
     By = B[N:, :]
-    norm = np.sqrt(Bx ** 2 + By ** 2)
+    norm = np.hypot(Bx, By)
+    thresh = np.asarray(thresh, dtype=np.float64)
     scale = np.maximum(0.0, 1.0 - thresh / np.maximum(norm, eps))
     B[:N, :] = Bx * scale
     B[N:, :] = By * scale
     return B
 
 
-def _mode_column_soft_threshold_B(B, thresh, eps=1e-12):
-    B = np.asarray(B, dtype=np.float32).copy()
-    col_norm = np.linalg.norm(B, axis=0)
-    scale = np.maximum(0.0, 1.0 - thresh / np.maximum(col_norm, eps))
-    return B * scale[None, :]
+def _sparse_compact_objective(
+    M,
+    B,
+    H,
+    spatial_coords,
+    centers,
+    lambda_sc,
+    rho,
+    kappa,
+    B_scale,
+    total_energy,
+    eps=1e-12,
+):
+    residual = np.asarray(M, dtype=np.float64) - B @ H
+    recon = float(np.sum(residual ** 2) / total_energy)
+    compact_raw, _ = _spatial_compact_penalty(
+        B,
+        spatial_coords,
+        centers,
+        rho=rho,
+        kappa=kappa,
+        B_scale=B_scale,
+        eps=eps,
+    )
+    compact = float(lambda_sc) * compact_raw
+    return recon + compact, recon, compact, compact_raw
 
 
 def _fit_motion_modes_minimal(
     M,
     B,
     H,
-    lambda_B=0.05,
-    lambda_H=0.01,
-    lambda_mode=0.01,
-    max_iter=100,
+    spatial_coords,
+    lambda_sc=0.05,
+    rho=1.0,
+    kappa=4.0,
+    max_iter=200,
     tol=1e-4,
     verbose=True,
     eps=1e-12,
-    scaled_B_penalty=True,
     B_scale=None,
+    initial_centers=None,
+    max_backtracking=30,
 ):
-    M = np.asarray(M, dtype=np.float32)
-    B = np.asarray(B, dtype=np.float32)
-    H = np.asarray(H, dtype=np.float32)
+    """Fit reconstruction + sparse-compact loss with ||H[k]||_2 = 1.
+
+    The optimized objective is
+
+        ||M - B H||_F^2 / ||M||_F^2
+        + lambda_sc/(N K s_B) * sum_{i,k}
+          (rho + kappa ||r_i - mu_k||_2^2) ||b_ik||_2,
+
+    where r_i are normalized patch coordinates and mu_k is the
+    amplitude-weighted centroid of mode k.  There is deliberately no temporal
+    smoothness term, Ridge term, graph-Laplacian term, or mode-column penalty.
+
+    B is updated by weighted group-Lasso proximal gradient.  The centroids are
+    then updated exactly.  H is updated on a product of unit spheres using a
+    tangent gradient and row-normalization retraction.  Backtracking rejects
+    any block step that would increase the objective.
+    """
+    M = np.asarray(M, dtype=np.float64)
+    B = np.asarray(B, dtype=np.float64).copy()
+    H = _normalize_H_rows(H, eps=eps)
+    spatial_coords = np.asarray(spatial_coords, dtype=np.float64)
 
     N2, T = M.shape
     N = N2 // 2
     K = H.shape[0]
 
     if K == 0:
-        return B, H, []
-
-    D2 = _second_diff_matrix(T)
-    L = D2.T @ D2
+        return B.astype(np.float32), H.astype(np.float32), [], np.zeros((0, 2), dtype=np.float32)
+    if N2 != 2 * len(spatial_coords):
+        raise ValueError("spatial_coords must contain one coordinate for each B patch.")
+    if lambda_sc < 0 or rho < 0 or kappa < 0:
+        raise ValueError("lambda_sc, rho, and kappa must be non-negative.")
 
     total_energy = float(np.sum(M ** 2)) + eps
-
     if B_scale is None:
-        B_scale = _estimate_motion_scale_from_M(M, eps=eps)
+        B_scale = float(np.sqrt(T) * np.sqrt(np.mean(M ** 2)) + eps)
+    B_scale = max(float(B_scale), eps)
 
-    # ------------------------------------------------------------
-    # Convert normalized penalties to equivalent raw proximal lambdas
-    # ------------------------------------------------------------
-    if scaled_B_penalty:
-        # patch loss:
-        # lambda_B * mean_{i,k} ||b_ik / B_scale||
-        lambda_B_eff = lambda_B / (max(N * K * B_scale, eps))
-
-        # mode loss:
-        # lambda_mode * mean_k sqrt(mean_i ||b_ik / B_scale||^2)
-        # = lambda_mode / (K * sqrt(N) * B_scale) * sum_k ||B_k||
-        lambda_mode_eff = lambda_mode / (max(K * np.sqrt(max(N, 1)) * B_scale, eps))
+    if initial_centers is None:
+        centers = _compute_mode_centroids(B, spatial_coords, eps=eps)
     else:
-        lambda_B_eff = lambda_B
-        lambda_mode_eff = lambda_mode
+        centers = _compute_mode_centroids(
+            B,
+            spatial_coords,
+            previous=np.asarray(initial_centers, dtype=np.float64),
+            eps=eps,
+        )
 
+    loss, recon, compact, compact_raw = _sparse_compact_objective(
+        M, B, H, spatial_coords, centers, lambda_sc, rho, kappa,
+        B_scale, total_energy, eps=eps,
+    )
     loss_history = []
 
     for it in range(max_iter):
         B_old = B.copy()
         H_old = H.copy()
+        centers_old = centers.copy()
+        loss_old = loss
 
-        # -------------------------
-        # update B
-        # -------------------------
+        # B block: proximal gradient with the centroid held fixed.
         HHt = H @ H.T
-        step_B = 1.0 / (np.linalg.norm(HHt, ord=2) + eps)
-
-        # normalized reconstruction gradient
         grad_B = (2.0 / total_energy) * (B @ H - M) @ H.T
-
-        lip_B = (2.0 / total_energy) * np.linalg.norm(HHt, ord=2)
+        lip_B = (2.0 / total_energy) * float(np.linalg.norm(HHt, ord=2))
         step_B = 1.0 / (lip_B + eps)
-
-        B_tmp = B - step_B * grad_B
-
-        tau_patch = step_B * lambda_B_eff
-        tau_mode = step_B * lambda_mode_eff
-
-        B_tmp = _group_soft_threshold_B(
-            B_tmp,
-            tau_patch,
-            eps=eps,
+        _, spatial_weights = _spatial_compact_penalty(
+            B, spatial_coords, centers, rho=rho, kappa=kappa,
+            B_scale=B_scale, eps=eps,
         )
-
-        B = _mode_column_soft_threshold_B(
-            B_tmp,
-            tau_mode,
-            eps=eps,
-        )
-
-        # -------------------------
-        # update H
-        # -------------------------
-        smooth_norm = max(K * max(T - 2, 1), 1)
-
-        BtB = B.T @ B
-
-        lip_H = (
-            (2.0 / total_energy) * np.linalg.norm(BtB, ord=2)
-            + (2.0 * lambda_H / smooth_norm) * np.linalg.norm(L, ord=2)
-            + eps
-        )
-
-        step_H = 1.0 / lip_H
-
-        grad_H = (
-            (2.0 / total_energy) * B.T @ (B @ H - M)
-            + (2.0 * lambda_H / smooth_norm) * (H @ L)
-        )
-
-        H = H - step_H * grad_H
-        # normalize H and absorb scale into B
-        for k in range(K):
-            nrm = np.linalg.norm(H[k])
-            if nrm > eps:
-                H[k] /= nrm
-                B[:, k] *= nrm
-
-        # -------------------------
-        # diagnostics / loss logging
-        # -------------------------
-        R = M - B @ H
-
-        recon_raw = 0.5 * float(np.sum(R ** 2))
-        recon_norm = float(np.sum(R ** 2) / total_energy)
-
-        if scaled_B_penalty:
-            pen = _compute_B_penalties_scaled(
-                B,
-                lambda_B=lambda_B,
-                lambda_mode=lambda_mode,
-                B_scale=B_scale,
-                eps=eps,
+        fixed_center_loss = loss
+        accepted_B = False
+        for _ in range(max_backtracking):
+            threshold = (
+                step_B * float(lambda_sc) * spatial_weights
+                / max(N * K * B_scale, eps)
             )
-            patch_sparse = pen["patch_loss"]
-            mode_sparse = pen["mode_loss"]
-            raw_patch = pen["raw_patch"]
-            raw_mode = pen["raw_mode"]
-        else:
-            bmag = np.sqrt(B[:N, :] ** 2 + B[N:, :] ** 2 + eps)
-            patch_sparse = lambda_B * float(np.sum(bmag))
-            mode_sparse = lambda_mode * float(np.sum(np.linalg.norm(B, axis=0)))
-            raw_patch = float(np.sum(bmag))
-            raw_mode = float(np.sum(np.linalg.norm(B, axis=0)))
+            B_trial = _group_soft_threshold_B(B - step_B * grad_B, threshold, eps=eps)
+            trial_loss, _, _, _ = _sparse_compact_objective(
+                M, B_trial, H, spatial_coords, centers, lambda_sc, rho,
+                kappa, B_scale, total_energy, eps=eps,
+            )
+            if trial_loss <= fixed_center_loss + 1e-12:
+                B = B_trial
+                accepted_B = True
+                break
+            step_B *= 0.5
+        if not accepted_B:
+            step_B = 0.0
 
-        # smooth 也用 mean 打印，避免 T/K 不同导致不可比
-        if T >= 3:
-            smooth_raw = float(np.mean((H @ D2.T) ** 2))
-            smooth = lambda_H * smooth_raw
-        else:
-            smooth_raw = 0.0
-            smooth = 0.0
+        # mu block: this weighted mean is the exact minimizer for fixed B.
+        centers = _compute_mode_centroids(B, spatial_coords, previous=centers, eps=eps)
 
-        # 注意：这里的 loss 是 normalized diagnostic loss，不再是 raw loss
-        loss = recon_norm + patch_sparse + mode_sparse + smooth
-        loss_history.append(loss)
-
-        delta = float(
-            np.mean(np.abs(B - B_old))
-            + np.mean(np.abs(H - H_old))
+        # H block: Riemannian gradient step on ||H[k]||_2 = 1.
+        grad_H = (2.0 / total_energy) * B.T @ (B @ H - M)
+        grad_H_tangent = grad_H - np.sum(grad_H * H, axis=1, keepdims=True) * H
+        grad_H_norm_sq = float(np.sum(grad_H_tangent ** 2))
+        lip_H = (2.0 / total_energy) * float(np.linalg.norm(B.T @ B, ord=2))
+        step_H = 1.0 / (lip_H + eps)
+        before_H_loss, _, _, _ = _sparse_compact_objective(
+            M, B, H, spatial_coords, centers, lambda_sc, rho, kappa,
+            B_scale, total_energy, eps=eps,
         )
+        accepted_H = grad_H_norm_sq <= eps
+        if not accepted_H:
+            for _ in range(max_backtracking):
+                H_trial = _normalize_H_rows(
+                    H - step_H * grad_H_tangent,
+                    reference=H,
+                    eps=eps,
+                )
+                trial_loss, _, _, _ = _sparse_compact_objective(
+                    M, B, H_trial, spatial_coords, centers, lambda_sc,
+                    rho, kappa, B_scale, total_energy, eps=eps,
+                )
+                armijo_rhs = before_H_loss - 1e-4 * step_H * grad_H_norm_sq
+                if trial_loss <= armijo_rhs + 1e-12:
+                    H = H_trial
+                    accepted_H = True
+                    break
+                step_H *= 0.5
+        if not accepted_H:
+            step_H = 0.0
+
+        loss, recon, compact, compact_raw = _sparse_compact_objective(
+            M, B, H, spatial_coords, centers, lambda_sc, rho, kappa,
+            B_scale, total_energy, eps=eps,
+        )
+        if loss > loss_old + 1e-10:
+            B, H, centers = B_old, H_old, centers_old
+            loss, recon, compact, compact_raw = _sparse_compact_objective(
+                M, B, H, spatial_coords, centers, lambda_sc, rho, kappa,
+                B_scale, total_energy, eps=eps,
+            )
+            step_B = 0.0
+            step_H = 0.0
+
+        delta = float(np.mean(np.abs(B - B_old)) + np.mean(np.abs(H - H_old)))
+        relative_decrease = float((loss_old - loss) / max(abs(loss_old), eps))
+        h_norm_error = float(np.max(np.abs(np.linalg.norm(H, axis=1) - 1.0)))
+        loss_history.append({
+            "loss": float(loss),
+            "recon": float(recon),
+            "sparse_compact": float(compact),
+            "sparse_compact_raw": float(compact_raw),
+            "step_B": float(step_B),
+            "step_H": float(step_H),
+            "delta": delta,
+            "relative_decrease": relative_decrease,
+            "H_norm_error": h_norm_error,
+        })
 
         if verbose:
             print(
                 f"[mode fit] iter={it:03d}, "
-                f"loss={loss:.6f}, "
-                f"recon_raw={recon_raw:.6f}, "
-                f"recon_norm={recon_norm:.6e}, "
-                f"patch={patch_sparse:.6f}, "
-                f"mode={mode_sparse:.6f}, "
-                f"smooth={smooth:.6f}, "
-                f"raw_patch={raw_patch:.6f}, "
-                f"raw_mode={raw_mode:.6f}, "
-                f"B_scale={B_scale:.6f}, "
-                f"delta={delta:.3e}"
+                f"loss={loss:.6e}, recon={recon:.6e}, "
+                f"sparse_compact={compact:.6e}, "
+                f"delta={delta:.3e}, H_norm_error={h_norm_error:.2e}"
             )
 
-        if delta < tol:
+        if relative_decrease <= tol and delta <= np.sqrt(tol):
             break
 
-    return B.astype(np.float32), H.astype(np.float32), loss_history
+    return (
+        B.astype(np.float32),
+        H.astype(np.float32),
+        loss_history,
+        centers.astype(np.float32),
+    )
 
-def _merge_redundant_modes_by_activation(B, H, activation_corr_thresh=0.95, eps=1e-12):
-    B = np.asarray(B, dtype=np.float32)
-    H = np.asarray(H, dtype=np.float32)
-    K, T = H.shape
-    if K <= 1:
-        return B, H, [[0]] if K == 1 else []
-    Hn = H / np.maximum(np.linalg.norm(H, axis=1, keepdims=True), eps)
-    C = Hn @ Hn.T
-    parent = list(range(K))
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    for i in range(K):
-        for j in range(i + 1, K):
-            if abs(float(C[i, j])) >= activation_corr_thresh:
-                union(i, j)
-
-    groups_dict = {}
-    for k in range(K):
-        groups_dict.setdefault(find(k), []).append(k)
-    groups = list(groups_dict.values())
-    if len(groups) == K:
-        return B, H, groups
-
-    col_norm = np.linalg.norm(B, axis=0)
-    B_new, H_new = [], []
-    for members in groups:
-        if len(members) == 1:
-            k = members[0]
-            hk = H[k].copy()
-            bk = B[:, k].copy()
-            hn = np.linalg.norm(hk)
-            if hn > eps:
-                hk = hk / hn
-                bk = bk * hn
-            H_new.append(hk.astype(np.float32))
-            B_new.append(bk.astype(np.float32))
-            continue
-        ref = max(members, key=lambda x: col_norm[x])
-        h_ref = Hn[ref]
-        B_acc = np.zeros_like(B[:, 0], dtype=np.float32)
-        H_acc = np.zeros_like(H[0], dtype=np.float32)
-        w_sum = 0.0
-        for k in members:
-            sign = 1.0 if float(np.dot(h_ref, Hn[k])) >= 0 else -1.0
-            w = float(col_norm[k]) + eps
-            H_acc += w * sign * H[k]
-            B_acc += sign * B[:, k]
-            w_sum += w
-        h_new = H_acc / max(w_sum, eps)
-        hn = np.linalg.norm(h_new)
-        if hn < eps:
-            h_new = h_ref.copy()
-            hn = np.linalg.norm(h_new)
-        h_new = h_new / max(hn, eps)
-        H_new.append(h_new.astype(np.float32))
-        B_new.append(B_acc.astype(np.float32))
-    return np.stack(B_new, axis=1).astype(np.float32), np.stack(H_new, axis=0).astype(np.float32), groups
-
-
-def _prune_BH_modes(
-    B,
-    H,
-    M,
-    support_rel_thresh=0.10,
-    min_mode_mass=1e-3,
-    min_incremental_energy=0.005,
-    min_support_area=3,
-    max_mode_density=1.0,
-    eps=1e-12,
-):
-    B = np.asarray(B, dtype=np.float32)
-    H = np.asarray(H, dtype=np.float32)
-    M = np.asarray(M, dtype=np.float32)
-    N2, T = M.shape
-    N = N2 // 2
-    K = H.shape[0]
-    if K == 0:
-        return B, H, {}
-    strength = np.sqrt(B[:N, :] ** 2 + B[N:, :] ** 2)
-    mass = np.sum(strength, axis=0)
-    support_area = np.zeros(K, dtype=np.int32)
-    density = np.zeros(K, dtype=np.float32)
-    for k in range(K):
-        s = strength[:, k]
-        vmax = float(np.max(s))
-        if vmax > eps:
-            support = s > support_rel_thresh * vmax
-            support_area[k] = int(np.sum(support))
-            density[k] = float(support_area[k] / max(N, 1))
-    R_full = M - B @ H
-    err_full = float(np.sum(R_full ** 2))
-    total = float(np.sum(M ** 2)) + eps
-    incremental = np.zeros(K, dtype=np.float32)
-    for k in range(K):
-        B_wo = B.copy()
-        B_wo[:, k] = 0.0
-        err_wo = float(np.sum((M - B_wo @ H) ** 2))
-        incremental[k] = max(0.0, (err_wo - err_full) / total)
-    keep = []
-    for k in range(K):
-        if mass[k] < min_mode_mass:
-            continue
-        if incremental[k] < min_incremental_energy:
-            continue
-        if support_area[k] < min_support_area:
-            continue
-        if density[k] > max_mode_density:
-            continue
-        keep.append(k)
-    if len(keep) == 0:
-        keep = [int(np.argmax(incremental))]
-    keep = np.asarray(keep, dtype=np.int64)
-    info = {
-        "mode_mass": mass,
-        "support_area": support_area,
-        "density": density,
-        "incremental": incremental,
-        "keep": keep,
-        "K_before_prune": K,
-        "K_after_prune": len(keep),
-    }
-    return B[:, keep].astype(np.float32), H[keep, :].astype(np.float32), info
+def _hard_threshold_B(B, support_rel_thresh=0.08, eps=1e-12):
+    """Keep the existing post-fit relative hard-thresholding behavior."""
+    B = np.asarray(B, dtype=np.float32).copy()
+    N = B.shape[0] // 2
+    amplitude = np.hypot(B[:N], B[N:])
+    max_amplitude = np.max(amplitude, axis=0, keepdims=True)
+    support_mask = amplitude > support_rel_thresh * max_amplitude
+    support_mask[:, max_amplitude[0] <= eps] = False
+    drop = ~support_mask
+    removed_energy = float(np.sum(B[:N][drop] ** 2 + B[N:][drop] ** 2))
+    B[:N][drop] = 0.0
+    B[N:][drop] = 0.0
+    return B, support_mask, int(np.sum(drop)), removed_energy
 
 
 def _build_motion_modes_from_BH(
@@ -1801,11 +1824,10 @@ def _build_motion_modes_from_BH(
     episode_id,
     time_range,
     global_motion,
-    min_mode_mass=1e-3,
-    min_explained_energy=0.01,
     support_rel_thresh=0.10,
     eps=1e-12,
 ):
+    """Convert every post-threshold B/H component into a MotionMode."""
     N2, T = M.shape
     N = N2 // 2
     K = H.shape[0]
@@ -1816,20 +1838,16 @@ def _build_motion_modes_from_BH(
         response_compact = np.stack([B[:N, k], B[N:, k]], axis=1).astype(np.float32)
         strength = np.linalg.norm(response_compact, axis=1)
         mass = float(np.sum(strength))
-        if mass < min_mode_mass:
-            continue
         Mk = B[:, [k]] @ H[[k], :]
         explained = float(np.sum(Mk ** 2) / total_energy)
-        if explained < min_explained_energy:
-            continue
         field = np.zeros((X, Y, 2), dtype=np.float32)
         A = np.zeros((X, Y), dtype=np.float32)
         for idx, (r, c) in enumerate(valid_coords):
             field[r, c, :] = response_compact[idx]
             A[r, c] = strength[idx]
-        vmax = float(np.max(A))
-        support = A > support_rel_thresh * vmax if vmax > eps else np.zeros((X, Y), dtype=bool)
-        direction = field / np.maximum(A[:, :, None], eps)
+        support = A > eps
+        direction = np.zeros_like(field, dtype=np.float32)
+        direction[support] = field[support] / A[support, None]
         h = H[k].astype(np.float32)
         recon_k = h[:, None, None] * response_compact[None, :, :]
         resid_k = Y_data - recon_k
@@ -1854,7 +1872,11 @@ def _build_motion_modes_from_BH(
             mode_mass=mass,
             seed_position=seed_position,
             confidence=1.0,
-            metadata={"support_rel_thresh": support_rel_thresh, "model": "motion_mode_B"},
+            metadata={
+                "support_rel_thresh": support_rel_thresh,
+                "model": "motion_mode_sparse_compact",
+                "postprocessing": "hard_threshold_only",
+            },
         )
         modes.append(mode)
     return modes
@@ -1876,182 +1898,6 @@ def _compute_recon_r2(M, B, H, eps=1e-12):
     return 1.0 - loss / energy
 
 
-def _normalize_BH(B, H, eps=1e-8):
-    """
-    Normalize each row of H to unit norm and absorb scale into B columns.
-
-    B: (D, K)
-    H: (K, T)
-    """
-    B = np.asarray(B, dtype=np.float32).copy()
-    H = np.asarray(H, dtype=np.float32).copy()
-
-    K = H.shape[0]
-    for k in range(K):
-        n = float(np.linalg.norm(H[k]))
-        if n > eps:
-            H[k] /= n
-            B[:, k] *= n
-
-    return B, H
-
-
-def _activation_merge_groups(H, activation_merge_thresh=0.95, eps=1e-8):
-    """
-    Build merge groups using sign-invariant cosine similarity between activations.
-
-    H: (K, T)
-    """
-    H = np.asarray(H, dtype=np.float32)
-    K = H.shape[0]
-
-    Hn = H / np.maximum(np.linalg.norm(H, axis=1, keepdims=True), eps)
-    sim = np.abs(Hn @ Hn.T)
-
-    parent = list(range(K))
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    for i in range(K):
-        for j in range(i + 1, K):
-            if sim[i, j] >= activation_merge_thresh:
-                union(i, j)
-
-    groups_dict = {}
-    for k in range(K):
-        groups_dict.setdefault(find(k), []).append(k)
-
-    groups = list(groups_dict.values())
-    return groups, sim
-
-
-def _rank1_merge_one_group(B_group, H_group, eps=1e-8):
-    """
-    Merge one group by finding the best rank-1 approximation to:
-
-        M_group = B_group @ H_group
-
-    B_group: (D, Kg)
-    H_group: (Kg, T)
-
-    Return:
-        b_new: (D,)
-        h_new: (T,)
-        rel_err: rank-1 reconstruction relative error of this group
-    """
-    M_group = B_group @ H_group  # (D, T)
-
-    energy = float(np.sum(M_group * M_group)) + eps
-    if energy <= eps:
-        D, _ = B_group.shape
-        T = H_group.shape[1]
-        return np.zeros(D, dtype=np.float32), np.zeros(T, dtype=np.float32), 1.0
-
-    # Since T is usually small, SVD of (D,T) is acceptable.
-    U, S, Vt = np.linalg.svd(M_group, full_matrices=False)
-
-    b_new = (U[:, 0] * S[0]).astype(np.float32)  # (D,)
-    h_new = Vt[0].astype(np.float32)             # (T,)
-
-    M_rank1 = b_new[:, None] @ h_new[None, :]
-    err = float(np.sum((M_group - M_rank1) ** 2))
-    rel_err = err / energy
-
-    return b_new, h_new, rel_err
-
-
-def _refit_B_given_H(M, H, ridge=1e-6):
-    """
-    Given M and H, solve optimal B in least squares sense:
-
-        min_B ||M - B H||_F^2
-
-    B = M H^T (H H^T + ridge I)^(-1)
-
-    M: (D, T)
-    H: (K, T)
-
-    Return:
-        B: (D, K)
-    """
-    H = np.asarray(H, dtype=np.float32)
-    M = np.asarray(M, dtype=np.float32)
-
-    K = H.shape[0]
-    gram = H @ H.T
-    gram = gram + ridge * np.eye(K, dtype=np.float32)
-
-    rhs = M @ H.T  # (D, K)
-
-    # Solve gram.T X.T = rhs.T
-    B = np.linalg.solve(gram.T, rhs.T).T
-    return B.astype(np.float32)
-
-def _select_elbow_k_from_curve(K_values, r2_values, target_r2=0.98):
-    """
-    Select K by:
-    1. If target_r2 is reached, choose the smallest K reaching it.
-    2. Otherwise use geometric elbow: max distance to line between endpoints.
-    """
-    K_values = np.asarray(K_values, dtype=np.float32)
-    r2_values = np.asarray(r2_values, dtype=np.float32)
-
-    valid = np.isfinite(r2_values)
-    K_values = K_values[valid]
-    r2_values = r2_values[valid]
-
-    if len(K_values) == 0:
-        raise ValueError("No valid K/R2 values for K selection.")
-
-    # Rule 1: smallest K reaching target R2
-    hit = np.where(r2_values >= target_r2)[0]
-    if len(hit) > 0:
-        idx = int(hit[0])
-        return int(K_values[idx]), {
-            "method": "target_r2",
-            "target_r2": float(target_r2),
-            "selected_idx": idx,
-        }
-
-    # Rule 2: geometric elbow
-    if len(K_values) <= 2:
-        idx = int(np.argmax(r2_values))
-        return int(K_values[idx]), {
-            "method": "best_r2_fallback",
-            "selected_idx": idx,
-        }
-
-    x = (K_values - K_values.min()) / (K_values.max() - K_values.min() + 1e-12)
-    y = (r2_values - r2_values.min()) / (r2_values.max() - r2_values.min() + 1e-12)
-
-    p0 = np.array([x[0], y[0]], dtype=np.float32)
-    p1 = np.array([x[-1], y[-1]], dtype=np.float32)
-
-    line = p1 - p0
-    line_norm = np.linalg.norm(line) + 1e-12
-
-    dists = []
-    for xi, yi in zip(x, y):
-        p = np.array([xi, yi], dtype=np.float32)
-        dist = abs(np.cross(line, p - p0)) / line_norm
-        dists.append(dist)
-
-    idx = int(np.argmax(dists))
-    return int(K_values[idx]), {
-        "method": "geometric_elbow",
-        "selected_idx": idx,
-        "target_r2": float(target_r2),
-    }
-
 def _select_K_by_svd_energy(
     M,
     target_r2=0.85,
@@ -2070,6 +1916,8 @@ def _select_K_by_svd_energy(
     info : dict
     """
     M = np.asarray(M, dtype=np.float32)
+    if M.ndim != 2 or min(M.shape) == 0:
+        raise ValueError("M must be a non-empty two-dimensional matrix.")
 
     U, S, Vt = np.linalg.svd(M, full_matrices=False)
 
@@ -2084,7 +1932,7 @@ def _select_K_by_svd_energy(
     else:
         Kmax_eff = min(int(Kmax), rank_max)
 
-    K_min = max(1, int(K_min))
+    K_min = min(max(1, int(K_min)), rank_max)
     Kmax_eff = max(K_min, Kmax_eff)
 
     selected_K = Kmax_eff
@@ -2121,443 +1969,87 @@ def _select_K_by_svd_energy(
 
     return int(selected_K), info
 
-def _sweep_K_for_episode_modes(
-    M,
-    Y_data,
-    valid_coords,
-    Kmax=20,
-    K_min=1,
-    K_list=None,
-    n_init=3,
-    short_iter=10,
-    lambda_B=0.001,
-    lambda_H=0.05,
-    lambda_mode=0.005,
-    tol=1e-4,
-    target_r2=0.98,
-    verbose=True,
-    random_state=0,
-    eps=1e-12,
-):
-    """
-    Try different K and choose an elbow/target K.
-
-    For each K:
-        run n_init initializations
-        fit only short_iter
-        keep best R2
-    """
-    rng = np.random.default_rng(random_state)
-
-    if K_list is None:
-        K_list = list(range(K_min, Kmax + 1))
-    else:
-        K_list = [int(k) for k in K_list if int(k) >= K_min and int(k) <= Kmax]
-
-    records = []
-    best_by_K = {}
-
-    B_scale = _estimate_motion_scale_from_M(M, eps=eps)
-
-    for K in K_list:
-        best = None
-
-        for s in range(n_init):
-            seed = int(rng.integers(0, 2**31 - 1))
-            local_rng = np.random.default_rng(seed)
-
-            H0, B0, seeds = _initialize_modes_spatial_seed(
-                Y_data,
-                valid_coords,
-                Kmax=K,
-                rng=local_rng,
-                eps=eps,
-            )
-
-            if short_iter > 0:
-                B_fit, H_fit, loss_hist = _fit_motion_modes_minimal(
-                    M,
-                    B0,
-                    H0,
-                    lambda_B=lambda_B,
-                    lambda_H=lambda_H,
-                    lambda_mode=lambda_mode,
-                    max_iter=short_iter,
-                    tol=tol,
-                    verbose=False,
-                    eps=eps,
-                    scaled_B_penalty=True,
-                    B_scale=B_scale,
-                )
-            else:
-                B_fit, H_fit = B0, H0
-                loss_hist = []
-
-            r2 = _compute_recon_r2_from_BH(M, B_fit, H_fit, eps=eps)
-            recon_norm = _compute_recon_loss_normalized(M, B_fit, H_fit, eps=eps)
-
-            pen = _compute_B_penalties_scaled(
-                B_fit,
-                lambda_B=lambda_B,
-                lambda_mode=lambda_mode,
-                B_scale=B_scale,
-                eps=eps,
-            )
-
-            rec = {
-                "K": int(K),
-                "seed": seed,
-                "r2": float(r2),
-                "recon_norm": float(recon_norm),
-                "patch_loss_scaled": float(pen["patch_loss"]),
-                "mode_loss_scaled": float(pen["mode_loss"]),
-                "raw_patch_scaled": float(pen["raw_patch"]),
-                "raw_mode_scaled": float(pen["raw_mode"]),
-                "B": B_fit,
-                "H": H_fit,
-                "seeds": seeds,
-                "loss_history": loss_hist,
-            }
-
-            if best is None or rec["r2"] > best["r2"]:
-                best = rec
-
-        best_by_K[K] = best
-        records.append({
-            k: v for k, v in best.items()
-            if k not in ("B", "H", "seeds", "loss_history")
-        })
-
-        if verbose:
-            print(
-                f"[K sweep] K={K:02d}, "
-                f"best_R2={best['r2']:.6f}, "
-                f"recon_norm={best['recon_norm']:.6e}, "
-                f"patch={best['patch_loss_scaled']:.6f}, "
-                f"mode={best['mode_loss_scaled']:.6f}"
-            )
-
-    K_values = [r["K"] for r in records]
-    r2_values = [r["r2"] for r in records]
-
-    selected_K, select_info = _select_elbow_k_from_curve(
-        K_values,
-        r2_values,
-        target_r2=target_r2,
-    )
-
-    selected = best_by_K[selected_K]
-
-    if verbose:
-        print(
-            f"[K selected] K={selected_K}, "
-            f"method={select_info['method']}, "
-            f"R2={selected['r2']:.6f}"
-        )
-
-    return selected_K, selected, {
-        "records": records,
-        "select_info": select_info,
-        "K_values": K_values,
-        "r2_values": r2_values,
-    }
-
-def _merge_modes_reconstruction_preserving(
-    M,
-    B,
-    H,
-    groups,
-    ridge=1e-6,
-    max_r2_drop=0.03,
-    max_group_rank1_error=0.20,
-    reject_bad_groups=True,
-    verbose=True,
-):
-    """
-    Reconstruction-preserving merge.
-
-    Steps:
-        1. For each proposed group, approximate its original contribution
-           B_group @ H_group by one rank-1 mode.
-        2. Stack merged H.
-        3. Given merged H, solve optimal B by least squares.
-        4. Reject merge if global R2 drop is too large.
-
-    Parameters
-    ----------
-    M : (D, T)
-    B : (D, K)
-    H : (K, T)
-    groups : list[list[int]]
-        Proposed groups from activation similarity.
-    max_r2_drop : float
-        Maximum allowed drop in reconstruction R2 after merge initialization.
-        If exceeded, fall back to no merge.
-    max_group_rank1_error : float
-        If one proposed group is not well approximated by rank-1, optionally
-        keep its members separate.
-    reject_bad_groups : bool
-        If True, a proposed group with high rank-1 error will not be merged.
-    """
-    M = np.asarray(M, dtype=np.float32)
-    B = np.asarray(B, dtype=np.float32)
-    H = np.asarray(H, dtype=np.float32)
-
-    B, H = _normalize_BH(B, H)
-
-    recon_before = _compute_recon_loss(M, B, H)
-    r2_before = _compute_recon_r2(M, B, H)
-
-    final_B_cols = []
-    final_H_rows = []
-    final_groups = []
-    group_errors = []
-
-    for group in groups:
-        group = list(group)
-
-        if len(group) == 1:
-            k = group[0]
-            final_B_cols.append(B[:, k].copy())
-            final_H_rows.append(H[k].copy())
-            final_groups.append(group)
-            group_errors.append(0.0)
-            continue
-
-        B_group = B[:, group]       # (D, Kg)
-        H_group = H[group, :]       # (Kg, T)
-
-        b_new, h_new, rel_err = _rank1_merge_one_group(B_group, H_group)
-        group_errors.append(float(rel_err))
-
-        if reject_bad_groups and rel_err > max_group_rank1_error:
-            # This group cannot be represented well by one merged mode.
-            # Keep members separate.
-            for k in group:
-                final_B_cols.append(B[:, k].copy())
-                final_H_rows.append(H[k].copy())
-                final_groups.append([k])
-        else:
-            final_B_cols.append(b_new)
-            final_H_rows.append(h_new)
-            final_groups.append(group)
-
-    B_init = np.stack(final_B_cols, axis=1).astype(np.float32)  # (D,Knew)
-    H_init = np.stack(final_H_rows, axis=0).astype(np.float32)  # (Knew,T)
-
-    B_init, H_init = _normalize_BH(B_init, H_init)
-
-    # Important: after choosing merged H, recompute globally optimal B.
-    B_ls = _refit_B_given_H(M, H_init, ridge=ridge)
-    B_ls, H_init = _normalize_BH(B_ls, H_init)
-
-    recon_after = _compute_recon_loss(M, B_ls, H_init)
-    r2_after = _compute_recon_r2(M, B_ls, H_init)
-    r2_drop = r2_before - r2_after
-
-    accepted = True
-    if r2_drop > max_r2_drop:
-        # Merge destroys too much reconstruction. Fall back to original modes.
-        accepted = False
-        B_out, H_out = B, H
-        final_groups = [[k] for k in range(H.shape[0])]
-        recon_after = recon_before
-        r2_after = r2_before
-    else:
-        B_out, H_out = B_ls, H_init
-
-    diag = {
-        "accepted": bool(accepted),
-        "K_before": int(H.shape[0]),
-        "K_after": int(H_out.shape[0]),
-        "recon_before": float(recon_before),
-        "recon_after_init": float(recon_after),
-        "r2_before": float(r2_before),
-        "r2_after_init": float(r2_after),
-        "r2_drop": float(r2_drop),
-        "group_rank1_errors": group_errors,
-        "groups": final_groups,
-    }
-
-    if verbose:
-        print(
-            "[recon-preserving merge] "
-            f"K {diag['K_before']} -> {diag['K_after']}, "
-            f"accepted={diag['accepted']}, "
-            f"recon {diag['recon_before']:.4f} -> {diag['recon_after_init']:.4f}, "
-            f"R2 {diag['r2_before']:.4f} -> {diag['r2_after_init']:.4f}, "
-            f"R2_drop={diag['r2_drop']:.4f}"
-        )
-
-    return B_out, H_out, final_groups, diag
-
-def _estimate_motion_scale_from_M(M, eps=1e-12):
-    """
-    Estimate a natural motion scale from M.
-    M: (2N, T)
-    """
-    M = np.asarray(M, dtype=np.float32)
-    return float(np.sqrt(np.mean(M ** 2)) + eps)
-
-def _compute_B_penalties_scaled(
-    B,
-    lambda_B=0.001,
-    lambda_mode=0.005,
-    B_scale=1.0,
-    eps=1e-12,
-):
-    """
-    Compute normalized patch/mode penalties from B.
-
-    B: (2N, K)
-    B_scale: typical motion scale. We penalize B / B_scale.
-
-    patch penalty:
-        mean_{i,k} ||b_ik / B_scale||
-
-    mode penalty:
-        mean_k sqrt(mean_i ||b_ik / B_scale||^2)
-    """
-    B = np.asarray(B, dtype=np.float32)
-    D, K = B.shape
-    N = D // 2
-
-    Bx = B[:N, :]
-    By = B[N:, :]
-
-    bmag = np.sqrt(Bx ** 2 + By ** 2 + eps) / max(B_scale, eps)  # (N, K)
-
-    raw_patch = float(np.mean(bmag))
-    patch_loss = float(lambda_B * raw_patch)
-
-    mode_rms = np.sqrt(np.mean(bmag ** 2, axis=0) + eps)  # (K,)
-    raw_mode = float(np.mean(mode_rms))
-    mode_loss = float(lambda_mode * raw_mode)
-
-    return {
-        "raw_patch": raw_patch,
-        "patch_loss": patch_loss,
-        "raw_mode": raw_mode,
-        "mode_loss": mode_loss,
-        "B_scale": float(B_scale),
-        "B_abs_mean": float(np.mean(np.sqrt(Bx ** 2 + By ** 2 + eps))),
-        "B_abs_max": float(np.max(np.sqrt(Bx ** 2 + By ** 2 + eps))),
-    }
-
-def _compute_recon_r2_from_BH(M, B, H, eps=1e-12):
-    R = M - B @ H
-    sse = float(np.sum(R ** 2))
-    total = float(np.sum(M ** 2)) + eps
-    return 1.0 - sse / total
-
-def _compute_recon_loss_normalized(M, B, H, eps=1e-12):
-    """
-    Normalized reconstruction error:
-        ||M - BH||^2 / ||M||^2
-    """
-    R = M - B @ H
-    return float(np.sum(R ** 2) / (np.sum(M ** 2) + eps))
-
 def decompose_episode_motion_modes(
     episode: MotionEpisode,
     Kmax=4,
-    lambda_B=0.05,
-    lambda_H=0.01,
-    lambda_mode=0.01,
-    max_iter=100,
+    lambda_sc=0.05,
+    rho=1.0,
+    kappa=4.0,
+    max_iter=200,
     tol=1e-4,
-    min_mode_mass=1e-3,
-    min_explained_energy=0.01,
-    min_incremental_energy=0.005,
-    min_support_area=3,
-    max_mode_density=1.0,
-    support_rel_thresh=0.10,
+    support_rel_thresh=0.08,
 
     # K selection
-    K_selection_method="svd",   # "svd", "sweep", or "fixed"
+    K_selection_method="svd",   # "svd" or "fixed"
     K_min=1,
-    K_list=None,
-    K_sweep_n_init=3,
-    K_sweep_short_iter=10,
 
     # SVD K selection
     svd_target_r2=0.85,
 
-    # old sweep target, only used when K_selection_method="sweep"
-    target_r2=0.90,
-
-    # normalized B penalty
-    scaled_B_penalty=True,
-
-    # merge control
-    merge_redundant_modes=True,
-    activation_merge_thresh=0.98,
-    merge_ridge=1e-6,
-    max_merge_r2_drop=0.03,
-    max_group_rank1_error=0.20,
-    reject_bad_merge_groups=True,
-
-    refine_after_merge=True,
-    final_refine_after_prune=True,
     verbose=True,
     random_state=0,
     use_velocity=False,
 ):
     """
-    Decompose one MotionEpisode into MotionModes.
+    Decompose one MotionEpisode with reconstruction + sparse-compact loss.
 
-    Model:
-        M ≈ B @ H
+    Optimization model:
+        min_{B,H,mu} ||M-BH||_F^2 / ||M||_F^2
+            + lambda_sc/(N K s_B) sum_{i,k}
+              (rho + kappa ||r_i-mu_k||_2^2) ||b_ik||_2
+        subject to ||H[k]||_2 = 1 for every k.
 
-    where:
+    Pipeline:
+        1. Prepare the episode motion matrix M.
+        2. Select K and initialize B/H from spatial seeds.
+        3. Alternate weighted group-Lasso B updates, exact centroid updates,
+           and unit-sphere H updates.  No temporal smoothness is used.
+        4. Keep the existing relative hard-threshold on B after optimization.
+        5. Convert all K components to MotionMode objects.
+
+    Model dimensions:
         M: (2N, T)
         B: (2N, K)
         H: (K, T)
-
-    Parameters
-    ----------
-    use_velocity : bool
-        If False (default), use episode.motion_abs (cumulative displacement)
-        for mode decomposition.
-        If True, use episode.motion_delta (frame-to-frame velocity) instead.
-
-    Main change:
-        Redundant modes are no longer directly merged by averaging.
-        We first propose merge groups from activation similarity,
-        then perform reconstruction-preserving merge.
     """
 
+    # ------------------------------------------------------------------
+    # 1. Validate and select the motion field
+    # ------------------------------------------------------------------
     if use_velocity:
         if episode.motion_delta is None:
             raise ValueError(
                 "episode.motion_delta is required when use_velocity=True."
             )
-        _motion_field_name = "motion_delta (velocity)"
+        motion_data = np.asarray(episode.motion_delta, dtype=np.float32)
+        motion_field_name = "motion_delta (velocity)"
     else:
         if episode.motion_abs is None:
             raise ValueError(
-                "episode.motion_abs is required for motion mode decomposition."
+                "episode.motion_abs is required when use_velocity=False."
             )
-        _motion_field_name = "motion_abs (cumulative displacement)"
+        motion_data = np.asarray(episode.motion_abs, dtype=np.float32)
+        motion_field_name = "motion_abs (cumulative displacement)"
 
     if episode.global_motion is None:
-        raise ValueError("episode.global_motion is required for motion mode decomposition.")
+        raise ValueError(
+            "episode.global_motion is required for motion mode decomposition."
+        )
 
     rng = np.random.default_rng(random_state)
     eps = 1e-12
+    if int(Kmax) < 1:
+        raise ValueError("Kmax must be at least 1.")
 
-    # ------------------------------------------------------------
-    # 1. Prepare episode motion matrix M
-    # ------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 2. Prepare M from the episode data
+    # ------------------------------------------------------------------
     mask = np.asarray(episode.spatial_region).astype(bool)
     X, Y = mask.shape
     valid_coords = np.argwhere(mask)
+    spatial_coords = _normalize_spatial_coords(valid_coords, (X, Y))
 
-    if use_velocity:
-        motion_data = np.asarray(episode.motion_delta, dtype=np.float32)  # (T, N, 2)
-    else:
-        motion_data = np.asarray(episode.motion_abs, dtype=np.float32)    # (T, N, 2)
-    global_motion = np.asarray(episode.global_motion, dtype=np.float32)   # (T, 2)
+    global_motion = np.asarray(episode.global_motion, dtype=np.float32)
 
     T, N, C = motion_data.shape
     if C != 2 or len(valid_coords) != N:
@@ -2568,52 +2060,42 @@ def decompose_episode_motion_modes(
 
     if global_motion.shape != (T, 2):
         raise ValueError(
-            f"global_motion should have shape {(T, 2)}, got {global_motion.shape}"
+            f"global_motion should have shape {(T, 2)}, "
+            f"got {global_motion.shape}"
         )
 
-    # remove global/background motion
+    # The physical units of global_motion must match motion_data. In
+    # particular, use_velocity=True requires a velocity-like global motion.
     Y_data = motion_data - global_motion[:, None, :]  # (T, N, 2)
 
-    # M: (2N, T)
     M = np.concatenate(
         [
             Y_data[:, :, 0].T,
             Y_data[:, :, 1].T,
         ],
         axis=0,
-    ).astype(np.float32)
+    ).astype(np.float32)  # (2N, T)
 
     total_energy = float(np.sum(M ** 2)) + eps
+    # Since ||H[k]||_2=1, a coefficient in B naturally scales as
+    # sqrt(T) times a per-frame motion amplitude.
+    B_scale = float(np.sqrt(T) * np.sqrt(np.mean(M ** 2)) + eps)
 
     if verbose:
         print(
             f"[motion data] episode={episode.episode_id}, "
-            f"using {_motion_field_name}, "
+            f"using {motion_field_name}, "
             f"T={T}, N={N}, total_energy={total_energy:.4f}"
         )
 
-    # ------------------------------------------------------------
-    # 2. Select K, then full fit with selected K
-    # ------------------------------------------------------------
-    B_scale = _estimate_motion_scale_from_M(M, eps=eps)
-
-    K_select_info = None
-    selected_K = None
-
-    # ------------------------------------------------------------
-    # 2. Select K, then full fit with selected K
-    # ------------------------------------------------------------
-    B_scale = _estimate_motion_scale_from_M(M, eps=eps)
-
+    # ------------------------------------------------------------------
+    # 3. Select K and initialize B/H
+    # ------------------------------------------------------------------
     K_select_info = None
     selected_K = None
 
     if K_selection_method == "svd":
-        # --------------------------------------------------------
-        # SVD only selects K.
-        # We still initialize B/H by spatial seeds, not by SVD,
-        # so the final decomposition is not forced to be SVD-like.
-        # --------------------------------------------------------
+        # SVD selects only K; B/H are still initialized from spatial seeds.
         selected_K, K_select_info = _select_K_by_svd_energy(
             M,
             target_r2=svd_target_r2,
@@ -2630,8 +2112,6 @@ def decompose_episode_motion_modes(
             eps=eps,
         )
 
-        K_init = H.shape[0]
-
         if verbose:
             print(
                 f"[mode K selection: SVD] episode={episode.episode_id}, "
@@ -2641,42 +2121,8 @@ def decompose_episode_motion_modes(
                 f"rank_max={K_select_info['rank_max']}"
             )
 
-    elif K_selection_method == "sweep":
-        selected_K, selected_init, K_select_info = _sweep_K_for_episode_modes(
-            M=M,
-            Y_data=Y_data,
-            valid_coords=valid_coords,
-            Kmax=Kmax,
-            K_min=K_min,
-            K_list=K_list,
-            n_init=K_sweep_n_init,
-            short_iter=K_sweep_short_iter,
-            lambda_B=lambda_B,
-            lambda_H=lambda_H,
-            lambda_mode=lambda_mode,
-            tol=tol,
-            target_r2=target_r2,
-            verbose=verbose,
-            random_state=random_state,
-            eps=eps,
-        )
-
-        B = selected_init["B"]
-        H = selected_init["H"]
-        seeds = selected_init["seeds"]
-        K_init = H.shape[0]
-
-        if verbose:
-            print(
-                f"[mode K selection: sweep] episode={episode.episode_id}, "
-                f"Kmax={Kmax}, selected_K={selected_K}, "
-                f"short_R2={selected_init['r2']:.6f}, "
-                f"method={K_select_info['select_info']['method']}"
-            )
-
     elif K_selection_method == "fixed":
-        # Directly use Kmax as K.
-        selected_K = int(Kmax)
+        selected_K = min(int(Kmax), N, T)
 
         H, B, seeds = _initialize_modes_spatial_seed(
             Y_data,
@@ -2685,8 +2131,6 @@ def decompose_episode_motion_modes(
             rng=rng,
             eps=eps,
         )
-
-        K_init = H.shape[0]
 
         K_select_info = {
             "method": "fixed",
@@ -2702,178 +2146,57 @@ def decompose_episode_motion_modes(
     else:
         raise ValueError(
             f"Unknown K_selection_method: {K_selection_method}. "
-            "Use 'svd', 'sweep', or 'fixed'."
+            "Use 'svd' or 'fixed'."
         )
 
+    K_init = H.shape[0]
 
-    # ------------------------------------------------------------
-    # Full fit from selected K initialization
-    # ------------------------------------------------------------
-    B, H, loss_history = _fit_motion_modes_minimal(
+    # ------------------------------------------------------------------
+    # 4. Optimize B/H and the auxiliary spatial centroids.
+    # ------------------------------------------------------------------
+    initial_centers = spatial_coords[np.asarray(seeds, dtype=np.int64)]
+    B, H, loss_history, mode_centers_normalized = _fit_motion_modes_minimal(
         M,
         B,
         H,
-        lambda_B=lambda_B,
-        lambda_H=lambda_H,
-        lambda_mode=lambda_mode,
+        spatial_coords=spatial_coords,
+        lambda_sc=lambda_sc,
+        rho=rho,
+        kappa=kappa,
         max_iter=max_iter,
         tol=tol,
         verbose=verbose,
         eps=eps,
-        scaled_B_penalty=scaled_B_penalty,
         B_scale=B_scale,
+        initial_centers=initial_centers,
     )
 
-    K_after_fit = H.shape[0]
+    K_final = H.shape[0]
+    optimized_B = B.copy()
+    optimized_recon = _compute_recon_loss(M, optimized_B, H, eps=eps)
+    optimized_r2 = _compute_recon_r2(M, optimized_B, H, eps=eps)
 
-    recon_after_fit = _compute_recon_loss(M, B, H, eps=eps)
-    r2_after_fit = _compute_recon_r2(M, B, H, eps=eps)
-
-    if verbose:
-        print(
-            f"[mode initial fit] episode={episode.episode_id}, "
-            f"K={K_after_fit}, recon={recon_after_fit:.6f}, "
-            f"R2={r2_after_fit:.6f}"
-        )
-
-    # ------------------------------------------------------------
-    # 3. Reconstruction-preserving merge
-    # ------------------------------------------------------------
-    merge_groups = None
-    merge_diag = None
-    proposed_merge_groups = None
-
-    if merge_redundant_modes and H.shape[0] > 1:
-        # 3.1 propose merge groups by activation similarity
-        proposed_merge_groups, sim_H = _activation_merge_groups(
-            H,
-            activation_merge_thresh=activation_merge_thresh,
-            eps=eps,
-        )
-
-        if verbose:
-            group_sizes = [len(g) for g in proposed_merge_groups]
-            print(
-                f"[mode merge proposal] episode={episode.episode_id}, "
-                f"K fit={K_after_fit}, n_groups={len(proposed_merge_groups)}, "
-                f"group_sizes={group_sizes}"
-            )
-
-        # 3.2 perform reconstruction-preserving merge
-        B_merge, H_merge, merge_groups, merge_diag = _merge_modes_reconstruction_preserving(
-            M=M,
-            B=B,
-            H=H,
-            groups=proposed_merge_groups,
-            ridge=merge_ridge,
-            max_r2_drop=max_merge_r2_drop,
-            max_group_rank1_error=max_group_rank1_error,
-            reject_bad_groups=reject_bad_merge_groups,
-            verbose=verbose,
-        )
-
-        B, H = B_merge, H_merge
-
-        if verbose:
-            print(
-                f"[mode merge] episode={episode.episode_id}, "
-                f"K fit={K_after_fit}, K merge={H.shape[0]}, "
-                f"accepted={merge_diag['accepted']}, "
-                f"recon {merge_diag['recon_before']:.6f}"
-                f" -> {merge_diag['recon_after_init']:.6f}, "
-                f"R2 {merge_diag['r2_before']:.6f}"
-                f" -> {merge_diag['r2_after_init']:.6f}, "
-                f"R2_drop={merge_diag['r2_drop']:.6f}"
-            )
-
-        # 3.3 refine from merged B,H, not random initialization
-        if refine_after_merge and H.shape[0] > 0:
-            B, H, loss_ref = _fit_motion_modes_minimal(
-                M,
-                B,
-                H,
-                lambda_B=lambda_B,
-                lambda_H=lambda_H,
-                lambda_mode=lambda_mode,
-                max_iter=max(10, max_iter // 2),
-                tol=tol,
-                verbose=verbose,
-                eps=eps,
-                scaled_B_penalty=scaled_B_penalty,
-                B_scale=B_scale,
-            )
-            loss_history.extend(loss_ref)
-
-            if verbose:
-                recon_after_merge_refine = _compute_recon_loss(M, B, H, eps=eps)
-                r2_after_merge_refine = _compute_recon_r2(M, B, H, eps=eps)
-                print(
-                    f"[mode merge refine] episode={episode.episode_id}, "
-                    f"K={H.shape[0]}, "
-                    f"recon={recon_after_merge_refine:.6f}, "
-                    f"R2={r2_after_merge_refine:.6f}"
-                )
-
-    K_after_merge = H.shape[0]
-
-    # ------------------------------------------------------------
-    # 4. Prune weak / redundant modes
-    # ------------------------------------------------------------
-    if H.shape[0] > 0:
-        B, H, prune_info = _prune_BH_modes(
-            B,
-            H,
-            M,
-            support_rel_thresh=support_rel_thresh,
-            min_mode_mass=min_mode_mass,
-            min_incremental_energy=min_incremental_energy,
-            min_support_area=min_support_area,
-            max_mode_density=max_mode_density,
-            eps=eps,
-        )
-    else:
-        prune_info = {}
+    # Existing downstream post-processing: intentionally unchanged in scope.
+    B, support_mask, removed_count, removed_energy = _hard_threshold_B(
+        optimized_B,
+        support_rel_thresh=support_rel_thresh,
+        eps=eps,
+    )
+    final_recon = _compute_recon_loss(M, B, H, eps=eps)
+    final_r2 = _compute_recon_r2(M, B, H, eps=eps)
 
     if verbose:
         print(
-            f"[mode prune] episode={episode.episode_id}, "
-            f"K merge={K_after_merge}, K prune={H.shape[0]}"
+            f"[mode fit] episode={episode.episode_id}, K={K_final}, "
+            f"optimized_R2={optimized_r2:.6f}, "
+            f"post_threshold_R2={final_r2:.6f}, "
+            f"removed_patch_modes={removed_count}"
         )
 
-    # ------------------------------------------------------------
-    # 5. Final refine after prune
-    # ------------------------------------------------------------
-    if final_refine_after_prune and H.shape[0] > 0:
-        B, H, loss_final = _fit_motion_modes_minimal(
-            M,
-            B,
-            H,
-            lambda_B=lambda_B,
-            lambda_H=lambda_H,
-            lambda_mode=lambda_mode,
-            max_iter=max(10, max_iter // 3),
-            tol=tol,
-            verbose=verbose,
-            eps=eps,
-            scaled_B_penalty=scaled_B_penalty,
-            B_scale=B_scale,
-        )
-        loss_history.extend(loss_final)
-
-        if verbose:
-            recon_after_prune_refine = _compute_recon_loss(M, B, H, eps=eps)
-            r2_after_prune_refine = _compute_recon_r2(M, B, H, eps=eps)
-            print(
-                f"[mode final refine] episode={episode.episode_id}, "
-                f"K={H.shape[0]}, "
-                f"recon={recon_after_prune_refine:.6f}, "
-                f"R2={r2_after_prune_refine:.6f}"
-            )
-
-    # ------------------------------------------------------------
-    # 6. Build MotionMode objects
-    # ------------------------------------------------------------
-    if H.shape[0] > 0:
+    # ------------------------------------------------------------------
+    # 5. Convert every fitted component to a MotionMode object.
+    # ------------------------------------------------------------------
+    if K_final > 0:
         modes = _build_motion_modes_from_BH(
             B,
             H,
@@ -2884,76 +2207,64 @@ def decompose_episode_motion_modes(
             episode.episode_id,
             episode.time_range,
             global_motion,
-            min_mode_mass=min_mode_mass,
-            min_explained_energy=min_explained_energy,
             support_rel_thresh=support_rel_thresh,
             eps=eps,
         )
     else:
         modes = []
 
-    # ------------------------------------------------------------
-    # 7. Save model information
-    # ------------------------------------------------------------
-    final_recon = _compute_recon_loss(M, B, H, eps=eps) if H.shape[0] > 0 else None
-    final_r2 = _compute_recon_r2(M, B, H, eps=eps) if H.shape[0] > 0 else None
-
+    # ------------------------------------------------------------------
+    # 6. Save the final model and diagnostics
+    # ------------------------------------------------------------------
     episode.modes = modes
     episode.mode_model = {
         "B": B,
+        "B_before_hard_threshold": optimized_B,
         "H": H,
         "loss_history": loss_history,
+        "mode_centers_normalized": mode_centers_normalized,
+        "mode_centers_patch": mode_centers_normalized * np.maximum(
+            np.asarray((X, Y), dtype=np.float32) - 1.0,
+            1.0,
+        )[None, :],
 
-        "lambda_B": lambda_B,
-        "lambda_H": lambda_H,
-        "lambda_mode": lambda_mode,
+        "lambda_sc": float(lambda_sc),
+        "rho": float(rho),
+        "kappa": float(kappa),
 
         "Kmax": Kmax,
         "K_init": K_init,
-        "K_after_fit": K_after_fit,
-        "K_after_merge": K_after_merge,
-        "K_after_prune": H.shape[0],
+        "K_final": K_final,
         "K_modes": len(modes),
-
         "seeds": seeds,
 
-        "proposed_merge_groups": proposed_merge_groups,
-        "merge_groups": merge_groups,
-        "merge_diag": merge_diag,
-
-        "prune_info": prune_info,
-
         "total_energy": total_energy,
-        "recon_after_fit": recon_after_fit,
-        "r2_after_fit": r2_after_fit,
+        "optimized_recon": optimized_recon,
+        "optimized_r2": optimized_r2,
         "final_recon": final_recon,
         "final_r2": final_r2,
+        "hard_threshold_support_mask": support_mask,
+        "hard_threshold_removed_count": removed_count,
+        "hard_threshold_removed_energy": removed_energy,
 
         "K_selection_method": K_selection_method,
         "K_selected": selected_K,
         "K_select_info": K_select_info,
         "svd_target_r2": svd_target_r2,
-        "target_r2": target_r2,
 
         "B_scale": B_scale,
-        "scaled_B_penalty": scaled_B_penalty,
         "use_velocity": use_velocity,
-        "motion_field_used": _motion_field_name,
-
-        "merge_params": {
-            "activation_merge_thresh": activation_merge_thresh,
-            "merge_ridge": merge_ridge,
-            "max_merge_r2_drop": max_merge_r2_drop,
-            "max_group_rank1_error": max_group_rank1_error,
-            "reject_bad_merge_groups": reject_bad_merge_groups,
-        },
+        "motion_field_used": motion_field_name,
+        "H_constraint": "row_l2_norm_equals_1",
+        "objective": "reconstruction_plus_sparse_compact",
+        "postprocessing": "hard_threshold_only",
     }
 
     if verbose:
         print(
             f"[motion modes] episode={episode.episode_id}, "
-            f"Kmax={Kmax}, kept modes={len(modes)}, "
-            f"final_R2={final_r2}"
+            f"selected_K={selected_K}, built_modes={len(modes)}, "
+            f"final_R2={final_r2:.6f}, postprocessing=hard_threshold_only"
         )
 
     return modes
@@ -3483,23 +2794,83 @@ def collect_regions_from_episodes(motion_episodes):
     return out
 
 
+def collect_modes_from_episodes(motion_episodes):
+    out = []
+    for ep in motion_episodes:
+        out.extend(getattr(ep, "modes", []) or [])
+    return out
+
+
+def collect_units_from_episodes(motion_episodes, unit_type="region"):
+    if unit_type == "mode":
+        return collect_modes_from_episodes(motion_episodes)
+    return collect_regions_from_episodes(motion_episodes)
+
+
 def filter_regions_for_patterns(regions, min_strength=0.0, min_area=0.0, min_duration=1):
+    """Filter units (MotionRegion or MotionMode) for pattern clustering.
+
+    Missing attributes on MotionMode are computed from response_strength / activation.
+    """
     kept = []
     for r in regions:
-        if getattr(r, "strength", 0.0) < min_strength:
+        # strength
+        s = getattr(r, "strength", None)
+        if s is None:
+            A = getattr(r, "response_strength", None)
+            s = float(np.sum(A)) if A is not None else 0.0
+        if s < min_strength:
             continue
-        if getattr(r, "area_effective", 0.0) < min_area:
+
+        # area_effective
+        a = getattr(r, "area_effective", None)
+        if a is None:
+            A = getattr(r, "response_strength", None)
+            if A is not None:
+                A = np.asarray(A, dtype=np.float32)
+                w = A[A > 0]
+                a = float(np.sum(w) ** 2 / max(np.sum(w ** 2), 1e-12)) if len(w) > 0 else 0.0
+            else:
+                a = 0.0
+        if a < min_area:
             continue
-        if getattr(r, "duration", 0) < min_duration:
+
+        # duration
+        d = getattr(r, "duration", None)
+        if d is None:
+            h = getattr(r, "activation", None)
+            d = len(np.asarray(h).reshape(-1)) if h is not None else 0
+        if d < min_duration:
             continue
-        if getattr(r, "mean_response_vector", None) is None:
+
+        # mean_response_vector
+        mrv = getattr(r, "mean_response_vector", None)
+        if mrv is None:
+            B = getattr(r, "response_field", None)
+            A = getattr(r, "response_strength", None)
+            if B is not None and A is not None:
+                B = np.asarray(B, dtype=np.float32)
+                A = np.asarray(A, dtype=np.float32)
+                mask = A > 0
+                if np.any(mask):
+                    w = A[mask]
+                    b = B[mask]
+                    mrv = (np.sum(w[:, None] * b, axis=0) / max(np.sum(w), 1e-12)).astype(np.float32)
+        if mrv is None:
             continue
+        # Attach computed mrv for downstream use
+        r.mean_response_vector = mrv
+
         kept.append(r)
     return kept
 
 
 def _region_support_mask(region):
+    # Works for both MotionRegion and MotionMode
     m = getattr(region, "region_mask", None)
+    if m is not None:
+        return np.asarray(m).astype(bool)
+    m = getattr(region, "support_mask", None)
     if m is not None:
         return np.asarray(m).astype(bool)
     A = np.asarray(region.response_strength, dtype=np.float32)
@@ -3516,10 +2887,28 @@ def _region_iou(r1, r2):
     return float(inter / (union + 1e-12))
 
 
+def _unit_centroid(unit):
+    """Compute spatial centroid from response_strength (fallback if no center_xy)."""
+    c = getattr(unit, "center_xy", None)
+    if c is not None:
+        c = np.asarray(c, dtype=np.float32)
+        if c.shape == (2,) and np.all(np.isfinite(c)):
+            return c
+    # Compute from response_strength
+    A = np.asarray(unit.response_strength, dtype=np.float32)
+    if A.ndim == 2 and np.max(A) > 0:
+        pts = np.argwhere(A > 0)
+        if len(pts) > 0:
+            w = A[A > 0].astype(np.float32)
+            c = np.average(pts.astype(np.float32), axis=0, weights=w)
+            return c.astype(np.float32)
+    return np.array([np.nan, np.nan], dtype=np.float32)
+
+
 def _region_centroid_distance(r1, r2):
-    c1 = np.asarray(getattr(r1, "center_xy", [np.nan, np.nan]), dtype=np.float32)
-    c2 = np.asarray(getattr(r2, "center_xy", [np.nan, np.nan]), dtype=np.float32)
-    if c1.shape != (2,) or c2.shape != (2,) or np.any(~np.isfinite(c1)) or np.any(~np.isfinite(c2)):
+    c1 = _unit_centroid(r1)
+    c2 = _unit_centroid(r2)
+    if np.any(~np.isfinite(c1)) or np.any(~np.isfinite(c2)):
         return np.inf
     return float(np.linalg.norm(c1 - c2))
 
@@ -3565,8 +2954,14 @@ def _get_region_activation(region):
     return None
 
 def _get_region_mask_simple(region):
+    # Works for both MotionRegion and MotionMode
     if hasattr(region, "region_mask") and region.region_mask is not None:
         mask = np.asarray(region.region_mask).astype(bool)
+        if mask.ndim == 2 and np.any(mask):
+            return mask
+
+    if hasattr(region, "support_mask") and region.support_mask is not None:
+        mask = np.asarray(region.support_mask).astype(bool)
         if mask.ndim == 2 and np.any(mask):
             return mask
 
@@ -3617,6 +3012,47 @@ def _response_field_distance_on_overlap(region1, region2, sign2=1.0, eps=1e-8):
     denom = np.sqrt(np.sum(v1 ** 2)) + np.sqrt(np.sum(v2 ** 2)) + eps
 
     return float(numerator / denom)
+
+
+def _response_field_correlation_on_overlap(region1, region2, sign2=1.0, eps=1e-8):
+    """Compare B vector fields using correlation on the overlap region.
+
+    Flattens the 2D vectors on the common mask into (N_common*2,) arrays
+    and computes Pearson r. Returns 1 - |r| (sign-insensitive, 0=identical).
+
+    D_b = 1 - |pearson_r(v1, sign2 * v2)|
+    """
+    mask1 = _get_region_mask_simple(region1)
+    mask2 = _get_region_mask_simple(region2)
+    B1 = _get_region_response_field(region1)
+    B2 = _get_region_response_field(region2)
+
+    if mask1 is None or mask2 is None or B1 is None or B2 is None:
+        return np.inf
+
+    if mask1.shape != mask2.shape or B1.shape != B2.shape:
+        return np.inf
+
+    common = np.logical_and(mask1, mask2)
+    if np.sum(common) < 3:   # need at least 3 points for meaningful correlation
+        return np.inf
+
+    v1 = B1[common].ravel().astype(np.float64)           # (N*2,)
+    v2 = (sign2 * B2[common]).ravel().astype(np.float64)  # (N*2,)
+
+    # Pearson r
+    v1_mean = np.mean(v1)
+    v2_mean = np.mean(v2)
+    v1_demean = v1 - v1_mean
+    v2_demean = v2 - v2_mean
+    num = np.dot(v1_demean, v2_demean)
+    denom = np.sqrt(np.sum(v1_demean ** 2) * np.sum(v2_demean ** 2)) + eps
+
+    r = num / denom
+    r = np.clip(r, -1.0, 1.0)
+
+    # Sign-insensitive: |r| close to 1 = highly correlated
+    return float(1.0 - abs(r))
 
 def _resample_1d_simple(x, target_len=12):
     x = np.asarray(x, dtype=np.float32).reshape(-1)
@@ -3670,6 +3106,7 @@ def compute_region_distance_matrix_simple(
     min_iou=0.10,
     omega=1.0,
     mu=1.0,
+    b_distance="l2",         # "l2" or "correlation"
     incompatible_dist=1e6,
     verbose=True,
 ):
@@ -3682,9 +3119,9 @@ def compute_region_distance_matrix_simple(
     Soft distance:
         D = omega * D_h + mu * D_b
 
-    where:
-        D_h = sign-aware DTW distance between activations
-        D_b = response vector field value difference on overlapping support
+    where D_h is sign-aware DTW of activations, and D_b is either:
+      - "l2":  normalized L2 distance on overlap (Eq: ||B1-sign*B2|| / (||B1||+||B2||))
+      - "correlation": 1 - |pearson_r(B1, sign*B2)| on overlap
     """
     n = len(regions)
     D = np.zeros((n, n), dtype=np.float32)
@@ -3752,11 +3189,12 @@ def compute_region_distance_matrix_simple(
                             }
                         else:
                             D_h, sign_j = _sign_aware_activation_dtw(h_i, h_j)
-                            D_b = _response_field_distance_on_overlap(
-                            regions[i],
-                            regions[j],
-                            sign2=sign_j,
-                        )
+                            if b_distance == "correlation":
+                                D_b = _response_field_correlation_on_overlap(
+                                    regions[i], regions[j], sign2=sign_j)
+                            else:
+                                D_b = _response_field_distance_on_overlap(
+                                    regions[i], regions[j], sign2=sign_j)
 
                         if not np.isfinite(D_h) or not np.isfinite(D_b):
                             dist = incompatible_dist
@@ -4059,8 +3497,9 @@ def build_motion_patterns_from_groups(regions, groups):
 
     return patterns
 
-def getMotionRegionPattern(
+def getMotionPattern(
     motion_episodes,
+    unit_type="region",        # "region" or "mode"
     min_strength=0.0,
     min_area=5,
     min_duration=1,
@@ -4068,6 +3507,7 @@ def getMotionRegionPattern(
     min_iou=0.10,
     omega=1.0,
     mu=1.0,
+    b_distance="l2",           # "l2" or "correlation"
 
     cluster_dist_thresh=0.8,
     linkage_method="complete",
@@ -4075,41 +3515,39 @@ def getMotionRegionPattern(
 
     verbose=True,
 ):
-    """
-    Build MotionPatterns from MotionRegions.
+    """Build MotionPatterns from MotionRegions or MotionModes.
 
-    Logic:
-        1. Collect MotionRegions from all episodes.
-        2. Filter weak/small/short regions.
-        3. Pairwise hard gate by region IoU.
-        4. Pairwise distance:
-               D = omega * DTW(h_i, h_j)
-                 + mu    * response_field_distance(b_i, b_j)
-        5. Complete-linkage hierarchical clustering.
+    Parameters
+    ----------
+    unit_type : str
+        "region" - cluster MotionRegions (default).
+        "mode"   - cluster MotionModes directly, skipping spatial splitting.
     """
-    all_regions = collect_regions_from_episodes(motion_episodes)
+    # Collect units
+    all_units = collect_units_from_episodes(motion_episodes, unit_type=unit_type)
 
     if verbose:
-        print(f"[getMotionRegionPattern] collected regions: {len(all_regions)}")
+        print(f"[getMotionPattern] collected {unit_type}s: {len(all_units)}")
 
-    kept_regions = filter_regions_for_patterns(
-        all_regions,
+    kept_units = filter_regions_for_patterns(
+        all_units,
         min_strength=min_strength,
         min_area=min_area,
         min_duration=min_duration,
     )
 
     if verbose:
-        print(f"[getMotionRegionPattern] kept regions: {len(kept_regions)}")
+        print(f"[getMotionPattern] kept {unit_type}s: {len(kept_units)}")
 
-    if len(kept_regions) == 0:
+    if len(kept_units) == 0:
         return [], [], [], np.array([], dtype=np.int32), {}
 
     dist_mat, pair_info = compute_region_distance_matrix_simple(
-        kept_regions,
+        kept_units,
         min_iou=min_iou,
         omega=omega,
         mu=mu,
+        b_distance=b_distance,
         incompatible_dist=incompatible_dist,
         verbose=verbose,
     )
@@ -4123,7 +3561,7 @@ def getMotionRegionPattern(
     )
 
     patterns = build_motion_patterns_from_groups(
-        kept_regions,
+        kept_units,
         groups,
     )
 
@@ -4131,7 +3569,9 @@ def getMotionRegionPattern(
         "distance_matrix": dist_mat,
         "pair_info": pair_info,
         "labels": labels,
+        "unit_type": unit_type,
         "params": {
+            "unit_type": unit_type,
             "min_strength": min_strength,
             "min_area": min_area,
             "min_duration": min_duration,
@@ -4144,7 +3584,40 @@ def getMotionRegionPattern(
         },
     }
 
-    return patterns, kept_regions, groups, labels, info
+    return patterns, kept_units, groups, labels, info
+
+
+# Backward-compatible alias
+def getMotionRegionPattern(
+    motion_episodes,
+    min_strength=0.0,
+    min_area=5,
+    min_duration=1,
+    min_iou=0.10,
+    omega=1.0,
+    mu=1.0,
+    b_distance="l2",
+    cluster_dist_thresh=0.8,
+    linkage_method="complete",
+    incompatible_dist=1e6,
+    verbose=True,
+):
+    """Backward-compatible wrapper - delegates to getMotionPattern(unit_type='region')."""
+    return getMotionPattern(
+        motion_episodes,
+        unit_type="region",
+        min_strength=min_strength,
+        min_area=min_area,
+        min_duration=min_duration,
+        min_iou=min_iou,
+        omega=omega,
+        mu=mu,
+        b_distance=b_distance,
+        cluster_dist_thresh=cluster_dist_thresh,
+        linkage_method=linkage_method,
+        incompatible_dist=incompatible_dist,
+        verbose=verbose,
+    )
 
 def pattern_to_binary_mask(
     pattern,
@@ -4312,8 +3785,8 @@ def make_query_mask_from_bbox(shape, x0, x1, y0, y1):
     Make rectangular query mask.
 
     Coordinates are in patch-coordinate system:
-        x in [x0, x1)
-        y in [y0, y1)
+        x in [x0, x1-1]
+        y in [y0, y1-1]
     """
     X, Y = shape
 
@@ -8391,8 +7864,8 @@ def visualize_top_dependency_components_with_lag_and_p(
 
         ax.annotate(
             label,
-            xy=(text_x, text_y),               
-            xytext=(-50, -50),                    
+            xy=(text_x, text_y),                 # 箭头指向 component 的中心
+            xytext=(-50, -50),                     # 标签相对中心偏移，单位是 points
             textcoords="offset points",
             color="white",
             fontsize=9,
