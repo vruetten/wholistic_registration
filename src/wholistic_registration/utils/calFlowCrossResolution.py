@@ -2059,10 +2059,11 @@ def optimize_layer_cross_resolution(
         error_last = residual**2
 
         # change the motion current to phase new 20260607 15:54
-        # neiDiff = getNeiDiff(motion_current[xG_grid, yG_grid, zG_grid, :], 1)
-        phase_cp = phase_new[xG_grid,yG_grid,zG_grid,:]
-        phase_residual_cp = phase_cp - phase_identity_cp
-        neiDiff = getNeiDiff(phase_residual_cp, 1)
+        neiDiff = getNeiDiff(motion_current[xG_grid, yG_grid, zG_grid, :], 1)
+        neiDiff[:,:,2] *= zRatio_hr
+        # phase_cp = phase_new[xG_grid,yG_grid,zG_grid,:]
+        # phase_residual_cp = phase_cp - phase_identity_cp
+        # neiDiff = getNeiDiff(phase_residual_cp, 1)
         neiSum = smoothPenaltySum * neiDiff
 
         diffError, penaltyError = calError(residual, neiDiff, smoothPenaltySum)

@@ -1,8 +1,37 @@
 # Corresponding files
 ## motion_correlation_pattern.py
-the main file to analyse and visualize motion
+the main file to analyse and visualize motion. **As of 2026-08-03 (V2)**, the mode decomposition has been refactored in-place with a new sparse-compact objective — there is no separate `_v2.py` file.
 ## motion_stage_cache.py
 the file to store the temp results
+
+---
+
+## Update Summary — 2026-08-03 (V2)
+
+This document has been updated to reflect the V2 refactoring. See the **V2: Sparse-Compact Decomposition** section at the end for full details. Key changes:
+
+### Mode Decomposition (V1 → V2) (Most important)
+- **New objective**: sparse-compact loss replaces L1 group-Lasso + mode-column penalty + temporal smoothing. A single penalty term `λ_sc` encodes both sparsity and spatial compactness via distance-weighted group-Lasso, with automatic centroid learning.
+- **No temporal smoothing**: the second-difference penalty on `h_k(t)` is deliberately removed. Activation shape is now purely data-driven, avoiding over-constraint on short/transient episodes.
+- **H constraint**: unit-sphere Riemannian gradient (`||H[k]||_2 = 1`) replaces post-hoc row normalization with scale absorption into B.
+- **Simplified post-processing**: a single hard-threshold step replaces the old merge → prune → refine pipeline.
+- **Backtracking line search**: replaces fixed-step gradient descent. B uses sufficient-decrease backtracking; H uses Armijo backtracking (c=1e-4).
+
+### Motion Unit Extraction
+- `estimate_rest_state_motion`: new **`return_median`** parameter — when True, also returns the local median motion for reuse in `getMotionUnit`.
+- `getMotionUnit`: new **`use_abs_dev`** mode (default `True`) — a patch is active when its **deviation from the local median baseline** exceeds the MAD threshold (`|motionMag - median_local| > restMotion`), instead of comparing raw magnitude against the threshold. New parameters: `median_local`, `median_window_t`, `median_window_xy`.
+
+### Clustering & Pattern Building
+- New **`getMotionPattern()`** function with **`unit_type="region"|"mode"`** — supports clustering `MotionMode` objects directly without first splitting into `MotionRegion`s.
+- New **`b_distance="correlation"`** option for response-field distance: uses `1 - |Pearson_r(B1, sign·B2)|` on the spatial overlap, as an alternative to the existing normalized L2 distance.
+- **`getMotionRegionPattern()`** is now a backward-compatible wrapper that delegates to `getMotionPattern(unit_type="region")`.
+- `filter_regions_for_patterns` now handles both `MotionRegion` and `MotionMode` objects, auto-computing missing attributes (`strength`, `area_effective`, `duration`, `mean_response_vector`) from `response_strength` / `response_field` / `activation` as needed.
+- New helpers: `collect_modes_from_episodes`, `collect_units_from_episodes`, `_unit_centroid`, `_response_field_correlation_on_overlap`.
+
+### File Organization
+- V2 code lives directly in `motion_correlation_pattern.py`. V1 code has been replaced in-place; there is no separate `motion_correlation_pattern_v2.py` file.
+
+---
 
 # Methods
 ## Abstract
@@ -17,8 +46,17 @@ In fact, we do not need to perform motion analysis down to the single-pixel leve
 #### 2.estimate the resting-state motion amplitude for each patch
 To this end, we apply median filtering with relatively large temporal and spatial window sizes for estimation. Median rather than mean filtering is adopted because genuine motion events generally feature large amplitude values, which can severely bias the mean calculation while exerting much weaker interference on the median. We avoid computing a single universal baseline value for the entire dataset, as resting motion intensity varies across anatomical locations and over time. This inherent assumption inevitably precludes our analysis of slow, long-timescale motions.
 
+**V2 update (`estimate_rest_state_motion`):** Uses Median Absolute Deviation (MAD) from a local spatiotemporal median: `restMotion = scale × 1.4826 × median(|motionMag - median_local|)`. The new `return_median` parameter (default `False`) allows returning the local median alongside the resting-state estimate, so `getMotionUnit` can reuse it without recomputing another median filter.
+
 #### 3.Extract motion units
 For each patch, extract the temporal segments where the amplitude exceeds the resting amplitude for several consecutive frames, and denote these segments as motion units.
+
+**V2 update (`getMotionUnit`):** Two detection modes are now available, controlled by `use_abs_dev` (default `True`):
+
+- **`use_abs_dev=True` (default, new):** A patch is active when its deviation from the local baseline exceeds the MAD-estimated threshold: `|motionMag - median_local| > restMotion`. This is more robust because it measures *excess* motion relative to the local context rather than raw magnitude.
+- **`use_abs_dev=False` (old behavior):** `motionMag > restMotion` — raw magnitude comparison.
+
+When `use_abs_dev=True`, the local median can be either precomputed via `estimate_rest_state_motion(..., return_median=True)` and passed as `median_local`, or computed internally with `median_window_t` and `median_window_xy` controlling the filter size.
 
 #### Weakness
 We couldn't analyze the  slow, long-timescale motions.
@@ -31,6 +69,9 @@ Motion units with nearly coincident start and end timestamps are grouped into a 
 
 
 ### Decomposite into motion modes/regions
+
+> **⚠️ V2 note (2026-08-03):** The method described below is the **V1** decomposition (L1 group-Lasso + temporal smoothing + merge/prune/refine pipeline). The current **V2** method uses a sparse-compact objective with automatic centroid learning, Riemannian H updates, and a simplified hard-threshold-only post-processing. See the **V2: Sparse-Compact Decomposition** section at the end of this document for the updated formulation.
+
 ### Assumption
 We assume that all patches affected by the same underlying physical motion source share consistent motion directions. In our framework, such a source is defined as a motion mode, which imposes a fixed, time-invariant motion vector on every patch within its effective spatial coverage. Furthermore, instantaneous response amplitudes across patches belonging to an identical motion mode are mutually proportional. Equivalently, these patches share a common temporal-only activation profile independent of spatial location.
 
@@ -249,6 +290,8 @@ A single motion mode may have a response support that spans several spatially di
 
 ### Clustering into motion patterns
 
+> **⚠️ V2 note (2026-08-03):** The clustering API has been updated. The primary entry point is now **`getMotionPattern()`** (with `unit_type="region"|"mode"`), which supports clustering both `MotionRegion` and `MotionMode` objects. The old `getMotionRegionPattern()` is retained as a backward-compatible wrapper. See the **V2: Clustering Updates** subsection at the end of this document.
+
 #### Assumption
 
 The same type of motion event — characterized by a consistent spatial location, a consistent motion direction, and a consistent temporal activation profile — **recurs across different episodes**. For instance, a peristaltic wave passing through a given gastrointestinal segment will generate a similar activation time course and a similar spatial pattern of patch-level response vectors each time it occurs. Our goal is to discover these recurring patterns by clustering motion regions across episodes.
@@ -283,3 +326,300 @@ where:
 This design follows a simple principle: **same biological event → same place, same direction, same temporal profile**. The spatial IoU gate ensures we only compare regions that could plausibly be the same anatomical structure. The DTW distance accommodates variable-length activations (different episodes have different durations). The sign-aware comparison handles the inherent sign ambiguity from the bilinear mode decomposition. The response-field distance on overlapping support prevents regions with similar activations but opposite motion directions from being merged.
 
 The complete-linkage hierarchical clustering is deliberately conservative — it prefers splitting over merging when in doubt. This is appropriate because over-merging distinct motion patterns would conflate different biological events, while under-merging (splitting one true pattern into two) is a less severe failure mode that can be addressed in downstream analysis.
+
+---
+
+# V2: Sparse-Compact Decomposition
+
+## Motivation
+
+V1 uses L1 group-Lasso + mode-column penalty + temporal smoothing, but has several limitations:
+
+1. **Complex post-processing**: three steps (merge → prune → refine) are needed to clean up modes after optimization.
+2. **Temporal smoothness assumption**: the second-difference penalty assumes slow-varying activations, which is unsuitable for fast transient motion (e.g. heartbeat, rapid peristalsis).
+3. **Weak spatial regularization**: L1 only encourages sparsity, not spatial compactness — modes can fracture into multiple disconnected fragments that require downstream region-splitting to separate.
+
+V2 adopts a unified **sparse-compact** objective that encodes both spatial sparsity and compactness in a single penalty term, and automatically learns the spatial centroid of each mode.
+
+## Objective Function
+
+### Notation
+
+Same as V1: $\mathbf{M} \in \mathbb{R}^{2N \times T}$, $\mathbf{B} \in \mathbb{R}^{2N \times K}$, $\mathbf{H} \in \mathbb{R}^{K \times T}$.
+
+Additional definitions:
+- $\mathbf{r}_i \in [0,1]^2$ — normalized spatial coordinates of patch $i$.
+- $\boldsymbol{\mu}_k \in [0,1]^2$ — amplitude-weighted spatial centroid of mode $k$.
+
+### Full Objective
+
+```math
+\min_{\mathbf{B},\mathbf{H},\boldsymbol{\mu}} \quad
+\frac{\|\mathbf{M} - \mathbf{B}\mathbf{H}\|_F^2}{\|\mathbf{M}\|_F^2}
++ \frac{\lambda_{sc}}{N K s_B} \sum_{i=1}^{N} \sum_{k=1}^{K}
+\big(\rho + \kappa \cdot \|\mathbf{r}_i - \boldsymbol{\mu}_k\|_2^2\big) \cdot \|\mathbf{b}_{ik}\|_2
+```
+
+```math
+\text{subject to} \quad \|\mathbf{H}[k]\|_2 = 1 \quad \text{for every } k
+```
+
+where $s_B = \sqrt{T} \cdot \sqrt{\operatorname{mean}(\mathbf{M}^2)}$ is the motion magnitude scale.
+
+### Penalty Semantics
+
+| Parameter | Meaning | Effect |
+|---|---|---|
+| $\lambda_{sc}$ | Total regularization strength | Larger → sparser and more compact modes |
+| $\rho$ (rho) | Base sparsity weight | Applied uniformly to all patches; drives irrelevant $b_{ik} \to 0$ |
+| $\kappa$ (kappa) | Compactness weight | Patches far from centroid $\boldsymbol{\mu}_k$ receive stronger sparsity penalty, encouraging modes to be spatially clustered |
+
+Intuitively:
+- The effective penalty weight for patch $i$ under mode $k$ is $\rho + \kappa \cdot \|\mathbf{r}_i - \boldsymbol{\mu}_k\|^2$.
+- Close to the centroid → low penalty → strong $b_{ik}$ allowed.
+- Far from the centroid → high penalty → $b_{ik}$ compressed to zero.
+- The centroid $\boldsymbol{\mu}_k$ is automatically learned as the amplitude-weighted mean of participating patches.
+
+### Key Differences from V1
+
+| Aspect | V1 | V2 |
+|---|---|---|
+| B regularization | L1 group-Lasso ($\|\mathbf{b}_{ik}\|$) + mode-column penalty ($\|\mathbf{B}_{:,k}\|$) | **Weighted** L1 group-Lasso, weights depend on distance to learned centroid |
+| Spatial modeling | None (relies on post-hoc region splitting) | **Automatic centroid learning**; compactness encoded in the penalty |
+| Temporal modeling | Second-difference smoothing ($\lambda_H$) | **No temporal smoothing** — activation shape is purely data-driven |
+| H constraint | Normalize then absorb scale into B | **Unit-sphere constraint** $\|\mathbf{H}[k]\|_2 = 1$ (Riemannian gradient) |
+| Post-processing | merge + prune + refine (3 steps) | **Hard threshold only** (1 step) |
+| Optimization | Fixed-step gradient descent + proximal operators | Proximal gradient + **backtracking line search** |
+| Parameter count | 4 ($\lambda_B$, $\lambda_{\text{mode}}$, $\lambda_H$, tol) | 3 ($\lambda_{sc}$, $\rho$, $\kappa$) |
+
+### Why Temporal Smoothing Was Removed
+
+The second-difference penalty assumes $h_k(t)$ varies slowly. In practice:
+- Many biological motions are fast and transient (heartbeats, rapid peristaltic waves).
+- Episodes are typically short (5–15 frames).
+- A second-difference penalty on such short sequences over-constrains the shape of $h_k(t)$.
+
+V2 deliberately imposes **no shape prior** on $h_k(t)$, letting the data determine the activation curve.
+
+## Optimization Algorithm
+
+### B Update: Weighted Group-Lasso Proximal Gradient
+
+1. Compute gradient of the smooth (reconstruction) part:
+   ```math
+   \nabla_{\mathbf{B}} \mathcal{L}_{\text{recon}} = \frac{2}{\|\mathbf{M}\|_F^2} (\mathbf{B}\mathbf{H} - \mathbf{M}) \mathbf{H}^\top
+   ```
+
+2. Step size (inverse of gradient Lipschitz constant):
+   ```math
+   \eta_B = 1 \;\big/\; \left(\frac{2}{\|\mathbf{M}\|_F^2} \|\mathbf{H}\mathbf{H}^\top\|_2\right)
+   ```
+
+3. Compute spatial weight matrix $\mathbf{W} \in \mathbb{R}^{N \times K}$:
+   ```math
+   W[i,k] = \rho + \kappa \cdot \|\mathbf{r}_i - \boldsymbol{\mu}_k\|_2^2
+   ```
+
+4. Weighted group soft-thresholding (for each patch $i$, mode $k$):
+   ```math
+   \tau_{ik} = \eta_B \cdot \lambda_{sc} \cdot W[i,k] \;\big/\; (N K s_B)
+   ```
+   ```math
+   \mathbf{b}_{ik} \leftarrow \mathbf{b}_{ik} \cdot \max\!\left(0,\; 1 - \frac{\tau_{ik}}{\|\mathbf{b}_{ik}\|_2}\right)
+   ```
+
+5. **Backtracking line search**: if the trial B increases the objective (with centroid held fixed), the step size is halved and the proximal step retried, up to `max_backtracking = 30` times. The acceptance condition is **sufficient decrease** (not Armijo):
+   ```math
+   \mathcal{L}(\mathbf{B}_{\text{trial}}, \mathbf{H}, \boldsymbol{\mu}) \leq \mathcal{L}(\mathbf{B}_{\text{old}}, \mathbf{H}, \boldsymbol{\mu}) + 10^{-12}
+   ```
+
+### μ Update: Exact Minimizer
+
+For fixed B, the centroid $\boldsymbol{\mu}_k$ has a closed-form solution — the amplitude-weighted spatial mean:
+
+```math
+\boldsymbol{\mu}_k = \frac{\sum_i \|\mathbf{b}_{ik}\|_2 \cdot \mathbf{r}_i}{\sum_i \|\mathbf{b}_{ik}\|_2}
+```
+
+### H Update: Riemannian Gradient on the Unit Sphere
+
+1. Compute Euclidean gradient:
+   ```math
+   \nabla_{\mathbf{H}} = \frac{2}{\|\mathbf{M}\|_F^2} \mathbf{B}^\top (\mathbf{B}\mathbf{H} - \mathbf{M})
+   ```
+
+2. Project onto the tangent space of the product of unit spheres:
+   ```math
+   \nabla_{\mathbf{H}}^{\text{tangent}} = \nabla_{\mathbf{H}} - (\nabla_{\mathbf{H}} \odot \mathbf{H}) \odot \mathbf{H}
+   ```
+   where $\odot$ is element-wise multiplication with row-wise summation over the inner product.
+
+3. Step along the tangent direction, then retract back to the sphere:
+   ```math
+   \mathbf{H}_{\text{trial}} = \text{normalize\_rows}\!\left(\mathbf{H} - \eta_H \cdot \nabla_{\mathbf{H}}^{\text{tangent}}\right)
+   ```
+   The step size is $\eta_H = 1 \;\big/\; \left(\frac{2}{\|\mathbf{M}\|_F^2} \|\mathbf{B}^\top\mathbf{B}\|_2\right)$.
+
+4. **Armijo backtracking** with $c = 10^{-4}$:
+   ```math
+   \mathcal{L}(\mathbf{B}, \mathbf{H}_{\text{trial}}, \boldsymbol{\mu}) \leq \mathcal{L}(\mathbf{B}, \mathbf{H}_{\text{old}}, \boldsymbol{\mu}) - 10^{-4} \cdot \eta_H \cdot \|\nabla_{\mathbf{H}}^{\text{tangent}}\|_F^2
+   ```
+   If the condition fails, $\eta_H$ is halved and the step retried.
+
+### Global Safety
+
+After both B and H blocks, if the full objective increased relative to the previous iteration, **both B and H are reverted** to their previous values and the step sizes are set to zero for that iteration.
+
+### Convergence Check
+
+The algorithm stops when **both** conditions are satisfied:
+
+```math
+\frac{|\mathcal{L}_{\text{old}} - \mathcal{L}|}{\max(|\mathcal{L}_{\text{old}}|, \epsilon)} \leq \text{tol}
+\quad\text{AND}\quad
+\operatorname{mean}(|\Delta\mathbf{B}|) + \operatorname{mean}(|\Delta\mathbf{H}|) \leq \sqrt{\text{tol}}
+```
+
+Default: `tol = 1e-4`, `max_iter = 200`.
+
+## Post-Processing
+
+Only **one step** — hard thresholding applied after optimization converges:
+
+```math
+a_{ik} = \|\mathbf{b}_{ik}\|_2, \qquad
+\tau_k = \text{support\_rel\_thresh} \cdot \max_i a_{ik}
+```
+
+```math
+\mathbf{b}_{ik} \leftarrow \mathbf{0} \quad \text{if} \quad a_{ik} \leq \tau_k
+```
+
+Both spatial components (x, y) are zeroed together. Default: `support_rel_thresh = 0.08`.
+
+## Parameter Recommendations
+
+| Parameter | Recommended Range | Notes |
+|---|---|---|
+| `lambda_sc` | 0.01–0.2 | Total regularization; start at 0.05 |
+| `rho` | 0.5–2.0 | Base sparsity; default 1.0 |
+| `kappa` | 2.0–8.0 | Compactness; default 4.0; increase for tighter spatial clustering |
+| `support_rel_thresh` | 0.05–0.15 | Hard threshold relative cutoff |
+| `svd_target_r2` | 0.80–0.95 | Target cumulative R² for SVD-based K selection |
+
+### V1 → V2 Parameter Migration
+
+**Do not reuse V1's $\lambda_B$ as V2's $\lambda_{sc}$.** The two objectives have fundamentally different penalty forms:
+- V1: $\lambda_B \cdot \operatorname{mean}(\|\mathbf{b}_{ik}\| / B_{\text{scale}})$ — uniform-weight L1
+- V2: $\lambda_{sc} \cdot \operatorname{mean}((\rho + \kappa \cdot d^2) \cdot \|\mathbf{b}_{ik}\| / s_B)$ — spatially-weighted L1
+
+A small grid search over V2 parameters is recommended rather than attempting to convert from V1 values.
+
+## API Usage
+
+```python
+from wholistic_registration.utils.motion_correlation_pattern import (
+    decompose_episode_motion_modes,
+    getMotionModes,
+)
+
+# Decompose a single episode
+modes = decompose_episode_motion_modes(
+    episode,
+    Kmax=4,                # or higher, e.g. 8
+    lambda_sc=0.05,        # total regularization
+    rho=1.0,               # base sparsity weight
+    kappa=4.0,             # spatial compactness
+    max_iter=200,
+    support_rel_thresh=0.08,
+    K_selection_method='svd',   # 'svd' or 'fixed'
+    svd_target_r2=0.85,
+    use_velocity=False,    # False = cumulative displacement; True = frame-to-frame velocity
+    verbose=True,
+)
+
+# Or decompose all episodes at once
+all_modes = getMotionModes(motion_episodes, Kmax=4, lambda_sc=0.05, ...)
+```
+
+## `episode.mode_model` Metadata (V2)
+
+After optimization, `episode.mode_model` is a dict with the following keys:
+
+| Key | Description |
+|---|---|
+| `B` | Final B after hard threshold |
+| `B_before_hard_threshold` | Raw B at optimization convergence |
+| `H` | Activation matrix ($K \times T$) |
+| `loss_history` | List of per-iteration dicts with `loss`, `recon`, `sparse_compact`, `sparse_compact_raw`, `step_B`, `step_H`, `delta`, `relative_decrease`, `H_norm_error` |
+| `mode_centers_normalized` | Learned mode centroids in normalized coordinates $[0,1]^2$ |
+| `mode_centers_patch` | Centroids in patch-index coordinates |
+| `lambda_sc`, `rho`, `kappa` | Regularization hyperparameters |
+| `Kmax`, `K_init`, `K_final`, `K_modes`, `seeds` | K selection and initialization info |
+| `total_energy` | $\|\mathbf{M}\|_F^2$ |
+| `optimized_recon`, `optimized_r2` | Reconstruction loss / R² **before** hard threshold |
+| `final_recon`, `final_r2` | Reconstruction loss / R² **after** hard threshold |
+| `hard_threshold_support_mask` | Boolean mask of surviving (patch, mode) entries |
+| `hard_threshold_removed_count` | Number of (patch, mode) entries zeroed by hard threshold |
+| `hard_threshold_removed_energy` | Sum of squared B entries removed |
+| `K_selection_method`, `K_selected`, `K_select_info`, `svd_target_r2` | K selection diagnostics |
+| `B_scale`, `use_velocity`, `motion_field_used` | Motion field metadata |
+| `H_constraint` | `"row_l2_norm_equals_1"` |
+| `objective` | `"reconstruction_plus_sparse_compact"` |
+| `postprocessing` | `"hard_threshold_only"` |
+
+---
+
+# V2: Clustering Updates
+
+## New Entry Point: `getMotionPattern()`
+
+The primary clustering function is now **`getMotionPattern()`**, which supersedes `getMotionRegionPattern()`:
+
+```python
+from wholistic_registration.utils.motion_correlation_pattern import getMotionPattern
+
+patterns, kept_units, groups, labels, info = getMotionPattern(
+    motion_episodes,
+    unit_type="region",       # "region" (default) or "mode"
+    min_strength=0.0,
+    min_area=5,
+    min_duration=1,
+    min_iou=0.10,
+    omega=1.0,                # weight for activation DTW distance
+    mu=1.0,                   # weight for response field distance
+    b_distance="l2",          # "l2" or "correlation"
+    cluster_dist_thresh=0.8,
+    linkage_method="complete",
+    incompatible_dist=1e6,
+    verbose=True,
+)
+```
+
+### New Parameters
+
+**`unit_type`** — controls what is clustered:
+- `"region"` (default): collect `MotionRegion`s from all episodes (same as old `getMotionRegionPattern`). Requires running `split_episode_modes_to_regions` first.
+- `"mode"`: cluster `MotionMode` objects directly, **skipping the spatial region-splitting step**. This is useful when modes are already spatially coherent and don't need further fragmentation.
+
+**`b_distance`** — controls how response-field similarity is measured:
+- `"l2"` (default): normalized L2 distance on the spatial overlap: $\|\mathbf{B}_1 - \text{sign} \cdot \mathbf{B}_2\| \;/\; (\|\mathbf{B}_1\| + \|\mathbf{B}_2\|)$.
+- `"correlation"`: sign-insensitive Pearson correlation distance on the overlap: $1 - |\text{Pearson}_r(\mathbf{B}_1, \text{sign} \cdot \mathbf{B}_2)|$.
+
+### Backward Compatibility
+
+`getMotionRegionPattern()` is retained as a wrapper that delegates to `getMotionPattern(unit_type="region")`. Existing code using `getMotionRegionPattern` will continue to work without modification.
+
+### `filter_regions_for_patterns` — Now Handles Both Types
+
+The filtering function has been extended to work with both `MotionRegion` and `MotionMode` objects. When an attribute is missing on a `MotionMode` (e.g., `strength`, `area_effective`, `duration`, `mean_response_vector`), it is automatically computed from `response_strength` / `response_field` / `activation`.
+
+### New Helper Functions
+
+| Function | Description |
+|---|---|
+| `collect_regions_from_episodes(episodes)` | Collect all `MotionRegion`s from all episodes |
+| `collect_modes_from_episodes(episodes)` | Collect all `MotionMode`s from all episodes |
+| `collect_units_from_episodes(episodes, unit_type)` | Unified collector; dispatches to the above based on `unit_type` |
+| `_unit_centroid(unit)` | Compute spatial centroid from `response_strength` (fallback if `center_xy` is missing) |
+| `_response_field_correlation_on_overlap(r1, r2, sign2)` | Pearson correlation distance between response fields on spatial overlap |

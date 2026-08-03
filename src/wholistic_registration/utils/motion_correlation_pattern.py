@@ -514,6 +514,95 @@ class MotionPattern:
 # =============================================================================
 # Generic helpers
 # =============================================================================
+def _safe_float(x, default=0.0):
+    try:
+        x = float(x)
+        if np.isfinite(x):
+            return x
+    except Exception:
+        pass
+    return default
+
+
+def _as_bool_mask(mask):
+    mask = np.asarray(mask)
+    return mask.astype(bool)
+
+
+def _normalize_1d(x, eps=1e-12):
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    m = np.nanmax(np.abs(x)) if x.size > 0 else 0.0
+    if not np.isfinite(m) or m < eps:
+        return np.zeros_like(x, dtype=np.float32)
+    return (x / m).astype(np.float32)
+
+
+def _smooth_1d(x, win=3):
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+
+    if win is None or win <= 1:
+        return x.copy()
+
+    win = int(win)
+    kernel = np.ones(win, dtype=np.float32) / float(win)
+
+    return np.convolve(x, kernel, mode="same").astype(np.float32)
+
+
+def _compute_dff_stack(ca_patch_stack, baseline_percentile=20, eps=1e-6):
+    """
+    Compute dF/F along time axis.
+
+    Supports:
+        ca_patch_stack: (T, X, Y)
+        ca_patch_stack: (T, Z, X, Y)
+        or more generally: (T, *spatial_shape)
+    """
+    ca = np.asarray(ca_patch_stack, dtype=np.float32)
+
+    if ca.ndim < 2:
+        raise ValueError(f"ca_patch_stack should have shape (T, *spatial), got {ca.shape}")
+
+    base = np.nanpercentile(
+        ca,
+        baseline_percentile,
+        axis=0,
+        keepdims=True,
+    )
+
+    dff = (ca - base) / (np.abs(base) + eps)
+    dff = np.nan_to_num(dff, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return dff.astype(np.float32)
+
+
+def _zscore_1d(x, eps=1e-12):
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    mu = np.nanmean(x)
+    sd = np.nanstd(x)
+
+    if not np.isfinite(sd) or sd < eps:
+        return np.zeros_like(x, dtype=np.float32)
+
+    return ((x - mu) / (sd + eps)).astype(np.float32)
+
+
+def _zscore_time_matrix(X, eps=1e-12):
+    """
+    X: (T, P)
+    z-score each spatial trace over time.
+    """
+    X = np.asarray(X, dtype=np.float32)
+
+    mu = np.nanmean(X, axis=0, keepdims=True)
+    sd = np.nanstd(X, axis=0, keepdims=True)
+
+    Z = (X - mu) / (sd + eps)
+    Z[:, (sd.reshape(-1) < eps)] = 0.0
+    Z = np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return Z.astype(np.float32)
+
 
 def _safe_corr(a, b, eps=1e-12):
     a = np.asarray(a, dtype=np.float32).reshape(-1)
@@ -537,12 +626,10 @@ def _safe_corr(a, b, eps=1e-12):
 def _resample_1d(x, target_len=16):
     x = np.asarray(x, dtype=np.float32).reshape(-1)
     T = len(x)
-    if T == 0:
-        return np.zeros(target_len, dtype=np.float32)
     if T == target_len:
         return x.copy()
-    if T == 1:
-        return np.full(target_len, float(x[0]), dtype=np.float32)
+    if T <= 1:
+        return np.repeat(x, target_len).astype(np.float32)
     old = np.linspace(0.0, 1.0, T)
     new = np.linspace(0.0, 1.0, target_len)
     return np.interp(new, old, x).astype(np.float32)
@@ -563,6 +650,32 @@ def _resample_vector_func(v, target_len=16):
     out[:, 0] = np.interp(new, old, v[:, 0])
     out[:, 1] = np.interp(new, old, v[:, 1])
     return out
+
+
+def _normalize_energy(v, eps=1e-12):
+    v = np.asarray(v, dtype=np.float32)
+    n = np.linalg.norm(v.reshape(-1))
+    return v / max(float(n), eps)
+
+
+def _compute_temporal_feature_from_induced_motion(induced_motion, resampled_len=16, eps=1e-12):
+    bf = np.asarray(induced_motion, dtype=np.float32)
+    bf_norm = _normalize_energy(bf, eps=eps)
+    bf_rs = _resample_vector_func(bf_norm, target_len=resampled_len)
+    mag = np.linalg.norm(bf, axis=1)
+    mag_rs = _resample_1d(mag / max(float(np.sum(mag)), eps), target_len=resampled_len)
+    feat = np.concatenate([bf_rs.reshape(-1), mag_rs], axis=0).astype(np.float32)
+    return feat, bf_rs
+
+
+def _compute_activation_feature(h, resampled_len=16, eps=1e-12):
+    h = np.asarray(h, dtype=np.float32).reshape(-1)
+    h_rs = _resample_1d(h, target_len=resampled_len)
+    h_rs = h_rs / max(float(np.linalg.norm(h_rs)), eps)
+    dh = np.diff(h_rs, prepend=h_rs[0])
+    feat = np.concatenate([h_rs, dh], axis=0).astype(np.float32)
+    return feat, h_rs.astype(np.float32)
+
 
 def _compute_spatial_stats(region_magnitude, eps=1e-12):
     R = np.asarray(region_magnitude, dtype=np.float32)
@@ -654,11 +767,27 @@ def estimate_rest_state_motion(
     window_size_xy=5,
     scale=5.0,
     use_gpu="auto",
+    max_mad_t=21,
+    return_median=False,
 ):
     """
     Estimate resting-state motion fluctuation.
 
+    Uses Median Absolute Deviation (MAD) from a local spatiotemporal median:
+        restMotion = scale * 1.4826 * median(|motionMag - median_local|)
+
     If CuPy is available, use GPU median filters, matching the old implementation.
+
+    Parameters
+    ----------
+    max_mad_t : int
+        Cap on the MAD temporal window. Default 21 prevents the MAD filter
+        from becoming excessively expensive on long recordings (where
+        T//4 could be 100+).
+    return_median : bool
+        If True, also return the local median motion (needed by getMotionUnit
+        when use_abs_dev=True, so abs_dev = |motionMag - median_local| can be
+        compared against restMotion instead of raw motionMag).
     """
     use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
 
@@ -666,7 +795,7 @@ def estimate_rest_state_motion(
     T, X, Y = motionMag_np.shape
 
     wt = int(max(3, min(window_size_t, T if T % 2 == 1 else max(T - 1, 3))))
-    mad_t = max(3, T // 4)
+    mad_t = min(max(3, T // 4), int(max_mad_t))
 
     if use_gpu:
         motion_gpu = cp.asarray(motionMag_np)
@@ -686,7 +815,10 @@ def estimate_rest_state_motion(
         )
 
         rest_state_motion = scale * 1.4826 * mad_local
-        return cp.asnumpy(rest_state_motion).astype(np.float32)
+        result = cp.asnumpy(rest_state_motion).astype(np.float32)
+        if return_median:
+            return result, cp.asnumpy(median_local).astype(np.float32)
+        return result
 
     # CPU fallback
     median_local = ndi.median_filter(
@@ -703,7 +835,10 @@ def estimate_rest_state_motion(
         mode="reflect",
     )
 
-    return (scale * 1.4826 * mad_local).astype(np.float32)
+    result = (scale * 1.4826 * mad_local).astype(np.float32)
+    if return_median:
+        return result, median_local
+    return result
 
 
 def getMotionUnit(
@@ -713,6 +848,11 @@ def getMotionUnit(
     extend_radius=1,
     save_motion=False,
     use_gpu="auto",
+    close_gap_frames=0,
+    use_abs_dev=True,
+    median_local=None,
+    median_window_t=21,
+    median_window_xy=5,
 ):
     """
     Extract active intervals for each patch.
@@ -723,6 +863,30 @@ def getMotionUnit(
     - only interval grouping on CPU
 
     save_motion=False is recommended for the new pipeline.
+
+    Parameters
+    ----------
+    close_gap_frames : int
+        If > 0, apply temporal binary closing to the active mask before
+        start/end detection. This merges nearby active intervals separated
+        by gaps <= close_gap_frames, dramatically reducing CPU loop time
+        when using noisy signals like cumulative displacement.
+    use_abs_dev : bool
+        If True (default), the active condition is:
+            |motionMag - median_local| > restMotion
+        i.e. deviation from local baseline exceeds MAD threshold.
+        If False (old behavior), the condition is:
+            motionMag > restMotion
+    median_local : ndarray or None
+        Precomputed local median of motionMag, shape (T, X, Y). Only used
+        when use_abs_dev=True. If None, it is computed inside this function.
+        Pass the second return value of estimate_rest_state_motion(..., return_median=True).
+    median_window_t : int
+        Temporal window for median_local computation (only used when
+        use_abs_dev=True and median_local is not provided).
+    median_window_xy : int
+        Spatial window for median_local computation (only used when
+        use_abs_dev=True and median_local is not provided).
     """
     use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
 
@@ -736,7 +900,27 @@ def getMotionUnit(
         motionMag_gpu = cp.asarray(motionMag_np)
         rest_gpu = cp.asarray(rest_np)
 
-        active = motionMag_gpu > rest_gpu  # (T, X, Y)
+        if use_abs_dev:
+            # active: deviation from local baseline exceeds threshold
+            if median_local is not None:
+                median_gpu = cp.asarray(median_local, dtype=np.float32)
+            else:
+                wt = int(max(3, min(int(median_window_t), T if T % 2 == 1 else max(T - 1, 3))))
+                median_gpu = cupy_ndi.median_filter(
+                    motionMag_gpu,
+                    size=(wt, int(median_window_xy), int(median_window_xy)),
+                    mode="reflect",
+                )
+            abs_dev_gpu = cp.abs(motionMag_gpu - median_gpu)
+            active = abs_dev_gpu > rest_gpu  # (T, X, Y)
+        else:
+            active = motionMag_gpu > rest_gpu  # (T, X, Y)
+
+        # Merge nearby active gaps on GPU to reduce CPU loop iterations
+        if close_gap_frames is not None and close_gap_frames > 0:
+            import cupy as _cp
+            structure = _cp.ones((int(close_gap_frames) + 2, 1, 1), dtype=bool)
+            active = cupy_ndi.binary_closing(active, structure=structure)
 
         prev_active = cp.zeros_like(active)
         prev_active[1:] = active[:-1]
@@ -826,8 +1010,21 @@ def getMotionUnit(
 
         return units_map, active_mask
 
-    # CPU fallback: original simple version
-    active = motionMag_np > rest_np
+    # CPU fallback
+    if use_abs_dev:
+        if median_local is not None:
+            median_np = np.asarray(median_local, dtype=np.float32)
+        else:
+            wt = int(max(3, min(int(median_window_t), T if T % 2 == 1 else max(T - 1, 3))))
+            median_np = ndi.median_filter(
+                motionMag_np,
+                size=(wt, int(median_window_xy), int(median_window_xy)),
+                mode="reflect",
+            )
+        abs_dev_np = np.abs(motionMag_np - median_np)
+        active = abs_dev_np > rest_np
+    else:
+        active = motionMag_np > rest_np
 
     units_map = [[[] for _ in range(Y)] for _ in range(X)]
     active_mask = np.zeros((T, X, Y), dtype=bool)
@@ -946,13 +1143,22 @@ def getMotionEpisode(
     global_motion_mode="median",
     tolerant_time=1,
     min_total_area=30,
+    expand_frames=0,
     repair_mask=True,
     closing_iter=1,
     min_cc_area=4,
     dilation_iter=3,
     overlap_threshold=0.3,
 ):
-    """Build MotionEpisodes by grouping MotionUnits with similar time and overlapping region."""
+    """Build MotionEpisodes by grouping MotionUnits with similar time and overlapping region.
+
+    Parameters
+    ----------
+    expand_frames : int
+        Number of frames to expand each episode's time window in both directions
+        (before the first frame and after the last frame). This gives mode decomposition
+        more temporal context without changing the spatial region.
+    """
     if nx is None:
         raise ImportError("networkx is required for getMotionEpisode().")
 
@@ -1041,6 +1247,7 @@ def getMotionEpisode(
             if ratio > overlap_threshold:
                 G.add_edge(i, j)
 
+    T_total = motion_full.shape[0]
     episodes = []
     for comp in nx.connected_components(G):
         comp = list(comp)
@@ -1054,11 +1261,17 @@ def getMotionEpisode(
             mask = ndi.binary_fill_holes(mask)
         if int(mask.sum()) < min_total_area:
             continue
-        motion_delta_seg = motion_full[t_min:t_max + 1][:, mask, :]
-        motion_abs_seg = motion_full_abs[t_min:t_max + 1][:, mask, :]
-        global_motion_seg = global_motion_all[t_min:t_max + 1]
+
+        # ---- time expansion: add context frames before and after ----
+        ef = int(expand_frames)
+        t_min_exp = max(0, t_min - ef)
+        t_max_exp = min(T_total - 1, t_max + ef)
+
+        motion_delta_seg = motion_full[t_min_exp:t_max_exp + 1][:, mask, :]
+        motion_abs_seg = motion_full_abs[t_min_exp:t_max_exp + 1][:, mask, :]
+        global_motion_seg = global_motion_all[t_min_exp:t_max_exp + 1]
         ep = MotionEpisode(
-            time_range=[t_min, t_max],
+            time_range=[t_min_exp, t_max_exp],
             region_mask=mask.astype(np.uint8),
             episode_id=len(episodes),
             motion_delta=motion_delta_seg,
@@ -1070,20 +1283,187 @@ def getMotionEpisode(
     return episodes
 
 
+def filter_episodes_artifacts(
+    episodes: List[MotionEpisode],
+    valid_mask: np.ndarray,
+    max_fov_fraction: float = 0.5,
+    min_duration: int = 3,
+    max_duration: Optional[int] = None,
+    max_global_corr: Optional[float] = 0.90,
+    max_edge_fraction: Optional[float] = 0.80,
+    edge_width: int = 3,
+    verbose: bool = True,
+) -> List[MotionEpisode]:
+    """
+    Filter out likely motion-artifact episodes.
+
+    Four criteria (an episode is discarded if ANY criterion triggers):
+
+    1. **FOV coverage**: spatial_region area > max_fov_fraction * valid_area
+       → Whole-FOV drift is unlikely to be biological.
+
+    2. **Duration bounds**: duration < min_duration or > max_duration
+       → Too-short episodes are often noise spikes.
+         Too-long episodes may be slow drift.
+
+    3. **Global motion correlation**: mean patch motion highly correlated
+       with global motion → episode is just the whole sample moving together.
+
+    4. **Edge concentration**: high fraction of active patches at the
+       boundary of the valid mask → registration boundary artifacts.
+
+    Parameters
+    ----------
+    episodes : list of MotionEpisode
+    valid_mask : np.ndarray, bool, shape (Xp, Yp)
+        Patch-level valid mask (True = valid tissue).
+    max_fov_fraction : float
+        Max fraction of valid FOV an episode can cover.
+    min_duration : int
+        Minimum episode duration in frames.
+    max_duration : int, optional
+        Maximum episode duration in frames (None = no limit).
+    max_global_corr : float, optional
+        If mean correlation between episode mean motion and global motion
+        exceeds this, discard. None = skip check.
+    max_edge_fraction : float, optional
+        If fraction of episode area within `edge_width` of valid_mask boundary
+        exceeds this, discard. None = skip check.
+    edge_width : int
+        Width (in patches) of the boundary zone.
+    verbose : bool
+
+    Returns
+    -------
+    kept : list of MotionEpisode
+    """
+    valid_mask = np.asarray(valid_mask).astype(bool)
+    valid_area = int(valid_mask.sum())
+
+    if valid_area == 0:
+        raise ValueError("valid_mask is empty.")
+
+    # Precompute edge mask (patches near the boundary of valid_mask)
+    edge_mask = None
+    if max_edge_fraction is not None:
+        # Distance from each valid patch to the nearest invalid patch
+        dist_to_boundary = ndi.distance_transform_edt(valid_mask)
+        edge_mask = (dist_to_boundary > 0) & (dist_to_boundary <= int(edge_width))
+
+    kept = []
+    reasons = {
+        "fov_coverage": 0,
+        "duration_short": 0,
+        "duration_long": 0,
+        "global_corr": 0,
+        "edge_fraction": 0,
+    }
+
+    for ep in episodes:
+        # ------------------------------------------------------------
+        # Criterion 1: FOV coverage
+        # ------------------------------------------------------------
+        ep_mask = np.asarray(ep.spatial_region).astype(bool)
+        ep_area = int(ep_mask.sum())
+
+        if ep_area > max_fov_fraction * valid_area:
+            reasons["fov_coverage"] += 1
+            if verbose:
+                fov_frac = ep_area / max(valid_area, 1)
+                print(
+                    f"[artifact filter] ep={ep.episode_id} DISCARD: "
+                    f"FOV coverage={fov_frac:.3f} > {max_fov_fraction}"
+                )
+            continue
+
+        # ------------------------------------------------------------
+        # Criterion 2: Duration
+        # ------------------------------------------------------------
+        duration = int(ep.time_range[1] - ep.time_range[0] + 1)
+
+        if duration < min_duration:
+            reasons["duration_short"] += 1
+            if verbose:
+                print(
+                    f"[artifact filter] ep={ep.episode_id} DISCARD: "
+                    f"duration={duration} < {min_duration}"
+                )
+            continue
+
+        if max_duration is not None and duration > max_duration:
+            reasons["duration_long"] += 1
+            if verbose:
+                print(
+                    f"[artifact filter] ep={ep.episode_id} DISCARD: "
+                    f"duration={duration} > {max_duration}"
+                )
+            continue
+
+        # ------------------------------------------------------------
+        # Criterion 3: Global motion correlation
+        # ------------------------------------------------------------
+        if max_global_corr is not None:
+            gm = ep.global_motion
+            md = ep.motion_delta
+
+            if gm is not None and md is not None:
+                gm = np.asarray(gm, dtype=np.float32)  # (T, 2)
+                md = np.asarray(md, dtype=np.float32)   # (T, N, 2)
+                T_ep = md.shape[0]
+
+                if gm.shape[0] == T_ep and md.shape[1] > 0:
+                    # Mean motion across all patches in the episode
+                    mean_motion = np.mean(md, axis=1)  # (T, 2)
+
+                    # Correlation per component (x, y)
+                    corr_x = _safe_corr(mean_motion[:, 0], gm[:, 0])
+                    corr_y = _safe_corr(mean_motion[:, 1], gm[:, 1])
+                    mean_corr = (corr_x + corr_y) / 2.0
+
+                    if mean_corr > max_global_corr:
+                        reasons["global_corr"] += 1
+                        if verbose:
+                            print(
+                                f"[artifact filter] ep={ep.episode_id} DISCARD: "
+                                f"global_corr={mean_corr:.4f} > {max_global_corr}"
+                            )
+                        continue
+
+        # ------------------------------------------------------------
+        # Criterion 4: Edge concentration
+        # ------------------------------------------------------------
+        if max_edge_fraction is not None and edge_mask is not None:
+            if ep_mask.shape == edge_mask.shape:
+                edge_patches = int((ep_mask & edge_mask).sum())
+                edge_frac = edge_patches / max(ep_area, 1)
+
+                if edge_frac > max_edge_fraction:
+                    reasons["edge_fraction"] += 1
+                    if verbose:
+                        print(
+                            f"[artifact filter] ep={ep.episode_id} DISCARD: "
+                            f"edge_fraction={edge_frac:.3f} > {max_edge_fraction}"
+                        )
+                    continue
+
+        # All checks passed
+        kept.append(ep)
+
+    if verbose:
+        n_total = len(episodes)
+        n_kept = len(kept)
+        n_discarded = n_total - n_kept
+        print(
+            f"[artifact filter] {n_total} episodes → {n_kept} kept "
+            f"({n_discarded} discarded): {reasons}"
+        )
+
+    return kept
+
+
 # =============================================================================
 # Motion mode decomposition: Y_i(t) ~= sum h_k(t) b_ik
 # =============================================================================
-
-
-def _second_diff_matrix(T):
-    if T < 3:
-        return np.zeros((0, T), dtype=np.float32)
-    D2 = np.zeros((T - 2, T), dtype=np.float32)
-    for i in range(T - 2):
-        D2[i, i] = 1.0
-        D2[i, i + 1] = -2.0
-        D2[i, i + 2] = 1.0
-    return D2
 
 
 def _initialize_modes_spatial_seed(Y_data, valid_coords, Kmax=4, rng=None, min_seed_dist=3.0, eps=1e-12):
@@ -1131,266 +1511,307 @@ def _initialize_modes_spatial_seed(Y_data, valid_coords, Kmax=4, rng=None, min_s
     return H.astype(np.float32), B.astype(np.float32), seeds
 
 
+def _normalize_spatial_coords(valid_coords, mask_shape):
+    """Map patch coordinates to [0, 1]^2 for a dimensionless compactness loss."""
+    coords = np.asarray(valid_coords, dtype=np.float64)
+    scale = np.maximum(np.asarray(mask_shape, dtype=np.float64) - 1.0, 1.0)
+    return (coords / scale[None, :]).astype(np.float64)
+
+
+def _normalize_H_rows(H, reference=None, eps=1e-12):
+    """Retract every row of H onto the unit sphere without rescaling B."""
+    H = np.asarray(H, dtype=np.float64).copy()
+    norms = np.linalg.norm(H, axis=1, keepdims=True)
+    bad = norms[:, 0] <= eps
+    if np.any(bad):
+        if reference is None:
+            raise ValueError("Cannot normalize a zero row of H without a reference.")
+        H[bad] = np.asarray(reference, dtype=np.float64)[bad]
+        norms = np.linalg.norm(H, axis=1, keepdims=True)
+    return H / np.maximum(norms, eps)
+
+
+def _compute_mode_centroids(B, spatial_coords, previous=None, eps=1e-12):
+    """Return the amplitude-weighted spatial centroid of every mode."""
+    B = np.asarray(B, dtype=np.float64)
+    coords = np.asarray(spatial_coords, dtype=np.float64)
+    N = B.shape[0] // 2
+    amplitude = np.hypot(B[:N], B[N:])
+    mass = np.sum(amplitude, axis=0)
+    centers = np.empty((B.shape[1], 2), dtype=np.float64)
+    for k in range(B.shape[1]):
+        if mass[k] > eps:
+            centers[k] = np.sum(amplitude[:, k, None] * coords, axis=0) / mass[k]
+        elif previous is not None:
+            centers[k] = np.asarray(previous, dtype=np.float64)[k]
+        else:
+            centers[k] = np.mean(coords, axis=0)
+    return centers
+
+
+def _spatial_compact_penalty(
+    B,
+    spatial_coords,
+    centers,
+    rho=1.0,
+    kappa=4.0,
+    B_scale=1.0,
+    eps=1e-12,
+):
+    """Dimensionless sparse-compact penalty and its per-patch weights."""
+    B = np.asarray(B, dtype=np.float64)
+    coords = np.asarray(spatial_coords, dtype=np.float64)
+    centers = np.asarray(centers, dtype=np.float64)
+    N = B.shape[0] // 2
+    K = B.shape[1]
+    amplitude = np.hypot(B[:N], B[N:])
+    distance_sq = np.sum((coords[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+    weights = float(rho) + float(kappa) * distance_sq
+    raw = float(np.sum(weights * amplitude) / max(N * K * B_scale, eps))
+    return raw, weights
+
+
 def _group_soft_threshold_B(B, thresh, eps=1e-12):
-    B = np.asarray(B, dtype=np.float32).copy()
+    """Weighted group soft-thresholding of each vector b_ik=(bx_ik, by_ik)."""
+    B = np.asarray(B, dtype=np.float64).copy()
     N2, K = B.shape
     N = N2 // 2
     Bx = B[:N, :]
     By = B[N:, :]
-    norm = np.sqrt(Bx ** 2 + By ** 2)
+    norm = np.hypot(Bx, By)
+    thresh = np.asarray(thresh, dtype=np.float64)
     scale = np.maximum(0.0, 1.0 - thresh / np.maximum(norm, eps))
     B[:N, :] = Bx * scale
     B[N:, :] = By * scale
     return B
 
 
-def _mode_column_soft_threshold_B(B, thresh, eps=1e-12):
-    B = np.asarray(B, dtype=np.float32).copy()
-    col_norm = np.linalg.norm(B, axis=0)
-    scale = np.maximum(0.0, 1.0 - thresh / np.maximum(col_norm, eps))
-    return B * scale[None, :]
+def _sparse_compact_objective(
+    M,
+    B,
+    H,
+    spatial_coords,
+    centers,
+    lambda_sc,
+    rho,
+    kappa,
+    B_scale,
+    total_energy,
+    eps=1e-12,
+):
+    residual = np.asarray(M, dtype=np.float64) - B @ H
+    recon = float(np.sum(residual ** 2) / total_energy)
+    compact_raw, _ = _spatial_compact_penalty(
+        B,
+        spatial_coords,
+        centers,
+        rho=rho,
+        kappa=kappa,
+        B_scale=B_scale,
+        eps=eps,
+    )
+    compact = float(lambda_sc) * compact_raw
+    return recon + compact, recon, compact, compact_raw
 
 
 def _fit_motion_modes_minimal(
     M,
     B,
     H,
-    lambda_B=0.05,
-    lambda_H=0.01,
-    lambda_mode=0.01,
-    max_iter=100,
+    spatial_coords,
+    lambda_sc=0.05,
+    rho=1.0,
+    kappa=4.0,
+    max_iter=200,
     tol=1e-4,
     verbose=True,
     eps=1e-12,
-    scaled_B_penalty=True,
     B_scale=None,
+    initial_centers=None,
+    max_backtracking=30,
 ):
-    M = np.asarray(M, dtype=np.float32)
-    B = np.asarray(B, dtype=np.float32)
-    H = np.asarray(H, dtype=np.float32)
+    """Fit reconstruction + sparse-compact loss with ||H[k]||_2 = 1.
+
+    The optimized objective is
+
+        ||M - B H||_F^2 / ||M||_F^2
+        + lambda_sc/(N K s_B) * sum_{i,k}
+          (rho + kappa ||r_i - mu_k||_2^2) ||b_ik||_2,
+
+    where r_i are normalized patch coordinates and mu_k is the
+    amplitude-weighted centroid of mode k.  There is deliberately no temporal
+    smoothness term, Ridge term, graph-Laplacian term, or mode-column penalty.
+
+    B is updated by weighted group-Lasso proximal gradient.  The centroids are
+    then updated exactly.  H is updated on a product of unit spheres using a
+    tangent gradient and row-normalization retraction.  Backtracking rejects
+    any block step that would increase the objective.
+    """
+    M = np.asarray(M, dtype=np.float64)
+    B = np.asarray(B, dtype=np.float64).copy()
+    H = _normalize_H_rows(H, eps=eps)
+    spatial_coords = np.asarray(spatial_coords, dtype=np.float64)
 
     N2, T = M.shape
     N = N2 // 2
     K = H.shape[0]
 
     if K == 0:
-        return B, H, []
-
-    D2 = _second_diff_matrix(T)
-    L = D2.T @ D2
+        return B.astype(np.float32), H.astype(np.float32), [], np.zeros((0, 2), dtype=np.float32)
+    if N2 != 2 * len(spatial_coords):
+        raise ValueError("spatial_coords must contain one coordinate for each B patch.")
+    if lambda_sc < 0 or rho < 0 or kappa < 0:
+        raise ValueError("lambda_sc, rho, and kappa must be non-negative.")
 
     total_energy = float(np.sum(M ** 2)) + eps
-
     if B_scale is None:
-        B_scale = _estimate_motion_scale_from_M(M, eps=eps)
+        B_scale = float(np.sqrt(T) * np.sqrt(np.mean(M ** 2)) + eps)
+    B_scale = max(float(B_scale), eps)
 
-    # ------------------------------------------------------------
-    # Convert normalized penalties to equivalent raw proximal lambdas
-    # ------------------------------------------------------------
-    if scaled_B_penalty:
-        # patch loss:
-        # lambda_B * mean_{i,k} ||b_ik / B_scale||
-        lambda_B_eff = lambda_B / (max(N * K * B_scale, eps))
-
-        # mode loss:
-        # lambda_mode * mean_k sqrt(mean_i ||b_ik / B_scale||^2)
-        # = lambda_mode / (K * sqrt(N) * B_scale) * sum_k ||B_k||
-        lambda_mode_eff = lambda_mode / (max(K * np.sqrt(max(N, 1)) * B_scale, eps))
+    if initial_centers is None:
+        centers = _compute_mode_centroids(B, spatial_coords, eps=eps)
     else:
-        lambda_B_eff = lambda_B
-        lambda_mode_eff = lambda_mode
+        centers = _compute_mode_centroids(
+            B,
+            spatial_coords,
+            previous=np.asarray(initial_centers, dtype=np.float64),
+            eps=eps,
+        )
 
+    loss, recon, compact, compact_raw = _sparse_compact_objective(
+        M, B, H, spatial_coords, centers, lambda_sc, rho, kappa,
+        B_scale, total_energy, eps=eps,
+    )
     loss_history = []
 
     for it in range(max_iter):
         B_old = B.copy()
         H_old = H.copy()
+        centers_old = centers.copy()
+        loss_old = loss
 
-        # -------------------------
-        # update B
-        # -------------------------
+        # B block: proximal gradient with the centroid held fixed.
         HHt = H @ H.T
-        step_B = 1.0 / (np.linalg.norm(HHt, ord=2) + eps)
-
-        # normalized reconstruction gradient
         grad_B = (2.0 / total_energy) * (B @ H - M) @ H.T
-
-        lip_B = (2.0 / total_energy) * np.linalg.norm(HHt, ord=2)
+        lip_B = (2.0 / total_energy) * float(np.linalg.norm(HHt, ord=2))
         step_B = 1.0 / (lip_B + eps)
-
-        B_tmp = B - step_B * grad_B
-
-        tau_patch = step_B * lambda_B_eff
-        tau_mode = step_B * lambda_mode_eff
-
-        B_tmp = _group_soft_threshold_B(
-            B_tmp,
-            tau_patch,
-            eps=eps,
+        _, spatial_weights = _spatial_compact_penalty(
+            B, spatial_coords, centers, rho=rho, kappa=kappa,
+            B_scale=B_scale, eps=eps,
         )
-
-        B = _mode_column_soft_threshold_B(
-            B_tmp,
-            tau_mode,
-            eps=eps,
-        )
-
-        # -------------------------
-        # update H
-        # -------------------------
-        smooth_norm = max(K * max(T - 2, 1), 1)
-
-        BtB = B.T @ B
-
-        lip_H = (
-            (2.0 / total_energy) * np.linalg.norm(BtB, ord=2)
-            + (2.0 * lambda_H / smooth_norm) * np.linalg.norm(L, ord=2)
-            + eps
-        )
-
-        step_H = 1.0 / lip_H
-
-        grad_H = (
-            (2.0 / total_energy) * B.T @ (B @ H - M)
-            + (2.0 * lambda_H / smooth_norm) * (H @ L)
-        )
-
-        H = H - step_H * grad_H
-        # normalize H and absorb scale into B
-        for k in range(K):
-            nrm = np.linalg.norm(H[k])
-            if nrm > eps:
-                H[k] /= nrm
-                B[:, k] *= nrm
-
-        # -------------------------
-        # diagnostics / loss logging
-        # -------------------------
-        R = M - B @ H
-
-        recon_raw = 0.5 * float(np.sum(R ** 2))
-        recon_norm = float(np.sum(R ** 2) / total_energy)
-
-        if scaled_B_penalty:
-            pen = _compute_B_penalties_scaled(
-                B,
-                lambda_B=lambda_B,
-                lambda_mode=lambda_mode,
-                B_scale=B_scale,
-                eps=eps,
+        fixed_center_loss = loss
+        accepted_B = False
+        for _ in range(max_backtracking):
+            threshold = (
+                step_B * float(lambda_sc) * spatial_weights
+                / max(N * K * B_scale, eps)
             )
-            patch_sparse = pen["patch_loss"]
-            mode_sparse = pen["mode_loss"]
-            raw_patch = pen["raw_patch"]
-            raw_mode = pen["raw_mode"]
-        else:
-            bmag = np.sqrt(B[:N, :] ** 2 + B[N:, :] ** 2 + eps)
-            patch_sparse = lambda_B * float(np.sum(bmag))
-            mode_sparse = lambda_mode * float(np.sum(np.linalg.norm(B, axis=0)))
-            raw_patch = float(np.sum(bmag))
-            raw_mode = float(np.sum(np.linalg.norm(B, axis=0)))
+            B_trial = _group_soft_threshold_B(B - step_B * grad_B, threshold, eps=eps)
+            trial_loss, _, _, _ = _sparse_compact_objective(
+                M, B_trial, H, spatial_coords, centers, lambda_sc, rho,
+                kappa, B_scale, total_energy, eps=eps,
+            )
+            if trial_loss <= fixed_center_loss + 1e-12:
+                B = B_trial
+                accepted_B = True
+                break
+            step_B *= 0.5
+        if not accepted_B:
+            step_B = 0.0
 
-        # smooth 也用 mean 打印，避免 T/K 不同导致不可比
-        if T >= 3:
-            smooth_raw = float(np.mean((H @ D2.T) ** 2))
-            smooth = lambda_H * smooth_raw
-        else:
-            smooth_raw = 0.0
-            smooth = 0.0
+        # mu block: this weighted mean is the exact minimizer for fixed B.
+        centers = _compute_mode_centroids(B, spatial_coords, previous=centers, eps=eps)
 
-        # 注意：这里的 loss 是 normalized diagnostic loss，不再是 raw loss
-        loss = recon_norm + patch_sparse + mode_sparse + smooth
-        loss_history.append(loss)
-
-        delta = float(
-            np.mean(np.abs(B - B_old))
-            + np.mean(np.abs(H - H_old))
+        # H block: Riemannian gradient step on ||H[k]||_2 = 1.
+        grad_H = (2.0 / total_energy) * B.T @ (B @ H - M)
+        grad_H_tangent = grad_H - np.sum(grad_H * H, axis=1, keepdims=True) * H
+        grad_H_norm_sq = float(np.sum(grad_H_tangent ** 2))
+        lip_H = (2.0 / total_energy) * float(np.linalg.norm(B.T @ B, ord=2))
+        step_H = 1.0 / (lip_H + eps)
+        before_H_loss, _, _, _ = _sparse_compact_objective(
+            M, B, H, spatial_coords, centers, lambda_sc, rho, kappa,
+            B_scale, total_energy, eps=eps,
         )
+        accepted_H = grad_H_norm_sq <= eps
+        if not accepted_H:
+            for _ in range(max_backtracking):
+                H_trial = _normalize_H_rows(
+                    H - step_H * grad_H_tangent,
+                    reference=H,
+                    eps=eps,
+                )
+                trial_loss, _, _, _ = _sparse_compact_objective(
+                    M, B, H_trial, spatial_coords, centers, lambda_sc,
+                    rho, kappa, B_scale, total_energy, eps=eps,
+                )
+                armijo_rhs = before_H_loss - 1e-4 * step_H * grad_H_norm_sq
+                if trial_loss <= armijo_rhs + 1e-12:
+                    H = H_trial
+                    accepted_H = True
+                    break
+                step_H *= 0.5
+        if not accepted_H:
+            step_H = 0.0
+
+        loss, recon, compact, compact_raw = _sparse_compact_objective(
+            M, B, H, spatial_coords, centers, lambda_sc, rho, kappa,
+            B_scale, total_energy, eps=eps,
+        )
+        if loss > loss_old + 1e-10:
+            B, H, centers = B_old, H_old, centers_old
+            loss, recon, compact, compact_raw = _sparse_compact_objective(
+                M, B, H, spatial_coords, centers, lambda_sc, rho, kappa,
+                B_scale, total_energy, eps=eps,
+            )
+            step_B = 0.0
+            step_H = 0.0
+
+        delta = float(np.mean(np.abs(B - B_old)) + np.mean(np.abs(H - H_old)))
+        relative_decrease = float((loss_old - loss) / max(abs(loss_old), eps))
+        h_norm_error = float(np.max(np.abs(np.linalg.norm(H, axis=1) - 1.0)))
+        loss_history.append({
+            "loss": float(loss),
+            "recon": float(recon),
+            "sparse_compact": float(compact),
+            "sparse_compact_raw": float(compact_raw),
+            "step_B": float(step_B),
+            "step_H": float(step_H),
+            "delta": delta,
+            "relative_decrease": relative_decrease,
+            "H_norm_error": h_norm_error,
+        })
 
         if verbose:
             print(
                 f"[mode fit] iter={it:03d}, "
-                f"loss={loss:.6f}, "
-                f"recon_raw={recon_raw:.6f}, "
-                f"recon_norm={recon_norm:.6e}, "
-                f"patch={patch_sparse:.6f}, "
-                f"mode={mode_sparse:.6f}, "
-                f"smooth={smooth:.6f}, "
-                f"raw_patch={raw_patch:.6f}, "
-                f"raw_mode={raw_mode:.6f}, "
-                f"B_scale={B_scale:.6f}, "
-                f"delta={delta:.3e}"
+                f"loss={loss:.6e}, recon={recon:.6e}, "
+                f"sparse_compact={compact:.6e}, "
+                f"delta={delta:.3e}, H_norm_error={h_norm_error:.2e}"
             )
 
-        if delta < tol:
+        if relative_decrease <= tol and delta <= np.sqrt(tol):
             break
 
-    return B.astype(np.float32), H.astype(np.float32), loss_history
+    return (
+        B.astype(np.float32),
+        H.astype(np.float32),
+        loss_history,
+        centers.astype(np.float32),
+    )
 
-
-def _prune_BH_modes(
-    B,
-    H,
-    M,
-    support_rel_thresh=0.10,
-    min_mode_mass=1e-3,
-    min_incremental_energy=0.005,
-    min_support_area=3,
-    max_mode_density=1.0,
-    eps=1e-12,
-):
-    B = np.asarray(B, dtype=np.float32)
-    H = np.asarray(H, dtype=np.float32)
-    M = np.asarray(M, dtype=np.float32)
-    N2, T = M.shape
-    N = N2 // 2
-    K = H.shape[0]
-    if K == 0:
-        return B, H, {}
-    strength = np.sqrt(B[:N, :] ** 2 + B[N:, :] ** 2)
-    mass = np.sum(strength, axis=0)
-    support_area = np.zeros(K, dtype=np.int32)
-    density = np.zeros(K, dtype=np.float32)
-    for k in range(K):
-        s = strength[:, k]
-        vmax = float(np.max(s))
-        if vmax > eps:
-            support = s > support_rel_thresh * vmax
-            support_area[k] = int(np.sum(support))
-            density[k] = float(support_area[k] / max(N, 1))
-    R_full = M - B @ H
-    err_full = float(np.sum(R_full ** 2))
-    total = float(np.sum(M ** 2)) + eps
-    incremental = np.zeros(K, dtype=np.float32)
-    for k in range(K):
-        B_wo = B.copy()
-        B_wo[:, k] = 0.0
-        err_wo = float(np.sum((M - B_wo @ H) ** 2))
-        incremental[k] = max(0.0, (err_wo - err_full) / total)
-    keep = []
-    for k in range(K):
-        if mass[k] < min_mode_mass:
-            continue
-        if incremental[k] < min_incremental_energy:
-            continue
-        if support_area[k] < min_support_area:
-            continue
-        if density[k] > max_mode_density:
-            continue
-        keep.append(k)
-    if len(keep) == 0:
-        keep = [int(np.argmax(incremental))]
-    keep = np.asarray(keep, dtype=np.int64)
-    info = {
-        "mode_mass": mass,
-        "support_area": support_area,
-        "density": density,
-        "incremental": incremental,
-        "keep": keep,
-        "K_before_prune": K,
-        "K_after_prune": len(keep),
-    }
-    return B[:, keep].astype(np.float32), H[keep, :].astype(np.float32), info
+def _hard_threshold_B(B, support_rel_thresh=0.08, eps=1e-12):
+    """Keep the existing post-fit relative hard-thresholding behavior."""
+    B = np.asarray(B, dtype=np.float32).copy()
+    N = B.shape[0] // 2
+    amplitude = np.hypot(B[:N], B[N:])
+    max_amplitude = np.max(amplitude, axis=0, keepdims=True)
+    support_mask = amplitude > support_rel_thresh * max_amplitude
+    support_mask[:, max_amplitude[0] <= eps] = False
+    drop = ~support_mask
+    removed_energy = float(np.sum(B[:N][drop] ** 2 + B[N:][drop] ** 2))
+    B[:N][drop] = 0.0
+    B[N:][drop] = 0.0
+    return B, support_mask, int(np.sum(drop)), removed_energy
 
 
 def _build_motion_modes_from_BH(
@@ -1403,11 +1824,10 @@ def _build_motion_modes_from_BH(
     episode_id,
     time_range,
     global_motion,
-    min_mode_mass=1e-3,
-    min_explained_energy=0.01,
     support_rel_thresh=0.10,
     eps=1e-12,
 ):
+    """Convert every post-threshold B/H component into a MotionMode."""
     N2, T = M.shape
     N = N2 // 2
     K = H.shape[0]
@@ -1418,20 +1838,16 @@ def _build_motion_modes_from_BH(
         response_compact = np.stack([B[:N, k], B[N:, k]], axis=1).astype(np.float32)
         strength = np.linalg.norm(response_compact, axis=1)
         mass = float(np.sum(strength))
-        if mass < min_mode_mass:
-            continue
         Mk = B[:, [k]] @ H[[k], :]
         explained = float(np.sum(Mk ** 2) / total_energy)
-        if explained < min_explained_energy:
-            continue
         field = np.zeros((X, Y, 2), dtype=np.float32)
         A = np.zeros((X, Y), dtype=np.float32)
         for idx, (r, c) in enumerate(valid_coords):
             field[r, c, :] = response_compact[idx]
             A[r, c] = strength[idx]
-        vmax = float(np.max(A))
-        support = A > support_rel_thresh * vmax if vmax > eps else np.zeros((X, Y), dtype=bool)
-        direction = field / np.maximum(A[:, :, None], eps)
+        support = A > eps
+        direction = np.zeros_like(field, dtype=np.float32)
+        direction[support] = field[support] / A[support, None]
         h = H[k].astype(np.float32)
         recon_k = h[:, None, None] * response_compact[None, :, :]
         resid_k = Y_data - recon_k
@@ -1456,7 +1872,11 @@ def _build_motion_modes_from_BH(
             mode_mass=mass,
             seed_position=seed_position,
             confidence=1.0,
-            metadata={"support_rel_thresh": support_rel_thresh, "model": "motion_mode_B"},
+            metadata={
+                "support_rel_thresh": support_rel_thresh,
+                "model": "motion_mode_sparse_compact",
+                "postprocessing": "hard_threshold_only",
+            },
         )
         modes.append(mode)
     return modes
@@ -1478,182 +1898,6 @@ def _compute_recon_r2(M, B, H, eps=1e-12):
     return 1.0 - loss / energy
 
 
-def _normalize_BH(B, H, eps=1e-8):
-    """
-    Normalize each row of H to unit norm and absorb scale into B columns.
-
-    B: (D, K)
-    H: (K, T)
-    """
-    B = np.asarray(B, dtype=np.float32).copy()
-    H = np.asarray(H, dtype=np.float32).copy()
-
-    K = H.shape[0]
-    for k in range(K):
-        n = float(np.linalg.norm(H[k]))
-        if n > eps:
-            H[k] /= n
-            B[:, k] *= n
-
-    return B, H
-
-
-def _activation_merge_groups(H, activation_merge_thresh=0.95, eps=1e-8):
-    """
-    Build merge groups using sign-invariant cosine similarity between activations.
-
-    H: (K, T)
-    """
-    H = np.asarray(H, dtype=np.float32)
-    K = H.shape[0]
-
-    Hn = H / np.maximum(np.linalg.norm(H, axis=1, keepdims=True), eps)
-    sim = np.abs(Hn @ Hn.T)
-
-    parent = list(range(K))
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    for i in range(K):
-        for j in range(i + 1, K):
-            if sim[i, j] >= activation_merge_thresh:
-                union(i, j)
-
-    groups_dict = {}
-    for k in range(K):
-        groups_dict.setdefault(find(k), []).append(k)
-
-    groups = list(groups_dict.values())
-    return groups, sim
-
-
-def _rank1_merge_one_group(B_group, H_group, eps=1e-8):
-    """
-    Merge one group by finding the best rank-1 approximation to:
-
-        M_group = B_group @ H_group
-
-    B_group: (D, Kg)
-    H_group: (Kg, T)
-
-    Return:
-        b_new: (D,)
-        h_new: (T,)
-        rel_err: rank-1 reconstruction relative error of this group
-    """
-    M_group = B_group @ H_group  # (D, T)
-
-    energy = float(np.sum(M_group * M_group)) + eps
-    if energy <= eps:
-        D, _ = B_group.shape
-        T = H_group.shape[1]
-        return np.zeros(D, dtype=np.float32), np.zeros(T, dtype=np.float32), 1.0
-
-    # Since T is usually small, SVD of (D,T) is acceptable.
-    U, S, Vt = np.linalg.svd(M_group, full_matrices=False)
-
-    b_new = (U[:, 0] * S[0]).astype(np.float32)  # (D,)
-    h_new = Vt[0].astype(np.float32)             # (T,)
-
-    M_rank1 = b_new[:, None] @ h_new[None, :]
-    err = float(np.sum((M_group - M_rank1) ** 2))
-    rel_err = err / energy
-
-    return b_new, h_new, rel_err
-
-
-def _refit_B_given_H(M, H, ridge=1e-6):
-    """
-    Given M and H, solve optimal B in least squares sense:
-
-        min_B ||M - B H||_F^2
-
-    B = M H^T (H H^T + ridge I)^(-1)
-
-    M: (D, T)
-    H: (K, T)
-
-    Return:
-        B: (D, K)
-    """
-    H = np.asarray(H, dtype=np.float32)
-    M = np.asarray(M, dtype=np.float32)
-
-    K = H.shape[0]
-    gram = H @ H.T
-    gram = gram + ridge * np.eye(K, dtype=np.float32)
-
-    rhs = M @ H.T  # (D, K)
-
-    # Solve gram.T X.T = rhs.T
-    B = np.linalg.solve(gram.T, rhs.T).T
-    return B.astype(np.float32)
-
-def _select_elbow_k_from_curve(K_values, r2_values, target_r2=0.98):
-    """
-    Select K by:
-    1. If target_r2 is reached, choose the smallest K reaching it.
-    2. Otherwise use geometric elbow: max distance to line between endpoints.
-    """
-    K_values = np.asarray(K_values, dtype=np.float32)
-    r2_values = np.asarray(r2_values, dtype=np.float32)
-
-    valid = np.isfinite(r2_values)
-    K_values = K_values[valid]
-    r2_values = r2_values[valid]
-
-    if len(K_values) == 0:
-        raise ValueError("No valid K/R2 values for K selection.")
-
-    # Rule 1: smallest K reaching target R2
-    hit = np.where(r2_values >= target_r2)[0]
-    if len(hit) > 0:
-        idx = int(hit[0])
-        return int(K_values[idx]), {
-            "method": "target_r2",
-            "target_r2": float(target_r2),
-            "selected_idx": idx,
-        }
-
-    # Rule 2: geometric elbow
-    if len(K_values) <= 2:
-        idx = int(np.argmax(r2_values))
-        return int(K_values[idx]), {
-            "method": "best_r2_fallback",
-            "selected_idx": idx,
-        }
-
-    x = (K_values - K_values.min()) / (K_values.max() - K_values.min() + 1e-12)
-    y = (r2_values - r2_values.min()) / (r2_values.max() - r2_values.min() + 1e-12)
-
-    p0 = np.array([x[0], y[0]], dtype=np.float32)
-    p1 = np.array([x[-1], y[-1]], dtype=np.float32)
-
-    line = p1 - p0
-    line_norm = np.linalg.norm(line) + 1e-12
-
-    dists = []
-    for xi, yi in zip(x, y):
-        p = np.array([xi, yi], dtype=np.float32)
-        dist = abs(np.cross(line, p - p0)) / line_norm
-        dists.append(dist)
-
-    idx = int(np.argmax(dists))
-    return int(K_values[idx]), {
-        "method": "geometric_elbow",
-        "selected_idx": idx,
-        "target_r2": float(target_r2),
-    }
-
 def _select_K_by_svd_energy(
     M,
     target_r2=0.85,
@@ -1672,6 +1916,8 @@ def _select_K_by_svd_energy(
     info : dict
     """
     M = np.asarray(M, dtype=np.float32)
+    if M.ndim != 2 or min(M.shape) == 0:
+        raise ValueError("M must be a non-empty two-dimensional matrix.")
 
     U, S, Vt = np.linalg.svd(M, full_matrices=False)
 
@@ -1686,7 +1932,7 @@ def _select_K_by_svd_energy(
     else:
         Kmax_eff = min(int(Kmax), rank_max)
 
-    K_min = max(1, int(K_min))
+    K_min = min(max(1, int(K_min)), rank_max)
     Kmax_eff = max(K_min, Kmax_eff)
 
     selected_K = Kmax_eff
@@ -1723,464 +1969,133 @@ def _select_K_by_svd_energy(
 
     return int(selected_K), info
 
-def _sweep_K_for_episode_modes(
-    M,
-    Y_data,
-    valid_coords,
-    Kmax=20,
-    K_min=1,
-    K_list=None,
-    n_init=3,
-    short_iter=10,
-    lambda_B=0.001,
-    lambda_H=0.05,
-    lambda_mode=0.005,
-    tol=1e-4,
-    target_r2=0.98,
-    verbose=True,
-    random_state=0,
-    eps=1e-12,
-):
-    """
-    Try different K and choose an elbow/target K.
-
-    For each K:
-        run n_init initializations
-        fit only short_iter
-        keep best R2
-    """
-    rng = np.random.default_rng(random_state)
-
-    if K_list is None:
-        K_list = list(range(K_min, Kmax + 1))
-    else:
-        K_list = [int(k) for k in K_list if int(k) >= K_min and int(k) <= Kmax]
-
-    records = []
-    best_by_K = {}
-
-    B_scale = _estimate_motion_scale_from_M(M, eps=eps)
-
-    for K in K_list:
-        best = None
-
-        for s in range(n_init):
-            seed = int(rng.integers(0, 2**31 - 1))
-            local_rng = np.random.default_rng(seed)
-
-            H0, B0, seeds = _initialize_modes_spatial_seed(
-                Y_data,
-                valid_coords,
-                Kmax=K,
-                rng=local_rng,
-                eps=eps,
-            )
-
-            if short_iter > 0:
-                B_fit, H_fit, loss_hist = _fit_motion_modes_minimal(
-                    M,
-                    B0,
-                    H0,
-                    lambda_B=lambda_B,
-                    lambda_H=lambda_H,
-                    lambda_mode=lambda_mode,
-                    max_iter=short_iter,
-                    tol=tol,
-                    verbose=False,
-                    eps=eps,
-                    scaled_B_penalty=True,
-                    B_scale=B_scale,
-                )
-            else:
-                B_fit, H_fit = B0, H0
-                loss_hist = []
-
-            r2 = _compute_recon_r2(M, B_fit, H_fit, eps=eps)
-            recon_norm = _compute_recon_loss_normalized(M, B_fit, H_fit, eps=eps)
-
-            pen = _compute_B_penalties_scaled(
-                B_fit,
-                lambda_B=lambda_B,
-                lambda_mode=lambda_mode,
-                B_scale=B_scale,
-                eps=eps,
-            )
-
-            rec = {
-                "K": int(K),
-                "seed": seed,
-                "r2": float(r2),
-                "recon_norm": float(recon_norm),
-                "patch_loss_scaled": float(pen["patch_loss"]),
-                "mode_loss_scaled": float(pen["mode_loss"]),
-                "raw_patch_scaled": float(pen["raw_patch"]),
-                "raw_mode_scaled": float(pen["raw_mode"]),
-                "B": B_fit,
-                "H": H_fit,
-                "seeds": seeds,
-                "loss_history": loss_hist,
-            }
-
-            if best is None or rec["r2"] > best["r2"]:
-                best = rec
-
-        best_by_K[K] = best
-        records.append({
-            k: v for k, v in best.items()
-            if k not in ("B", "H", "seeds", "loss_history")
-        })
-
-        if verbose:
-            print(
-                f"[K sweep] K={K:02d}, "
-                f"best_R2={best['r2']:.6f}, "
-                f"recon_norm={best['recon_norm']:.6e}, "
-                f"patch={best['patch_loss_scaled']:.6f}, "
-                f"mode={best['mode_loss_scaled']:.6f}"
-            )
-
-    K_values = [r["K"] for r in records]
-    r2_values = [r["r2"] for r in records]
-
-    selected_K, select_info = _select_elbow_k_from_curve(
-        K_values,
-        r2_values,
-        target_r2=target_r2,
-    )
-
-    selected = best_by_K[selected_K]
-
-    if verbose:
-        print(
-            f"[K selected] K={selected_K}, "
-            f"method={select_info['method']}, "
-            f"R2={selected['r2']:.6f}"
-        )
-
-    return selected_K, selected, {
-        "records": records,
-        "select_info": select_info,
-        "K_values": K_values,
-        "r2_values": r2_values,
-    }
-
-def _merge_modes_reconstruction_preserving(
-    M,
-    B,
-    H,
-    groups,
-    ridge=1e-6,
-    max_r2_drop=0.03,
-    max_group_rank1_error=0.20,
-    reject_bad_groups=True,
-    verbose=True,
-):
-    """
-    Reconstruction-preserving merge.
-
-    Steps:
-        1. For each proposed group, approximate its original contribution
-           B_group @ H_group by one rank-1 mode.
-        2. Stack merged H.
-        3. Given merged H, solve optimal B by least squares.
-        4. Reject merge if global R2 drop is too large.
-
-    Parameters
-    ----------
-    M : (D, T)
-    B : (D, K)
-    H : (K, T)
-    groups : list[list[int]]
-        Proposed groups from activation similarity.
-    max_r2_drop : float
-        Maximum allowed drop in reconstruction R2 after merge initialization.
-        If exceeded, fall back to no merge.
-    max_group_rank1_error : float
-        If one proposed group is not well approximated by rank-1, optionally
-        keep its members separate.
-    reject_bad_groups : bool
-        If True, a proposed group with high rank-1 error will not be merged.
-    """
-    M = np.asarray(M, dtype=np.float32)
-    B = np.asarray(B, dtype=np.float32)
-    H = np.asarray(H, dtype=np.float32)
-
-    B, H = _normalize_BH(B, H)
-
-    recon_before = _compute_recon_loss(M, B, H)
-    r2_before = _compute_recon_r2(M, B, H)
-
-    final_B_cols = []
-    final_H_rows = []
-    final_groups = []
-    group_errors = []
-
-    for group in groups:
-        group = list(group)
-
-        if len(group) == 1:
-            k = group[0]
-            final_B_cols.append(B[:, k].copy())
-            final_H_rows.append(H[k].copy())
-            final_groups.append(group)
-            group_errors.append(0.0)
-            continue
-
-        B_group = B[:, group]       # (D, Kg)
-        H_group = H[group, :]       # (Kg, T)
-
-        b_new, h_new, rel_err = _rank1_merge_one_group(B_group, H_group)
-        group_errors.append(float(rel_err))
-
-        if reject_bad_groups and rel_err > max_group_rank1_error:
-            # This group cannot be represented well by one merged mode.
-            # Keep members separate.
-            for k in group:
-                final_B_cols.append(B[:, k].copy())
-                final_H_rows.append(H[k].copy())
-                final_groups.append([k])
-        else:
-            final_B_cols.append(b_new)
-            final_H_rows.append(h_new)
-            final_groups.append(group)
-
-    B_init = np.stack(final_B_cols, axis=1).astype(np.float32)  # (D,Knew)
-    H_init = np.stack(final_H_rows, axis=0).astype(np.float32)  # (Knew,T)
-
-    B_init, H_init = _normalize_BH(B_init, H_init)
-
-    # Important: after choosing merged H, recompute globally optimal B.
-    B_ls = _refit_B_given_H(M, H_init, ridge=ridge)
-    B_ls, H_init = _normalize_BH(B_ls, H_init)
-
-    recon_after = _compute_recon_loss(M, B_ls, H_init)
-    r2_after = _compute_recon_r2(M, B_ls, H_init)
-    r2_drop = r2_before - r2_after
-
-    accepted = True
-    if r2_drop > max_r2_drop:
-        # Merge destroys too much reconstruction. Fall back to original modes.
-        accepted = False
-        B_out, H_out = B, H
-        final_groups = [[k] for k in range(H.shape[0])]
-        recon_after = recon_before
-        r2_after = r2_before
-    else:
-        B_out, H_out = B_ls, H_init
-
-    diag = {
-        "accepted": bool(accepted),
-        "K_before": int(H.shape[0]),
-        "K_after": int(H_out.shape[0]),
-        "recon_before": float(recon_before),
-        "recon_after_init": float(recon_after),
-        "r2_before": float(r2_before),
-        "r2_after_init": float(r2_after),
-        "r2_drop": float(r2_drop),
-        "group_rank1_errors": group_errors,
-        "groups": final_groups,
-    }
-
-    if verbose:
-        print(
-            "[recon-preserving merge] "
-            f"K {diag['K_before']} -> {diag['K_after']}, "
-            f"accepted={diag['accepted']}, "
-            f"recon {diag['recon_before']:.4f} -> {diag['recon_after_init']:.4f}, "
-            f"R2 {diag['r2_before']:.4f} -> {diag['r2_after_init']:.4f}, "
-            f"R2_drop={diag['r2_drop']:.4f}"
-        )
-
-    return B_out, H_out, final_groups, diag
-
-def _estimate_motion_scale_from_M(M, eps=1e-12):
-    """
-    Estimate a natural motion scale from M.
-    M: (2N, T)
-    """
-    M = np.asarray(M, dtype=np.float32)
-    return float(np.sqrt(np.mean(M ** 2)) + eps)
-
-def _compute_B_penalties_scaled(
-    B,
-    lambda_B=0.001,
-    lambda_mode=0.005,
-    B_scale=1.0,
-    eps=1e-12,
-):
-    """
-    Compute normalized patch/mode penalties from B.
-
-    B: (2N, K)
-    B_scale: typical motion scale. We penalize B / B_scale.
-
-    patch penalty:
-        mean_{i,k} ||b_ik / B_scale||
-
-    mode penalty:
-        mean_k sqrt(mean_i ||b_ik / B_scale||^2)
-    """
-    B = np.asarray(B, dtype=np.float32)
-    D, K = B.shape
-    N = D // 2
-
-    Bx = B[:N, :]
-    By = B[N:, :]
-
-    bmag = np.sqrt(Bx ** 2 + By ** 2 + eps) / max(B_scale, eps)  # (N, K)
-
-    raw_patch = float(np.mean(bmag))
-    patch_loss = float(lambda_B * raw_patch)
-
-    mode_rms = np.sqrt(np.mean(bmag ** 2, axis=0) + eps)  # (K,)
-    raw_mode = float(np.mean(mode_rms))
-    mode_loss = float(lambda_mode * raw_mode)
-
-    return {
-        "raw_patch": raw_patch,
-        "patch_loss": patch_loss,
-        "raw_mode": raw_mode,
-        "mode_loss": mode_loss,
-        "B_scale": float(B_scale),
-        "B_abs_mean": float(np.mean(np.sqrt(Bx ** 2 + By ** 2 + eps))),
-        "B_abs_max": float(np.max(np.sqrt(Bx ** 2 + By ** 2 + eps))),
-    }
-
-def _compute_recon_loss_normalized(M, B, H, eps=1e-12):
-    """
-    Normalized reconstruction error:
-        ||M - BH||^2 / ||M||^2
-    """
-    R = M - B @ H
-    return float(np.sum(R ** 2) / (np.sum(M ** 2) + eps))
-
 def decompose_episode_motion_modes(
     episode: MotionEpisode,
     Kmax=4,
-    lambda_B=0.05,
-    lambda_H=0.01,
-    lambda_mode=0.01,
-    max_iter=100,
+    lambda_sc=0.05,
+    rho=1.0,
+    kappa=4.0,
+    max_iter=200,
     tol=1e-4,
-    min_mode_mass=1e-3,
-    min_explained_energy=0.01,
-    min_incremental_energy=0.005,
-    min_support_area=3,
-    max_mode_density=1.0,
-    support_rel_thresh=0.10,
+    support_rel_thresh=0.08,
 
     # K selection
-    K_selection_method="svd",   # "svd", "sweep", or "fixed"
+    K_selection_method="svd",   # "svd" or "fixed"
     K_min=1,
-    K_list=None,
-    K_sweep_n_init=3,
-    K_sweep_short_iter=10,
 
     # SVD K selection
     svd_target_r2=0.85,
 
-    # old sweep target, only used when K_selection_method="sweep"
-    target_r2=0.90,
-
-    # normalized B penalty
-    scaled_B_penalty=True,
-
-    # merge control
-    merge_redundant_modes=True,
-    activation_merge_thresh=0.98,
-    merge_ridge=1e-6,
-    max_merge_r2_drop=0.03,
-    max_group_rank1_error=0.20,
-    reject_bad_merge_groups=True,
-
-    refine_after_merge=True,
-    final_refine_after_prune=True,
     verbose=True,
     random_state=0,
+    use_velocity=False,
 ):
     """
-    Decompose one MotionEpisode into MotionModes.
+    Decompose one MotionEpisode with reconstruction + sparse-compact loss.
 
-    Model:
-        M ≈ B @ H
+    Optimization model:
+        min_{B,H,mu} ||M-BH||_F^2 / ||M||_F^2
+            + lambda_sc/(N K s_B) sum_{i,k}
+              (rho + kappa ||r_i-mu_k||_2^2) ||b_ik||_2
+        subject to ||H[k]||_2 = 1 for every k.
 
-    where:
+    Pipeline:
+        1. Prepare the episode motion matrix M.
+        2. Select K and initialize B/H from spatial seeds.
+        3. Alternate weighted group-Lasso B updates, exact centroid updates,
+           and unit-sphere H updates.  No temporal smoothness is used.
+        4. Keep the existing relative hard-threshold on B after optimization.
+        5. Convert all K components to MotionMode objects.
+
+    Model dimensions:
         M: (2N, T)
         B: (2N, K)
         H: (K, T)
-
-    Main change:
-        Redundant modes are no longer directly merged by averaging.
-        We first propose merge groups from activation similarity,
-        then perform reconstruction-preserving merge.
     """
 
-    if episode.motion_abs is None:
-        raise ValueError("episode.motion_abs is required for motion mode decomposition.")
+    # ------------------------------------------------------------------
+    # 1. Validate and select the motion field
+    # ------------------------------------------------------------------
+    if use_velocity:
+        if episode.motion_delta is None:
+            raise ValueError(
+                "episode.motion_delta is required when use_velocity=True."
+            )
+        motion_data = np.asarray(episode.motion_delta, dtype=np.float32)
+        motion_field_name = "motion_delta (velocity)"
+    else:
+        if episode.motion_abs is None:
+            raise ValueError(
+                "episode.motion_abs is required when use_velocity=False."
+            )
+        motion_data = np.asarray(episode.motion_abs, dtype=np.float32)
+        motion_field_name = "motion_abs (cumulative displacement)"
+
     if episode.global_motion is None:
-        raise ValueError("episode.global_motion is required for motion mode decomposition.")
+        raise ValueError(
+            "episode.global_motion is required for motion mode decomposition."
+        )
 
     rng = np.random.default_rng(random_state)
     eps = 1e-12
+    if int(Kmax) < 1:
+        raise ValueError("Kmax must be at least 1.")
 
-    # ------------------------------------------------------------
-    # 1. Prepare episode motion matrix M
-    # ------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 2. Prepare M from the episode data
+    # ------------------------------------------------------------------
     mask = np.asarray(episode.spatial_region).astype(bool)
     X, Y = mask.shape
     valid_coords = np.argwhere(mask)
+    spatial_coords = _normalize_spatial_coords(valid_coords, (X, Y))
 
-    motion_abs = np.asarray(episode.motion_abs, dtype=np.float32)       # (T, N, 2)
-    global_motion = np.asarray(episode.global_motion, dtype=np.float32) # (T, 2)
+    global_motion = np.asarray(episode.global_motion, dtype=np.float32)
 
-    T, N, C = motion_abs.shape
+    T, N, C = motion_data.shape
     if C != 2 or len(valid_coords) != N:
         raise ValueError(
-            f"motion_abs shape {motion_abs.shape} inconsistent with "
+            f"motion_data shape {motion_data.shape} inconsistent with "
             f"episode mask count {len(valid_coords)}"
         )
 
     if global_motion.shape != (T, 2):
         raise ValueError(
-            f"global_motion should have shape {(T, 2)}, got {global_motion.shape}"
+            f"global_motion should have shape {(T, 2)}, "
+            f"got {global_motion.shape}"
         )
 
-    # remove global/background motion
-    Y_data = motion_abs - global_motion[:, None, :]  # (T, N, 2)
+    # The physical units of global_motion must match motion_data. In
+    # particular, use_velocity=True requires a velocity-like global motion.
+    Y_data = motion_data - global_motion[:, None, :]  # (T, N, 2)
 
-    # M: (2N, T)
     M = np.concatenate(
         [
             Y_data[:, :, 0].T,
             Y_data[:, :, 1].T,
         ],
         axis=0,
-    ).astype(np.float32)
+    ).astype(np.float32)  # (2N, T)
 
     total_energy = float(np.sum(M ** 2)) + eps
+    # Since ||H[k]||_2=1, a coefficient in B naturally scales as
+    # sqrt(T) times a per-frame motion amplitude.
+    B_scale = float(np.sqrt(T) * np.sqrt(np.mean(M ** 2)) + eps)
 
-    # ------------------------------------------------------------
-    # 2. Select K, then full fit with selected K
-    # ------------------------------------------------------------
-    B_scale = _estimate_motion_scale_from_M(M, eps=eps)
+    if verbose:
+        print(
+            f"[motion data] episode={episode.episode_id}, "
+            f"using {motion_field_name}, "
+            f"T={T}, N={N}, total_energy={total_energy:.4f}"
+        )
 
-    K_select_info = None
-    selected_K = None
-
-    # ------------------------------------------------------------
-    # 2. Select K, then full fit with selected K
-    # ------------------------------------------------------------
-    B_scale = _estimate_motion_scale_from_M(M, eps=eps)
-
+    # ------------------------------------------------------------------
+    # 3. Select K and initialize B/H
+    # ------------------------------------------------------------------
     K_select_info = None
     selected_K = None
 
     if K_selection_method == "svd":
-        # --------------------------------------------------------
-        # SVD only selects K.
-        # We still initialize B/H by spatial seeds, not by SVD,
-        # so the final decomposition is not forced to be SVD-like.
-        # --------------------------------------------------------
+        # SVD selects only K; B/H are still initialized from spatial seeds.
         selected_K, K_select_info = _select_K_by_svd_energy(
             M,
             target_r2=svd_target_r2,
@@ -2197,8 +2112,6 @@ def decompose_episode_motion_modes(
             eps=eps,
         )
 
-        K_init = H.shape[0]
-
         if verbose:
             print(
                 f"[mode K selection: SVD] episode={episode.episode_id}, "
@@ -2208,42 +2121,8 @@ def decompose_episode_motion_modes(
                 f"rank_max={K_select_info['rank_max']}"
             )
 
-    elif K_selection_method == "sweep":
-        selected_K, selected_init, K_select_info = _sweep_K_for_episode_modes(
-            M=M,
-            Y_data=Y_data,
-            valid_coords=valid_coords,
-            Kmax=Kmax,
-            K_min=K_min,
-            K_list=K_list,
-            n_init=K_sweep_n_init,
-            short_iter=K_sweep_short_iter,
-            lambda_B=lambda_B,
-            lambda_H=lambda_H,
-            lambda_mode=lambda_mode,
-            tol=tol,
-            target_r2=target_r2,
-            verbose=verbose,
-            random_state=random_state,
-            eps=eps,
-        )
-
-        B = selected_init["B"]
-        H = selected_init["H"]
-        seeds = selected_init["seeds"]
-        K_init = H.shape[0]
-
-        if verbose:
-            print(
-                f"[mode K selection: sweep] episode={episode.episode_id}, "
-                f"Kmax={Kmax}, selected_K={selected_K}, "
-                f"short_R2={selected_init['r2']:.6f}, "
-                f"method={K_select_info['select_info']['method']}"
-            )
-
     elif K_selection_method == "fixed":
-        # Directly use Kmax as K.
-        selected_K = int(Kmax)
+        selected_K = min(int(Kmax), N, T)
 
         H, B, seeds = _initialize_modes_spatial_seed(
             Y_data,
@@ -2252,8 +2131,6 @@ def decompose_episode_motion_modes(
             rng=rng,
             eps=eps,
         )
-
-        K_init = H.shape[0]
 
         K_select_info = {
             "method": "fixed",
@@ -2269,178 +2146,57 @@ def decompose_episode_motion_modes(
     else:
         raise ValueError(
             f"Unknown K_selection_method: {K_selection_method}. "
-            "Use 'svd', 'sweep', or 'fixed'."
+            "Use 'svd' or 'fixed'."
         )
 
+    K_init = H.shape[0]
 
-    # ------------------------------------------------------------
-    # Full fit from selected K initialization
-    # ------------------------------------------------------------
-    B, H, loss_history = _fit_motion_modes_minimal(
+    # ------------------------------------------------------------------
+    # 4. Optimize B/H and the auxiliary spatial centroids.
+    # ------------------------------------------------------------------
+    initial_centers = spatial_coords[np.asarray(seeds, dtype=np.int64)]
+    B, H, loss_history, mode_centers_normalized = _fit_motion_modes_minimal(
         M,
         B,
         H,
-        lambda_B=lambda_B,
-        lambda_H=lambda_H,
-        lambda_mode=lambda_mode,
+        spatial_coords=spatial_coords,
+        lambda_sc=lambda_sc,
+        rho=rho,
+        kappa=kappa,
         max_iter=max_iter,
         tol=tol,
         verbose=verbose,
         eps=eps,
-        scaled_B_penalty=scaled_B_penalty,
         B_scale=B_scale,
+        initial_centers=initial_centers,
     )
 
-    K_after_fit = H.shape[0]
+    K_final = H.shape[0]
+    optimized_B = B.copy()
+    optimized_recon = _compute_recon_loss(M, optimized_B, H, eps=eps)
+    optimized_r2 = _compute_recon_r2(M, optimized_B, H, eps=eps)
 
-    recon_after_fit = _compute_recon_loss(M, B, H, eps=eps)
-    r2_after_fit = _compute_recon_r2(M, B, H, eps=eps)
-
-    if verbose:
-        print(
-            f"[mode initial fit] episode={episode.episode_id}, "
-            f"K={K_after_fit}, recon={recon_after_fit:.6f}, "
-            f"R2={r2_after_fit:.6f}"
-        )
-
-    # ------------------------------------------------------------
-    # 3. Reconstruction-preserving merge
-    # ------------------------------------------------------------
-    merge_groups = None
-    merge_diag = None
-    proposed_merge_groups = None
-
-    if merge_redundant_modes and H.shape[0] > 1:
-        # 3.1 propose merge groups by activation similarity
-        proposed_merge_groups, sim_H = _activation_merge_groups(
-            H,
-            activation_merge_thresh=activation_merge_thresh,
-            eps=eps,
-        )
-
-        if verbose:
-            group_sizes = [len(g) for g in proposed_merge_groups]
-            print(
-                f"[mode merge proposal] episode={episode.episode_id}, "
-                f"K fit={K_after_fit}, n_groups={len(proposed_merge_groups)}, "
-                f"group_sizes={group_sizes}"
-            )
-
-        # 3.2 perform reconstruction-preserving merge
-        B_merge, H_merge, merge_groups, merge_diag = _merge_modes_reconstruction_preserving(
-            M=M,
-            B=B,
-            H=H,
-            groups=proposed_merge_groups,
-            ridge=merge_ridge,
-            max_r2_drop=max_merge_r2_drop,
-            max_group_rank1_error=max_group_rank1_error,
-            reject_bad_groups=reject_bad_merge_groups,
-            verbose=verbose,
-        )
-
-        B, H = B_merge, H_merge
-
-        if verbose:
-            print(
-                f"[mode merge] episode={episode.episode_id}, "
-                f"K fit={K_after_fit}, K merge={H.shape[0]}, "
-                f"accepted={merge_diag['accepted']}, "
-                f"recon {merge_diag['recon_before']:.6f}"
-                f" -> {merge_diag['recon_after_init']:.6f}, "
-                f"R2 {merge_diag['r2_before']:.6f}"
-                f" -> {merge_diag['r2_after_init']:.6f}, "
-                f"R2_drop={merge_diag['r2_drop']:.6f}"
-            )
-
-        # 3.3 refine from merged B,H, not random initialization
-        if refine_after_merge and H.shape[0] > 0:
-            B, H, loss_ref = _fit_motion_modes_minimal(
-                M,
-                B,
-                H,
-                lambda_B=lambda_B,
-                lambda_H=lambda_H,
-                lambda_mode=lambda_mode,
-                max_iter=max(10, max_iter // 2),
-                tol=tol,
-                verbose=verbose,
-                eps=eps,
-                scaled_B_penalty=scaled_B_penalty,
-                B_scale=B_scale,
-            )
-            loss_history.extend(loss_ref)
-
-            if verbose:
-                recon_after_merge_refine = _compute_recon_loss(M, B, H, eps=eps)
-                r2_after_merge_refine = _compute_recon_r2(M, B, H, eps=eps)
-                print(
-                    f"[mode merge refine] episode={episode.episode_id}, "
-                    f"K={H.shape[0]}, "
-                    f"recon={recon_after_merge_refine:.6f}, "
-                    f"R2={r2_after_merge_refine:.6f}"
-                )
-
-    K_after_merge = H.shape[0]
-
-    # ------------------------------------------------------------
-    # 4. Prune weak / redundant modes
-    # ------------------------------------------------------------
-    if H.shape[0] > 0:
-        B, H, prune_info = _prune_BH_modes(
-            B,
-            H,
-            M,
-            support_rel_thresh=support_rel_thresh,
-            min_mode_mass=min_mode_mass,
-            min_incremental_energy=min_incremental_energy,
-            min_support_area=min_support_area,
-            max_mode_density=max_mode_density,
-            eps=eps,
-        )
-    else:
-        prune_info = {}
+    # Existing downstream post-processing: intentionally unchanged in scope.
+    B, support_mask, removed_count, removed_energy = _hard_threshold_B(
+        optimized_B,
+        support_rel_thresh=support_rel_thresh,
+        eps=eps,
+    )
+    final_recon = _compute_recon_loss(M, B, H, eps=eps)
+    final_r2 = _compute_recon_r2(M, B, H, eps=eps)
 
     if verbose:
         print(
-            f"[mode prune] episode={episode.episode_id}, "
-            f"K merge={K_after_merge}, K prune={H.shape[0]}"
+            f"[mode fit] episode={episode.episode_id}, K={K_final}, "
+            f"optimized_R2={optimized_r2:.6f}, "
+            f"post_threshold_R2={final_r2:.6f}, "
+            f"removed_patch_modes={removed_count}"
         )
 
-    # ------------------------------------------------------------
-    # 5. Final refine after prune
-    # ------------------------------------------------------------
-    if final_refine_after_prune and H.shape[0] > 0:
-        B, H, loss_final = _fit_motion_modes_minimal(
-            M,
-            B,
-            H,
-            lambda_B=lambda_B,
-            lambda_H=lambda_H,
-            lambda_mode=lambda_mode,
-            max_iter=max(10, max_iter // 3),
-            tol=tol,
-            verbose=verbose,
-            eps=eps,
-            scaled_B_penalty=scaled_B_penalty,
-            B_scale=B_scale,
-        )
-        loss_history.extend(loss_final)
-
-        if verbose:
-            recon_after_prune_refine = _compute_recon_loss(M, B, H, eps=eps)
-            r2_after_prune_refine = _compute_recon_r2(M, B, H, eps=eps)
-            print(
-                f"[mode final refine] episode={episode.episode_id}, "
-                f"K={H.shape[0]}, "
-                f"recon={recon_after_prune_refine:.6f}, "
-                f"R2={r2_after_prune_refine:.6f}"
-            )
-
-    # ------------------------------------------------------------
-    # 6. Build MotionMode objects
-    # ------------------------------------------------------------
-    if H.shape[0] > 0:
+    # ------------------------------------------------------------------
+    # 5. Convert every fitted component to a MotionMode object.
+    # ------------------------------------------------------------------
+    if K_final > 0:
         modes = _build_motion_modes_from_BH(
             B,
             H,
@@ -2451,74 +2207,64 @@ def decompose_episode_motion_modes(
             episode.episode_id,
             episode.time_range,
             global_motion,
-            min_mode_mass=min_mode_mass,
-            min_explained_energy=min_explained_energy,
             support_rel_thresh=support_rel_thresh,
             eps=eps,
         )
     else:
         modes = []
 
-    # ------------------------------------------------------------
-    # 7. Save model information
-    # ------------------------------------------------------------
-    final_recon = _compute_recon_loss(M, B, H, eps=eps) if H.shape[0] > 0 else None
-    final_r2 = _compute_recon_r2(M, B, H, eps=eps) if H.shape[0] > 0 else None
-
+    # ------------------------------------------------------------------
+    # 6. Save the final model and diagnostics
+    # ------------------------------------------------------------------
     episode.modes = modes
     episode.mode_model = {
         "B": B,
+        "B_before_hard_threshold": optimized_B,
         "H": H,
         "loss_history": loss_history,
+        "mode_centers_normalized": mode_centers_normalized,
+        "mode_centers_patch": mode_centers_normalized * np.maximum(
+            np.asarray((X, Y), dtype=np.float32) - 1.0,
+            1.0,
+        )[None, :],
 
-        "lambda_B": lambda_B,
-        "lambda_H": lambda_H,
-        "lambda_mode": lambda_mode,
+        "lambda_sc": float(lambda_sc),
+        "rho": float(rho),
+        "kappa": float(kappa),
 
         "Kmax": Kmax,
         "K_init": K_init,
-        "K_after_fit": K_after_fit,
-        "K_after_merge": K_after_merge,
-        "K_after_prune": H.shape[0],
+        "K_final": K_final,
         "K_modes": len(modes),
-
         "seeds": seeds,
 
-        "proposed_merge_groups": proposed_merge_groups,
-        "merge_groups": merge_groups,
-        "merge_diag": merge_diag,
-
-        "prune_info": prune_info,
-
         "total_energy": total_energy,
-        "recon_after_fit": recon_after_fit,
-        "r2_after_fit": r2_after_fit,
+        "optimized_recon": optimized_recon,
+        "optimized_r2": optimized_r2,
         "final_recon": final_recon,
         "final_r2": final_r2,
+        "hard_threshold_support_mask": support_mask,
+        "hard_threshold_removed_count": removed_count,
+        "hard_threshold_removed_energy": removed_energy,
 
         "K_selection_method": K_selection_method,
         "K_selected": selected_K,
         "K_select_info": K_select_info,
         "svd_target_r2": svd_target_r2,
-        "target_r2": target_r2,
 
         "B_scale": B_scale,
-        "scaled_B_penalty": scaled_B_penalty,
-
-        "merge_params": {
-            "activation_merge_thresh": activation_merge_thresh,
-            "merge_ridge": merge_ridge,
-            "max_merge_r2_drop": max_merge_r2_drop,
-            "max_group_rank1_error": max_group_rank1_error,
-            "reject_bad_merge_groups": reject_bad_merge_groups,
-        },
+        "use_velocity": use_velocity,
+        "motion_field_used": motion_field_name,
+        "H_constraint": "row_l2_norm_equals_1",
+        "objective": "reconstruction_plus_sparse_compact",
+        "postprocessing": "hard_threshold_only",
     }
 
     if verbose:
         print(
             f"[motion modes] episode={episode.episode_id}, "
-            f"Kmax={Kmax}, kept modes={len(modes)}, "
-            f"final_R2={final_r2}"
+            f"selected_K={selected_K}, built_modes={len(modes)}, "
+            f"final_R2={final_r2:.6f}, postprocessing=hard_threshold_only"
         )
 
     return modes
@@ -2536,6 +2282,43 @@ def getMotionModes(motion_episodes: Sequence[MotionEpisode], **kwargs):
 # =============================================================================
 
 
+def _split_binary_support(
+    support_original,
+    min_region_area=5,
+    split_mode="gap_tolerant",
+    gap_close_iter=1,
+    gap_dilation_iter=2,
+):
+    support_original = np.asarray(support_original).astype(bool)
+    if not np.any(support_original):
+        return []
+    if int(support_original.sum()) < min_region_area:
+        return []
+    structure = np.ones((3, 3), dtype=bool)
+    if split_mode == "loose":
+        return [support_original]
+    elif split_mode == "strict":
+        support_for_label = support_original
+    elif split_mode == "gap_tolerant":
+        support_for_label = support_original.copy()
+        if gap_close_iter and gap_close_iter > 0:
+            support_for_label = ndi.binary_closing(support_for_label, structure=structure, iterations=int(gap_close_iter))
+        if gap_dilation_iter and gap_dilation_iter > 0:
+            support_for_label = ndi.binary_dilation(support_for_label, structure=structure, iterations=int(gap_dilation_iter))
+    else:
+        raise ValueError("split_mode should be 'strict', 'gap_tolerant', or 'loose'.")
+    lab, num = ndi.label(support_for_label, structure=structure)
+    masks = []
+    for rid in range(1, num + 1):
+        # Use repaired/dilated mask only for grouping, final region keeps original support pixels.
+        m = support_original & (lab == rid)
+        if int(m.sum()) >= min_region_area:
+            masks.append(m)
+    if len(masks) == 0 and int(support_original.sum()) >= min_region_area:
+        masks = [support_original]
+    return masks
+
+
 def _weighted_mean_response_vector(B, A, mask, eps=1e-8):
     if mask is None or not np.any(mask):
         return np.zeros(2, dtype=np.float32)
@@ -2547,6 +2330,13 @@ def _weighted_mean_response_vector(B, A, mask, eps=1e-8):
         return b.mean(axis=0).astype(np.float32)
 
     return (np.sum(w[:, None] * b, axis=0) / (np.sum(w) + eps)).astype(np.float32)
+
+
+def _region_centroid(mask):
+    pts = np.argwhere(mask)
+    if len(pts) == 0:
+        return None
+    return pts.mean(axis=0).astype(np.float32)
 
 
 def _region_min_distance(mask_a, mask_b):
@@ -2849,7 +2639,7 @@ def split_mode_to_regions(
             )
         else:
             try:
-                region.activation_resampled = _resample_1d(h, target_len=12)
+                region.activation_resampled = _resample_1d_simple(h, target_len=12)
             except NameError:
                 region.activation_resampled = h.copy().astype(np.float32)
 
@@ -3004,92 +2794,144 @@ def collect_regions_from_episodes(motion_episodes):
     return out
 
 
+def collect_modes_from_episodes(motion_episodes):
+    out = []
+    for ep in motion_episodes:
+        out.extend(getattr(ep, "modes", []) or [])
+    return out
+
+
+def collect_units_from_episodes(motion_episodes, unit_type="region"):
+    if unit_type == "mode":
+        return collect_modes_from_episodes(motion_episodes)
+    return collect_regions_from_episodes(motion_episodes)
+
+
 def filter_regions_for_patterns(regions, min_strength=0.0, min_area=0.0, min_duration=1):
+    """Filter units (MotionRegion or MotionMode) for pattern clustering.
+
+    Missing attributes on MotionMode are computed from response_strength / activation.
+    """
     kept = []
     for r in regions:
-        if getattr(r, "strength", 0.0) < min_strength:
+        # strength
+        s = getattr(r, "strength", None)
+        if s is None:
+            A = getattr(r, "response_strength", None)
+            s = float(np.sum(A)) if A is not None else 0.0
+        if s < min_strength:
             continue
-        if getattr(r, "area_effective", 0.0) < min_area:
+
+        # area_effective
+        a = getattr(r, "area_effective", None)
+        if a is None:
+            A = getattr(r, "response_strength", None)
+            if A is not None:
+                A = np.asarray(A, dtype=np.float32)
+                w = A[A > 0]
+                a = float(np.sum(w) ** 2 / max(np.sum(w ** 2), 1e-12)) if len(w) > 0 else 0.0
+            else:
+                a = 0.0
+        if a < min_area:
             continue
-        if getattr(r, "duration", 0) < min_duration:
+
+        # duration
+        d = getattr(r, "duration", None)
+        if d is None:
+            h = getattr(r, "activation", None)
+            d = len(np.asarray(h).reshape(-1)) if h is not None else 0
+        if d < min_duration:
             continue
-        if getattr(r, "mean_response_vector", None) is None:
+
+        # mean_response_vector
+        mrv = getattr(r, "mean_response_vector", None)
+        if mrv is None:
+            B = getattr(r, "response_field", None)
+            A = getattr(r, "response_strength", None)
+            if B is not None and A is not None:
+                B = np.asarray(B, dtype=np.float32)
+                A = np.asarray(A, dtype=np.float32)
+                mask = A > 0
+                if np.any(mask):
+                    w = A[mask]
+                    b = B[mask]
+                    mrv = (np.sum(w[:, None] * b, axis=0) / max(np.sum(w), 1e-12)).astype(np.float32)
+        if mrv is None:
             continue
+        # Attach computed mrv for downstream use
+        r.mean_response_vector = mrv
+
         kept.append(r)
     return kept
 
 
-def _dtw_distance_1d(x, y, eps=1e-8):
-    x = np.asarray(x, dtype=np.float32).reshape(-1)
-    y = np.asarray(y, dtype=np.float32).reshape(-1)
+def _region_support_mask(region):
+    # Works for both MotionRegion and MotionMode
+    m = getattr(region, "region_mask", None)
+    if m is not None:
+        return np.asarray(m).astype(bool)
+    m = getattr(region, "support_mask", None)
+    if m is not None:
+        return np.asarray(m).astype(bool)
+    A = np.asarray(region.response_strength, dtype=np.float32)
+    return A > 0
 
-    n, m = len(x), len(y)
-    if n == 0 or m == 0:
+
+def _region_iou(r1, r2):
+    m1 = _region_support_mask(r1)
+    m2 = _region_support_mask(r2)
+    if m1.shape != m2.shape:
+        return 0.0
+    inter = np.logical_and(m1, m2).sum()
+    union = np.logical_or(m1, m2).sum()
+    return float(inter / (union + 1e-12))
+
+
+def _unit_centroid(unit):
+    """Compute spatial centroid from response_strength (fallback if no center_xy)."""
+    c = getattr(unit, "center_xy", None)
+    if c is not None:
+        c = np.asarray(c, dtype=np.float32)
+        if c.shape == (2,) and np.all(np.isfinite(c)):
+            return c
+    # Compute from response_strength
+    A = np.asarray(unit.response_strength, dtype=np.float32)
+    if A.ndim == 2 and np.max(A) > 0:
+        pts = np.argwhere(A > 0)
+        if len(pts) > 0:
+            w = A[A > 0].astype(np.float32)
+            c = np.average(pts.astype(np.float32), axis=0, weights=w)
+            return c.astype(np.float32)
+    return np.array([np.nan, np.nan], dtype=np.float32)
+
+
+def _region_centroid_distance(r1, r2):
+    c1 = _unit_centroid(r1)
+    c2 = _unit_centroid(r2)
+    if np.any(~np.isfinite(c1)) or np.any(~np.isfinite(c2)):
         return np.inf
+    return float(np.linalg.norm(c1 - c2))
 
-    dp = np.full((n + 1, m + 1), np.inf, dtype=np.float32)
-    dp[0, 0] = 0.0
-
-    for i in range(1, n + 1):
-        xi = x[i - 1]
-        for j in range(1, m + 1):
-            cost = abs(xi - y[j - 1])
-            dp[i, j] = cost + min(
-                dp[i - 1, j],
-                dp[i, j - 1],
-                dp[i - 1, j - 1],
-            )
-
-    return float(dp[n, m] / (n + m + eps))
-
-
-def _find_activation_medoid_index(activations, weights=None, eps=1e-8):
-    """
-    Select the region whose activation is most representative of the pattern.
-    This does not require equal-length activations.
-    """
-    n = len(activations)
-    if n == 0:
-        return None
-    if n == 1:
-        return 0
-
-    if weights is None:
-        weights = np.ones(n, dtype=np.float32)
+def _regions_spatially_compatible(
+    r1,
+    r2,
+    spatial_rule="iou_or_centroid",
+    iou_thresh=0.10,
+    centroid_dist_thresh=3.0,
+):
+    iou = _region_iou(r1, r2)
+    cd = _region_centroid_distance(r1, r2)
+    if spatial_rule == "iou":
+        ok = iou >= iou_thresh
+    elif spatial_rule == "centroid":
+        ok = cd <= centroid_dist_thresh
+    elif spatial_rule == "iou_and_centroid":
+        ok = (iou >= iou_thresh) and (cd <= centroid_dist_thresh)
+    elif spatial_rule == "iou_or_centroid":
+        ok = (iou >= iou_thresh) or (cd <= centroid_dist_thresh)
     else:
-        weights = np.asarray(weights, dtype=np.float32)
-
-    weights = weights / (np.sum(weights) + eps)
-
-    scores = np.zeros(n, dtype=np.float32)
-
-    for i in range(n):
-        s = 0.0
-        for j in range(n):
-            if i == j:
-                continue
-            d = _dtw_distance_1d(activations[i], activations[j], eps=eps)
-            s += weights[j] * d
-        scores[i] = s
-
-    return int(np.argmin(scores))
-
-
-def _sign_by_resampled_corr(ref_h, h, target_len=16):
-    """
-    Only for sign alignment. Raw activations can still keep original length.
-    """
-    ref_h = np.asarray(ref_h, dtype=np.float32).reshape(-1)
-    h = np.asarray(h, dtype=np.float32).reshape(-1)
-
-    if len(ref_h) == 0 or len(h) == 0:
-        return 1.0
-
-    ref_rs = _resample_1d(ref_h, target_len)
-    h_rs = _resample_1d(h, target_len)
-
-    return 1.0 if _safe_corr(ref_rs, h_rs) >= 0 else -1.0
-
+        raise ValueError(f"Unknown spatial_rule: {spatial_rule}")
+    return bool(ok), {"iou": iou, "centroid_distance": cd, "spatial_ok": bool(ok)}
 
 def _sign_aware_activation_dtw(h1, h2):
     """
@@ -3112,8 +2954,14 @@ def _get_region_activation(region):
     return None
 
 def _get_region_mask_simple(region):
+    # Works for both MotionRegion and MotionMode
     if hasattr(region, "region_mask") and region.region_mask is not None:
         mask = np.asarray(region.region_mask).astype(bool)
+        if mask.ndim == 2 and np.any(mask):
+            return mask
+
+    if hasattr(region, "support_mask") and region.support_mask is not None:
+        mask = np.asarray(region.support_mask).astype(bool)
         if mask.ndim == 2 and np.any(mask):
             return mask
 
@@ -3165,11 +3013,100 @@ def _response_field_distance_on_overlap(region1, region2, sign2=1.0, eps=1e-8):
 
     return float(numerator / denom)
 
+
+def _response_field_correlation_on_overlap(region1, region2, sign2=1.0, eps=1e-8):
+    """Compare B vector fields using correlation on the overlap region.
+
+    Flattens the 2D vectors on the common mask into (N_common*2,) arrays
+    and computes Pearson r. Returns 1 - |r| (sign-insensitive, 0=identical).
+
+    D_b = 1 - |pearson_r(v1, sign2 * v2)|
+    """
+    mask1 = _get_region_mask_simple(region1)
+    mask2 = _get_region_mask_simple(region2)
+    B1 = _get_region_response_field(region1)
+    B2 = _get_region_response_field(region2)
+
+    if mask1 is None or mask2 is None or B1 is None or B2 is None:
+        return np.inf
+
+    if mask1.shape != mask2.shape or B1.shape != B2.shape:
+        return np.inf
+
+    common = np.logical_and(mask1, mask2)
+    if np.sum(common) < 3:   # need at least 3 points for meaningful correlation
+        return np.inf
+
+    v1 = B1[common].ravel().astype(np.float64)           # (N*2,)
+    v2 = (sign2 * B2[common]).ravel().astype(np.float64)  # (N*2,)
+
+    # Pearson r
+    v1_mean = np.mean(v1)
+    v2_mean = np.mean(v2)
+    v1_demean = v1 - v1_mean
+    v2_demean = v2 - v2_mean
+    num = np.dot(v1_demean, v2_demean)
+    denom = np.sqrt(np.sum(v1_demean ** 2) * np.sum(v2_demean ** 2)) + eps
+
+    r = num / denom
+    r = np.clip(r, -1.0, 1.0)
+
+    # Sign-insensitive: |r| close to 1 = highly correlated
+    return float(1.0 - abs(r))
+
+def _resample_1d_simple(x, target_len=12):
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+
+    if len(x) == 0:
+        return np.zeros(target_len, dtype=np.float32)
+
+    if len(x) == target_len:
+        return x.copy()
+
+    if len(x) == 1:
+        return np.full(target_len, float(x[0]), dtype=np.float32)
+
+    old_grid = np.linspace(0.0, 1.0, len(x))
+    new_grid = np.linspace(0.0, 1.0, target_len)
+
+    return np.interp(new_grid, old_grid, x).astype(np.float32)
+
+def _resample_time_2d_simple(x, target_len=12):
+    """
+    x: (T, C), e.g. induced_motion with C=2
+    return: (target_len, C)
+    """
+    x = np.asarray(x, dtype=np.float32)
+
+    if x.ndim != 2:
+        raise ValueError(f"x should be 2D, got {x.shape}")
+
+    T, C = x.shape
+
+    if T == 0:
+        return np.zeros((target_len, C), dtype=np.float32)
+
+    if T == target_len:
+        return x.copy()
+
+    if T == 1:
+        return np.repeat(x, target_len, axis=0).astype(np.float32)
+
+    old_grid = np.linspace(0.0, 1.0, T)
+    new_grid = np.linspace(0.0, 1.0, target_len)
+
+    out = np.zeros((target_len, C), dtype=np.float32)
+    for c in range(C):
+        out[:, c] = np.interp(new_grid, old_grid, x[:, c])
+
+    return out
+
 def compute_region_distance_matrix_simple(
     regions,
     min_iou=0.10,
     omega=1.0,
     mu=1.0,
+    b_distance="l2",         # "l2" or "correlation"
     incompatible_dist=1e6,
     verbose=True,
 ):
@@ -3182,9 +3119,9 @@ def compute_region_distance_matrix_simple(
     Soft distance:
         D = omega * D_h + mu * D_b
 
-    where:
-        D_h = sign-aware DTW distance between activations
-        D_b = response vector field value difference on overlapping support
+    where D_h is sign-aware DTW of activations, and D_b is either:
+      - "l2":  normalized L2 distance on overlap (Eq: ||B1-sign*B2|| / (||B1||+||B2||))
+      - "correlation": 1 - |pearson_r(B1, sign*B2)| on overlap
     """
     n = len(regions)
     D = np.zeros((n, n), dtype=np.float32)
@@ -3192,43 +3129,43 @@ def compute_region_distance_matrix_simple(
 
     for i in range(n):
         for j in range(i + 1, n):
-            mask_i = _get_region_mask_simple(regions[i])
-            mask_j = _get_region_mask_simple(regions[j])
-
-            if mask_i is None or mask_j is None or mask_i.shape != mask_j.shape:
+            # Hard constraint: never cluster two regions from the SAME episode
+            # (they are already distinct spatiotemporal units)
+            if getattr(regions[i], "episode_id", None) == getattr(regions[j], "episode_id", None):
                 dist = incompatible_dist
                 info = {
                     "compatible": False,
-                    "reason": "invalid_mask",
+                    "reason": "same_episode",
                     "iou": 0.0,
                     "D_h": np.inf,
                     "D_b": np.inf,
                     "distance": dist,
                     "sign": 1.0,
                 }
-            else:
-                iou = _mask_iou(mask_i, mask_j)
 
-                if iou < min_iou:
+            else:
+                mask_i = _get_region_mask_simple(regions[i])
+                mask_j = _get_region_mask_simple(regions[j])
+
+                if mask_i is None or mask_j is None or mask_i.shape != mask_j.shape:
                     dist = incompatible_dist
                     info = {
                         "compatible": False,
-                        "reason": "low_iou",
-                        "iou": float(iou),
+                        "reason": "invalid_mask",
+                        "iou": 0.0,
                         "D_h": np.inf,
                         "D_b": np.inf,
                         "distance": dist,
                         "sign": 1.0,
                     }
                 else:
-                    h_i = _get_region_activation(regions[i])
-                    h_j = _get_region_activation(regions[j])
+                    iou = _mask_iou(mask_i, mask_j)
 
-                    if h_i is None or h_j is None:
+                    if iou < min_iou:
                         dist = incompatible_dist
                         info = {
                             "compatible": False,
-                            "reason": "invalid_activation",
+                            "reason": "low_iou",
                             "iou": float(iou),
                             "D_h": np.inf,
                             "D_b": np.inf,
@@ -3236,12 +3173,28 @@ def compute_region_distance_matrix_simple(
                             "sign": 1.0,
                         }
                     else:
-                        D_h, sign_j = _sign_aware_activation_dtw(h_i, h_j)
-                        D_b = _response_field_distance_on_overlap(
-                            regions[i],
-                            regions[j],
-                            sign2=sign_j,
-                        )
+                        h_i = _get_region_activation(regions[i])
+                        h_j = _get_region_activation(regions[j])
+
+                        if h_i is None or h_j is None:
+                            dist = incompatible_dist
+                            info = {
+                                "compatible": False,
+                                "reason": "invalid_activation",
+                                "iou": float(iou),
+                                "D_h": np.inf,
+                                "D_b": np.inf,
+                                "distance": dist,
+                                "sign": 1.0,
+                            }
+                        else:
+                            D_h, sign_j = _sign_aware_activation_dtw(h_i, h_j)
+                            if b_distance == "correlation":
+                                D_b = _response_field_correlation_on_overlap(
+                                    regions[i], regions[j], sign2=sign_j)
+                            else:
+                                D_b = _response_field_distance_on_overlap(
+                                    regions[i], regions[j], sign2=sign_j)
 
                         if not np.isfinite(D_h) or not np.isfinite(D_b):
                             dist = incompatible_dist
@@ -3332,6 +3285,190 @@ def cluster_regions_hierarchical(
 
     return groups, labels
 
+def region_pair_distance(
+    r1,
+    r2,
+    w_activation=1.0,
+    w_response=1.0,
+    w_space=0.0,
+    spatial_rule="iou_or_centroid",
+    iou_thresh=0.10,
+    centroid_dist_thresh=3.0,
+    enforce_spatial_gate=True,
+    incompatible_dist=1e6,
+):
+    spatial_ok, spatial_info = _regions_spatially_compatible(
+        r1, r2,
+        spatial_rule=spatial_rule,
+        iou_thresh=iou_thresh,
+        centroid_dist_thresh=centroid_dist_thresh,
+    )
+    if enforce_spatial_gate and not spatial_ok:
+        return float(incompatible_dist), {**spatial_info, "D_activation": None, "D_response": None, "D_space": None}
+
+    h1 = np.asarray(r1.activation_resampled, dtype=np.float32)
+    h2 = np.asarray(r2.activation_resampled, dtype=np.float32)
+    corr_h = _safe_corr(h1, h2)
+    sign = 1.0 if corr_h >= 0 else -1.0
+    D_h = 1.0 - abs(float(corr_h))
+
+    b1 = np.asarray(r1.mean_response_vector, dtype=np.float32)
+    b2 = sign * np.asarray(r2.mean_response_vector, dtype=np.float32)
+    cos_b = _cosine_similarity(b1, b2)
+    D_b = 1.0 - np.clip(cos_b, -1.0, 1.0)
+
+    D_s = 1.0 - spatial_info["iou"] if np.isfinite(spatial_info["iou"]) else 1.0
+    D = w_activation * D_h + w_response * D_b + w_space * D_s
+    return float(D), {
+        **spatial_info,
+        "D_activation": float(D_h),
+        "activation_corr": float(corr_h),
+        "sign": float(sign),
+        "D_response": float(D_b),
+        "response_cosine": float(cos_b),
+        "D_space": float(D_s),
+        "D_total": float(D),
+    }
+
+def build_region_graph(
+    regions,
+    spatial_rule="iou_or_centroid",
+    iou_thresh=0.10,
+    centroid_dist_thresh=3.0,
+    activation_dist_thresh=0.35,
+    response_dist_thresh=0.45,
+    total_dist_thresh=None,
+    w_activation=1.0,
+    w_response=1.0,
+    w_space=0.0,
+    enforce_spatial_gate=True,
+    verbose=True,
+):
+    n = len(regions)
+    neighbors = [[] for _ in range(n)]
+    edge_info = {}
+    stats = {"pairs": 0, "spatial_pass": 0, "activation_pass": 0, "response_pass": 0, "edge": 0}
+    for i in range(n):
+        for j in range(i + 1, n):
+            stats["pairs"] += 1
+            D, info = region_pair_distance(
+                regions[i], regions[j],
+                w_activation=w_activation,
+                w_response=w_response,
+                w_space=w_space,
+                spatial_rule=spatial_rule,
+                iou_thresh=iou_thresh,
+                centroid_dist_thresh=centroid_dist_thresh,
+                enforce_spatial_gate=enforce_spatial_gate,
+            )
+            if not info.get("spatial_ok", True):
+                continue
+            stats["spatial_pass"] += 1
+            if info["D_activation"] is None or info["D_activation"] > activation_dist_thresh:
+                continue
+            stats["activation_pass"] += 1
+            if info["D_response"] is None or info["D_response"] > response_dist_thresh:
+                continue
+            stats["response_pass"] += 1
+            if total_dist_thresh is not None and D > total_dist_thresh:
+                continue
+            neighbors[i].append(j)
+            neighbors[j].append(i)
+            edge_info[(i, j)] = info
+            stats["edge"] += 1
+    if verbose:
+        print(f"[region graph] nodes={n}, pairs={stats['pairs']}, spatial={stats['spatial_pass']}, "
+              f"activation={stats['activation_pass']}, response={stats['response_pass']}, edges={stats['edge']}")
+    return neighbors, edge_info, stats
+
+def _dtw_distance_1d(x, y, eps=1e-8):
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    y = np.asarray(y, dtype=np.float32).reshape(-1)
+
+    n, m = len(x), len(y)
+    if n == 0 or m == 0:
+        return np.inf
+
+    dp = np.full((n + 1, m + 1), np.inf, dtype=np.float32)
+    dp[0, 0] = 0.0
+
+    for i in range(1, n + 1):
+        xi = x[i - 1]
+        for j in range(1, m + 1):
+            cost = abs(xi - y[j - 1])
+            dp[i, j] = cost + min(
+                dp[i - 1, j],
+                dp[i, j - 1],
+                dp[i - 1, j - 1],
+            )
+
+    return float(dp[n, m] / (n + m + eps))
+
+def _find_activation_medoid_index(activations, weights=None, eps=1e-8):
+    """
+    Select the region whose activation is most representative of the pattern.
+    This does not require equal-length activations.
+    """
+    n = len(activations)
+    if n == 0:
+        return None
+    if n == 1:
+        return 0
+
+    if weights is None:
+        weights = np.ones(n, dtype=np.float32)
+    else:
+        weights = np.asarray(weights, dtype=np.float32)
+
+    weights = weights / (np.sum(weights) + eps)
+
+    scores = np.zeros(n, dtype=np.float32)
+
+    for i in range(n):
+        s = 0.0
+        for j in range(n):
+            if i == j:
+                continue
+            d = _dtw_distance_1d(activations[i], activations[j], eps=eps)
+            s += weights[j] * d
+        scores[i] = s
+
+    return int(np.argmin(scores))
+
+def _sign_by_resampled_corr(ref_h, h, target_len=16):
+    """
+    Only for sign alignment. Raw activations can still keep original length.
+    """
+    ref_h = np.asarray(ref_h, dtype=np.float32).reshape(-1)
+    h = np.asarray(h, dtype=np.float32).reshape(-1)
+
+    if len(ref_h) == 0 or len(h) == 0:
+        return 1.0
+
+    ref_rs = _resample_1d(ref_h, target_len)
+    h_rs = _resample_1d(h, target_len)
+
+    return 1.0 if _safe_corr(ref_rs, h_rs) >= 0 else -1.0
+
+def connected_components_from_graph(neighbors):
+    n = len(neighbors)
+    visited = np.zeros(n, dtype=bool)
+    groups = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        stack = [i]
+        visited[i] = True
+        group = []
+        while stack:
+            u = stack.pop()
+            group.append(u)
+            for v in neighbors[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    stack.append(v)
+        groups.append(sorted(group))
+    return groups
 
 def build_motion_patterns_from_groups(regions, groups):
     """
@@ -3360,8 +3497,9 @@ def build_motion_patterns_from_groups(regions, groups):
 
     return patterns
 
-def getMotionRegionPattern(
+def getMotionPattern(
     motion_episodes,
+    unit_type="region",        # "region" or "mode"
     min_strength=0.0,
     min_area=5,
     min_duration=1,
@@ -3369,6 +3507,7 @@ def getMotionRegionPattern(
     min_iou=0.10,
     omega=1.0,
     mu=1.0,
+    b_distance="l2",           # "l2" or "correlation"
 
     cluster_dist_thresh=0.8,
     linkage_method="complete",
@@ -3376,41 +3515,39 @@ def getMotionRegionPattern(
 
     verbose=True,
 ):
-    """
-    Build MotionPatterns from MotionRegions.
+    """Build MotionPatterns from MotionRegions or MotionModes.
 
-    Logic:
-        1. Collect MotionRegions from all episodes.
-        2. Filter weak/small/short regions.
-        3. Pairwise hard gate by region IoU.
-        4. Pairwise distance:
-               D = omega * DTW(h_i, h_j)
-                 + mu    * response_field_distance(b_i, b_j)
-        5. Complete-linkage hierarchical clustering.
+    Parameters
+    ----------
+    unit_type : str
+        "region" - cluster MotionRegions (default).
+        "mode"   - cluster MotionModes directly, skipping spatial splitting.
     """
-    all_regions = collect_regions_from_episodes(motion_episodes)
+    # Collect units
+    all_units = collect_units_from_episodes(motion_episodes, unit_type=unit_type)
 
     if verbose:
-        print(f"[getMotionRegionPattern] collected regions: {len(all_regions)}")
+        print(f"[getMotionPattern] collected {unit_type}s: {len(all_units)}")
 
-    kept_regions = filter_regions_for_patterns(
-        all_regions,
+    kept_units = filter_regions_for_patterns(
+        all_units,
         min_strength=min_strength,
         min_area=min_area,
         min_duration=min_duration,
     )
 
     if verbose:
-        print(f"[getMotionRegionPattern] kept regions: {len(kept_regions)}")
+        print(f"[getMotionPattern] kept {unit_type}s: {len(kept_units)}")
 
-    if len(kept_regions) == 0:
+    if len(kept_units) == 0:
         return [], [], [], np.array([], dtype=np.int32), {}
 
     dist_mat, pair_info = compute_region_distance_matrix_simple(
-        kept_regions,
+        kept_units,
         min_iou=min_iou,
         omega=omega,
         mu=mu,
+        b_distance=b_distance,
         incompatible_dist=incompatible_dist,
         verbose=verbose,
     )
@@ -3424,7 +3561,7 @@ def getMotionRegionPattern(
     )
 
     patterns = build_motion_patterns_from_groups(
-        kept_regions,
+        kept_units,
         groups,
     )
 
@@ -3432,7 +3569,9 @@ def getMotionRegionPattern(
         "distance_matrix": dist_mat,
         "pair_info": pair_info,
         "labels": labels,
+        "unit_type": unit_type,
         "params": {
+            "unit_type": unit_type,
             "min_strength": min_strength,
             "min_area": min_area,
             "min_duration": min_duration,
@@ -3445,7 +3584,40 @@ def getMotionRegionPattern(
         },
     }
 
-    return patterns, kept_regions, groups, labels, info
+    return patterns, kept_units, groups, labels, info
+
+
+# Backward-compatible alias
+def getMotionRegionPattern(
+    motion_episodes,
+    min_strength=0.0,
+    min_area=5,
+    min_duration=1,
+    min_iou=0.10,
+    omega=1.0,
+    mu=1.0,
+    b_distance="l2",
+    cluster_dist_thresh=0.8,
+    linkage_method="complete",
+    incompatible_dist=1e6,
+    verbose=True,
+):
+    """Backward-compatible wrapper - delegates to getMotionPattern(unit_type='region')."""
+    return getMotionPattern(
+        motion_episodes,
+        unit_type="region",
+        min_strength=min_strength,
+        min_area=min_area,
+        min_duration=min_duration,
+        min_iou=min_iou,
+        omega=omega,
+        mu=mu,
+        b_distance=b_distance,
+        cluster_dist_thresh=cluster_dist_thresh,
+        linkage_method=linkage_method,
+        incompatible_dist=incompatible_dist,
+        verbose=verbose,
+    )
 
 def pattern_to_binary_mask(
     pattern,
@@ -3591,6 +3763,44 @@ def find_patterns_overlapping_region(
         rows = sorted(rows, key=lambda x: x[sort_by], reverse=True)
 
     return rows
+
+def make_query_mask_from_point(shape, point_xy, radius=5):
+    """
+    Make a circular query mask around one point.
+
+    point_xy:
+        (x, y) or (row, col) index in patch-coordinate system.
+        Must match your pattern mask coordinate convention.
+    """
+    X, Y = shape
+    x0, y0 = point_xy
+
+    xx, yy = np.meshgrid(np.arange(X), np.arange(Y), indexing="ij")
+    dist2 = (xx - x0) ** 2 + (yy - y0) ** 2
+
+    return dist2 <= radius ** 2
+
+def make_query_mask_from_bbox(shape, x0, x1, y0, y1):
+    """
+    Make rectangular query mask.
+
+    Coordinates are in patch-coordinate system:
+        x in [x0, x1-1]
+        y in [y0, y1-1]
+    """
+    X, Y = shape
+
+    x0 = max(0, int(x0))
+    x1 = min(X, int(x1))
+    y0 = max(0, int(y0))
+    y1 = min(Y, int(y1))
+
+    mask = np.zeros(shape, dtype=bool)
+    mask[x0:x1, y0:y1] = True
+
+    return mask
+
+
 
 # =============================================================================
 # Visualization
@@ -4172,6 +4382,9 @@ def summarize_temporal_basis_likeness(episodes):
         return rows
 
 
+
+
+
 def save_episode_mode_region_gallery(
     motion_episodes,
     out_dir,
@@ -4405,3 +4618,3324 @@ def mode_incremental_contribution(ep: MotionEpisode):
         vals.append((err_wo - err_full) / total)
     return np.asarray(vals, dtype=np.float32)
 
+
+# =============================================================================
+# Analysis with Ca channel
+# =============================================================================
+
+
+
+# Convert MotionRegion / MotionMode to spatial mask
+def motion_region_to_mask(region):
+    """
+    Use MotionRegion.region_mask.
+    """
+    m = getattr(region, "region_mask", None)
+    if m is None:
+        return None
+    return _as_bool_mask(m)
+
+
+def motion_mode_to_mask(
+    mode,
+    support_rel_thresh=0.05,
+):
+    """
+    Build support mask from MotionMode.response_strength.
+    """
+    A = getattr(mode, "response_strength", None)
+    if A is None:
+        return None
+
+    A = np.asarray(A, dtype=np.float32)
+    if A.ndim != 2:
+        return None
+
+    vmax = float(np.nanmax(A))
+    if not np.isfinite(vmax) or vmax <= 0:
+        return None
+
+    return A > support_rel_thresh * vmax
+
+
+def unit_to_mask(
+    unit,
+    unit_type="region",
+    mode_support_rel_thresh=0.05,
+):
+    if unit_type == "region":
+        return motion_region_to_mask(unit)
+    elif unit_type == "mode":
+        return motion_mode_to_mask(
+            unit,
+            support_rel_thresh=mode_support_rel_thresh,
+        )
+    else:
+        raise ValueError(f"Unknown unit_type: {unit_type}")
+
+
+# Get unit activation and absolute frame range
+def _infer_unit_time_indices(unit, n_frames=None):
+    """
+    Infer absolute frame indices for a unit from unit.time_range and unit.activation.
+
+    Supports both:
+        time_range = (start, end_exclusive)
+    and:
+        time_range = (start, end_inclusive)
+
+    Returns
+    -------
+    frames : ndarray, shape (len(h),)
+    """
+    h = getattr(unit, "activation", None)
+    if h is None:
+        return None
+
+    h = np.asarray(h, dtype=np.float32).reshape(-1)
+    L = len(h)
+
+    tr = getattr(unit, "time_range", None)
+    if tr is None:
+        return None
+
+    start = int(tr[0])
+    end = int(tr[1])
+
+    # Case 1: [start, end) has length L
+    if end - start == L:
+        frames = np.arange(start, end, dtype=int)
+
+    # Case 2: [start, end] has length L
+    elif end - start + 1 == L:
+        frames = np.arange(start, end + 1, dtype=int)
+
+    else:
+        # Fallback: assume start + len(h)
+        frames = np.arange(start, start + L, dtype=int)
+
+    if n_frames is not None:
+        valid = (frames >= 0) & (frames < int(n_frames))
+        frames = frames[valid]
+
+    return frames
+
+def unit_to_activation_trace(
+    unit,
+    n_frames,
+    use_abs=True,
+    normalize_unit=True,
+    smooth_win=None,
+):
+    """
+    Put a region/mode activation back onto full video time axis.
+
+    Returns
+    -------
+    trace : (n_frames,)
+    """
+    h = getattr(unit, "activation", None)
+    if h is None:
+        return np.zeros(int(n_frames), dtype=np.float32)
+
+    h = np.asarray(h, dtype=np.float32).reshape(-1)
+
+    if use_abs:
+        h = np.abs(h)
+
+    if smooth_win is not None and smooth_win > 1:
+        h = _smooth_1d(h, win=smooth_win)
+
+    if normalize_unit:
+        h = _normalize_1d(h)
+
+    frames = _infer_unit_time_indices(unit, n_frames=n_frames)
+    trace = np.zeros(int(n_frames), dtype=np.float32)
+
+    if frames is None:
+        return trace
+
+    L = min(len(frames), len(h))
+    if L <= 0:
+        return trace
+
+    frames = frames[:L]
+    h = h[:L]
+
+    valid = (frames >= 0) & (frames < int(n_frames))
+    trace[frames[valid]] = h[valid]
+
+    return trace
+
+
+# ROI-overlap classification
+def classify_motion_units_by_roi(
+    units,
+    roi_mask,
+    valid_mask=None,
+    unit_type="region",
+    mode_support_rel_thresh=0.05,
+
+    min_intersection=1,
+    min_roi_coverage=0.01,
+
+    local_locality_thresh=0.50,
+    local_globalness_max=0.10,
+
+    global_globalness_thresh=0.25,
+    global_locality_max=0.25,
+
+    roi_dilation_iter=0,
+):
+    """
+    Classify motion regions/modes overlapping a user-specified ROI into:
+        local / global / mixed
+
+    Definitions:
+        roi_coverage = |S ∩ R| / |R|
+        locality     = |S ∩ R| / |S|
+        globalness   = |S| / |valid spatial area|
+
+    Parameters
+    ----------
+    units:
+        list of MotionRegion or MotionMode.
+
+    roi_mask:
+        bool mask, shape (X,Y), in patch coordinates.
+
+    valid_mask:
+        optional bool mask. If None, whole FOV is used.
+
+    unit_type:
+        "region" or "mode".
+    """
+    roi_mask = _as_bool_mask(roi_mask)
+
+    if roi_dilation_iter is not None and roi_dilation_iter > 0:
+        roi_eval = ndi.binary_dilation(
+            roi_mask,
+            iterations=int(roi_dilation_iter),
+        )
+    else:
+        roi_eval = roi_mask.copy()
+
+    if valid_mask is None:
+        valid_mask = np.ones_like(roi_eval, dtype=bool)
+    else:
+        valid_mask = _as_bool_mask(valid_mask)
+
+    roi_area = int((roi_eval & valid_mask).sum())
+    valid_area = int(valid_mask.sum())
+
+    if roi_area <= 0:
+        raise ValueError("ROI mask is empty after applying valid_mask.")
+
+    if valid_area <= 0:
+        raise ValueError("valid_mask is empty.")
+
+    records = []
+    grouped = {
+        "local": [],
+        "global": [],
+        "mixed": [],
+    }
+
+    for idx, unit in enumerate(units):
+        mask = unit_to_mask(
+            unit,
+            unit_type=unit_type,
+            mode_support_rel_thresh=mode_support_rel_thresh,
+        )
+
+        if mask is None:
+            continue
+
+        mask = _as_bool_mask(mask)
+
+        if mask.shape != roi_eval.shape:
+            raise ValueError(
+                f"Unit mask shape {mask.shape} != roi_mask shape {roi_eval.shape}"
+            )
+
+        mask = mask & valid_mask
+
+        support_area = int(mask.sum())
+        if support_area <= 0:
+            continue
+
+        inter = int((mask & roi_eval).sum())
+        if inter < min_intersection:
+            continue
+
+        roi_coverage = inter / max(roi_area, 1)
+        locality = inter / max(support_area, 1)
+        globalness = support_area / max(valid_area, 1)
+
+        if roi_coverage < min_roi_coverage:
+            continue
+
+        # Classification
+        if (locality >= local_locality_thresh) and (globalness <= local_globalness_max):
+            cls = "local"
+        elif (globalness >= global_globalness_thresh) or (locality <= global_locality_max):
+            cls = "global"
+        else:
+            cls = "mixed"
+
+        strength = _safe_float(getattr(unit, "strength", 1.0), default=1.0)
+
+        rec = {
+            "index": idx,
+            "unit": unit,
+            "class": cls,
+            "support_area": support_area,
+            "intersection": inter,
+            "roi_area": roi_area,
+            "valid_area": valid_area,
+            "roi_coverage": float(roi_coverage),
+            "locality": float(locality),
+            "globalness": float(globalness),
+            "strength": float(strength),
+            "episode_id": getattr(unit, "episode_id", None),
+            "mode_id": getattr(unit, "mode_id", None),
+            "region_id": getattr(unit, "region_id", None),
+            "pattern_id": getattr(unit, "pattern_id", None),
+            "mask": mask,
+        }
+
+        records.append(rec)
+        grouped[cls].append(rec)
+
+    return records, grouped
+
+# Build class activation traces
+def build_class_activation_traces(
+    grouped_records,
+    n_frames,
+    weight_mode="roi_strength",
+    use_abs=True,
+    normalize_unit=True,
+    smooth_unit_win=None,
+    normalize_class=True,
+):
+    """
+    Build one full-time activation trace for each class:
+        global / local / mixed
+
+    weight_mode:
+        "uniform"
+        "strength"
+        "roi_coverage"
+        "roi_strength" = strength * roi_coverage
+        "intersection"
+    """
+    traces = {}
+
+    for cls, records in grouped_records.items():
+        out = np.zeros(int(n_frames), dtype=np.float32)
+        wsum = 0.0
+
+        for rec in records:
+            unit = rec["unit"]
+
+            h_full = unit_to_activation_trace(
+                unit,
+                n_frames=n_frames,
+                use_abs=use_abs,
+                normalize_unit=normalize_unit,
+                smooth_win=smooth_unit_win,
+            )
+
+            if weight_mode == "uniform":
+                w = 1.0
+            elif weight_mode == "strength":
+                w = rec["strength"]
+            elif weight_mode == "roi_coverage":
+                w = rec["roi_coverage"]
+            elif weight_mode == "roi_strength":
+                w = rec["strength"] * rec["roi_coverage"]
+            elif weight_mode == "intersection":
+                w = rec["intersection"]
+            else:
+                raise ValueError(f"Unknown weight_mode: {weight_mode}")
+
+            if not np.isfinite(w) or w <= 0:
+                w = 1.0
+
+            out += float(w) * h_full
+            wsum += float(w)
+
+        if wsum > 0:
+            out = out / wsum
+
+        if normalize_class:
+            out = _normalize_1d(out)
+
+        traces[cls] = out.astype(np.float32)
+
+    # Make sure all keys exist
+    for cls in ["global", "local", "mixed"]:
+        traces.setdefault(cls, np.zeros(int(n_frames), dtype=np.float32))
+
+    return traces
+
+# Event detection from activation trace
+def detect_activation_events_mad(
+    trace,
+    mad_k=3.0,
+    min_len=1,
+    merge_gap=1,
+    eps=1e-12,
+):
+    """
+    Detect active periods from a 1D activation trace using MAD threshold.
+
+    Returns list of dicts:
+        start, end, peak_frame, peak_value, duration
+    """
+    x = np.asarray(trace, dtype=np.float32).reshape(-1)
+
+    med = np.nanmedian(x)
+    mad = np.nanmedian(np.abs(x - med))
+    sigma = 1.4826 * mad + eps
+    thresh = med + mad_k * sigma
+
+    active = x > thresh
+
+    if merge_gap is not None and merge_gap > 0:
+        structure = np.ones(int(merge_gap) + 1, dtype=bool)
+        active = ndi.binary_closing(active, structure=structure)
+
+    labeled, num = ndi.label(active)
+
+    events = []
+    for rid in range(1, num + 1):
+        idx = np.where(labeled == rid)[0]
+        if len(idx) < min_len:
+            continue
+
+        vals = x[idx]
+        peak_local = int(np.argmax(vals))
+        peak_frame = int(idx[peak_local])
+
+        events.append({
+            "start": int(idx[0]),
+            "end": int(idx[-1]),
+            "peak_frame": peak_frame,
+            "peak_value": float(x[peak_frame]),
+            "duration": int(len(idx)),
+            "threshold": float(thresh),
+        })
+
+    return events
+
+# Ca lag correlation
+def compute_lagged_ca_correlation_map(
+    activation_trace,
+    ca_patch_stack,
+    max_lag=10,
+    lag_mode="positive",
+    use_dff=True,
+    ca_smooth_win=None,
+    min_std=1e-6,
+):
+    """
+    Compute lagged correlation between one activation trace A(t)
+    and Ca at each spatial location C(t, ...).
+
+    Supports:
+        ca_patch_stack: (T, X, Y)
+        ca_patch_stack: (T, Z, X, Y)
+        or generally: (T, *spatial_shape)
+
+    lag definition:
+        corr(A(t), C(t + lag, ...))
+
+    Therefore:
+        lag < 0: Ca precedes motion activation
+        lag = 0: Ca is synchronous with motion activation
+        lag > 0: Ca follows motion activation
+
+    lag_mode:
+        "positive": choose lag with maximum correlation
+        "absolute": choose lag with maximum absolute correlation
+
+    Returns
+    -------
+    dict:
+        corr_by_lag: (n_lags, *spatial_shape)
+        lags: (n_lags,)
+        best_corr: (*spatial_shape,)
+        best_lag: (*spatial_shape,)
+        spatial_shape: tuple
+    """
+    A = np.asarray(activation_trace, dtype=np.float32).reshape(-1)
+    ca = np.asarray(ca_patch_stack, dtype=np.float32)
+
+    if ca.ndim < 3:
+        raise ValueError(
+            "ca_patch_stack should be at least 3D: "
+            "(T, X, Y) or (T, Z, X, Y). "
+            f"Got shape {ca.shape}"
+        )
+
+    T = ca.shape[0]
+    spatial_shape = ca.shape[1:]
+
+    if len(A) != T:
+        raise ValueError(
+            f"activation_trace length {len(A)} != ca_patch_stack time length {T}"
+        )
+
+    if use_dff:
+        ca = _compute_dff_stack(ca)
+
+    # Optional temporal smoothing for each spatial trace.
+    # Works for both 2D and 3D Ca, because we flatten space.
+    ca_flat = ca.reshape(T, -1).astype(np.float32)
+
+    if ca_smooth_win is not None and ca_smooth_win > 1:
+        ca_smooth = np.zeros_like(ca_flat, dtype=np.float32)
+        for j in range(ca_flat.shape[1]):
+            ca_smooth[:, j] = _smooth_1d(ca_flat[:, j], win=ca_smooth_win)
+        ca_flat = ca_smooth
+
+    lags = np.arange(-int(max_lag), int(max_lag) + 1, dtype=int)
+
+    n_lags = len(lags)
+    n_sites = ca_flat.shape[1]
+
+    corr_by_lag_flat = np.full(
+        (n_lags, n_sites),
+        np.nan,
+        dtype=np.float32,
+    )
+
+    for li, lag in enumerate(lags):
+        if lag >= 0:
+            a_seg = A[:T - lag]
+            c_seg = ca_flat[lag:T, :]
+        else:
+            a_seg = A[-lag:T]
+            c_seg = ca_flat[:T + lag, :]
+
+        if len(a_seg) < 3:
+            continue
+
+        a_z = _zscore_1d(a_seg)
+
+        if np.nanstd(a_z) < min_std:
+            continue
+
+        C_z = _zscore_time_matrix(c_seg)
+
+        corr = np.nanmean(C_z * a_z[:, None], axis=0)
+        corr_by_lag_flat[li, :] = corr.astype(np.float32)
+
+    corr_by_lag = corr_by_lag_flat.reshape(
+        (n_lags,) + tuple(spatial_shape)
+    )
+
+    # ------------------------------------------------------------
+    # Choose best lag for each spatial location
+    # ------------------------------------------------------------
+    if lag_mode == "positive":
+        score_flat = corr_by_lag_flat.copy()
+    elif lag_mode == "absolute":
+        score_flat = np.abs(corr_by_lag_flat)
+    else:
+        raise ValueError(f"Unknown lag_mode: {lag_mode}")
+
+    finite_any = np.any(np.isfinite(score_flat), axis=0)
+
+    score_safe = np.where(np.isfinite(score_flat), score_flat, -np.inf)
+
+    best_idx_flat = np.zeros(n_sites, dtype=np.int32)
+    best_idx_flat[finite_any] = np.argmax(score_safe[:, finite_any], axis=0)
+
+    best_corr_flat = np.full(n_sites, np.nan, dtype=np.float32)
+    best_lag_flat = np.full(n_sites, 0, dtype=np.int32)
+
+    idx_sites = np.arange(n_sites)
+
+    best_corr_flat[finite_any] = corr_by_lag_flat[
+        best_idx_flat[finite_any],
+        idx_sites[finite_any],
+    ]
+
+    best_lag_flat[finite_any] = lags[best_idx_flat[finite_any]]
+
+    best_corr = best_corr_flat.reshape(spatial_shape).astype(np.float32)
+    best_lag = best_lag_flat.reshape(spatial_shape).astype(np.int32)
+
+    return {
+        "corr_by_lag": corr_by_lag.astype(np.float32),
+        "lags": lags,
+        "best_corr": best_corr,
+        "best_lag": best_lag,
+        "spatial_shape": tuple(spatial_shape),
+        "ca_ndim": ca.ndim,
+    }
+
+
+def get_top_ca_sites_from_corr_map(
+    corr_map,
+    lag_map=None,
+    top_n=20,
+    min_corr=None,
+):
+    """
+    Get top Ca sites from 2D or 3D correlation map.
+
+    Supports:
+        corr_map: (X, Y)
+        corr_map: (Z, X, Y)
+        or generally: (*spatial_shape,)
+
+    Returns
+    -------
+    rows:
+        list of dicts with:
+            coord: tuple
+            corr: float
+            lag: int, optional
+            plus convenience keys for 2D/3D
+    """
+    corr = np.asarray(corr_map, dtype=np.float32)
+    flat = corr.reshape(-1)
+
+    valid = np.isfinite(flat)
+
+    if min_corr is not None:
+        valid &= flat >= float(min_corr)
+
+    idx_all = np.where(valid)[0]
+
+    if len(idx_all) == 0:
+        return []
+
+    order = idx_all[np.argsort(flat[idx_all])[::-1]]
+    order = order[:int(top_n)]
+
+    rows = []
+
+    for idx in order:
+        coord = np.unravel_index(int(idx), corr.shape)
+        coord = tuple(int(c) for c in coord)
+
+        row = {
+            "coord": coord,
+            "corr": float(corr[coord]),
+        }
+
+        # Backward-compatible convenience fields
+        if corr.ndim == 2:
+            row["x"] = coord[0]
+            row["y"] = coord[1]
+        elif corr.ndim == 3:
+            row["z"] = coord[0]
+            row["x"] = coord[1]
+            row["y"] = coord[2]
+
+        if lag_map is not None:
+            lag = np.asarray(lag_map)
+            row["lag"] = int(lag[coord])
+
+        rows.append(row)
+
+    return rows
+
+import numpy as np
+
+
+# ============================================================
+# Basic helpers
+# ============================================================
+
+def _as_bool_mask_fallback(mask):
+    if "_as_bool_mask" in globals():
+        return _as_bool_mask(mask)
+    return np.asarray(mask).astype(bool)
+
+
+def _extract_unit_from_record(record, units=None):
+    """
+    Make this compatible with different possible formats returned by
+    classify_motion_units_by_roi.
+
+    Expected common formats:
+        record["unit"]
+        record["region"]
+        record["motion_region"]
+        record["unit_index"]
+        record["idx"]
+        or record itself is the unit.
+    """
+    if isinstance(record, dict):
+        for k in ["unit", "region", "motion_region", "motion_unit", "obj"]:
+            if k in record:
+                return record[k]
+
+        if units is not None:
+            for k in ["unit_index", "idx", "index", "id"]:
+                if k in record:
+                    idx = int(record[k])
+                    if 0 <= idx < len(units):
+                        return units[idx]
+
+    return record
+
+
+def _interval_from_motion_region_scheme_a(region, n_frames):
+    """
+    Motion region binarization scheme A:
+    Do not use activation magnitude.
+    Only use region.time_range.
+
+    Returns half-open interval [start, end).
+    """
+    tr = getattr(region, "time_range", None)
+    h = getattr(region, "activation", None)
+
+    if tr is None:
+        return None
+
+    start = int(tr[0])
+
+    if h is not None:
+        end = start + len(np.asarray(h).reshape(-1))
+    elif len(tr) >= 2:
+        second = int(tr[1])
+
+        # Compatible with two possible conventions:
+        #   time_range = [start, end]
+        #   time_range = [start, duration]
+        if second > start:
+            end = second
+        else:
+            end = start + max(1, second)
+    else:
+        end = start + 1
+
+    start = max(0, min(int(n_frames), start))
+    end = max(0, min(int(n_frames), end))
+
+    if end <= start:
+        return None
+
+    return (start, end)
+
+
+def _merge_intervals(intervals, merge_gap=1):
+    """
+    Merge overlapping or nearby intervals.
+
+    intervals:
+        list of (start, end), half-open [start, end)
+    """
+    if len(intervals) == 0:
+        return []
+
+    intervals = sorted(intervals, key=lambda x: x[0])
+    merged = [list(intervals[0])]
+
+    for s, e in intervals[1:]:
+        last_s, last_e = merged[-1]
+
+        if s <= last_e + int(merge_gap):
+            merged[-1][1] = max(last_e, e)
+        else:
+            merged.append([s, e])
+
+    return [tuple(x) for x in merged]
+
+
+def _make_lags(max_lag=10, lag_mode="positive"):
+    max_lag = int(max_lag)
+
+    if lag_mode == "positive":
+        return np.arange(0, max_lag + 1, dtype=np.int32)
+    elif lag_mode == "negative":
+        return np.arange(-max_lag, 1, dtype=np.int32)
+    elif lag_mode in ["both", "symmetric"]:
+        return np.arange(-max_lag, max_lag + 1, dtype=np.int32)
+    else:
+        raise ValueError("lag_mode should be 'positive', 'negative', or 'both'.")
+
+
+def _binomial_tail_pvalue(k, n, p):
+    """
+    Right-tail p-value:
+        P(X >= k), X ~ Binomial(n, p)
+
+    This is a fast AQuA2-like approximate p-value.
+    For final statistical claims, circular-shift permutation is still safer.
+    """
+    if n <= 0:
+        return np.nan
+
+    k = int(k)
+    n = int(n)
+    p = float(np.clip(p, 0.0, 1.0))
+
+    if k <= 0:
+        return 1.0
+
+    try:
+        from scipy.stats import binom
+        return float(binom.sf(k - 1, n, p))
+    except Exception:
+        from math import comb
+
+        val = 0.0
+        for i in range(k, n + 1):
+            val += comb(n, i) * (p ** i) * ((1 - p) ** (n - i))
+        return float(np.clip(val, 0.0, 1.0))
+
+
+# ============================================================
+# Ca active-state construction
+# ============================================================
+
+def _prepare_ca_active_chunk_fast(
+    ca_chunk,
+    use_dff=True,
+    baseline_percentile=20,
+    smooth_win=3,
+    mad_k=3.0,
+    min_len=2,
+    merge_gap=1,
+    eps=1e-6,
+):
+    """
+    ca_chunk:
+        shape (T, N_chunk)
+
+    Returns:
+        active:
+            bool array, shape (T, N_chunk)
+    """
+    x = np.asarray(ca_chunk, dtype=np.float32)
+
+    if use_dff:
+        f0 = np.nanpercentile(x, baseline_percentile, axis=0).astype(np.float32)
+        x = (x - f0[None, :]) / (np.abs(f0[None, :]) + eps)
+
+    if smooth_win is not None and smooth_win > 1:
+        try:
+            from scipy.ndimage import uniform_filter1d
+            x = uniform_filter1d(
+                x,
+                size=int(smooth_win),
+                axis=0,
+                mode="nearest",
+            )
+        except Exception:
+            kernel = np.ones(int(smooth_win), dtype=np.float32) / int(smooth_win)
+            for i in range(x.shape[1]):
+                x[:, i] = np.convolve(x[:, i], kernel, mode="same")
+
+    med = np.nanmedian(x, axis=0).astype(np.float32)
+    mad = np.nanmedian(np.abs(x - med[None, :]), axis=0).astype(np.float32)
+
+    robust_std = 1.4826 * mad
+
+    # Fallback for nearly constant traces.
+    std = np.nanstd(x, axis=0).astype(np.float32)
+    robust_std = np.where(robust_std > eps, robust_std, std)
+
+    threshold = med + float(mad_k) * robust_std
+    active = x > threshold[None, :]
+
+    # Make Ca activation more continuous.
+    # This is much faster than looping over every Ca site.
+    try:
+        from scipy.ndimage import binary_closing, binary_opening
+
+        if merge_gap is not None and merge_gap > 0:
+            # Fill short inactive gaps.
+            structure = np.ones((int(merge_gap) + 2, 1), dtype=bool)
+            active = binary_closing(active, structure=structure)
+
+        if min_len is not None and min_len > 1:
+            # Remove very short active bursts.
+            structure = np.ones((int(min_len), 1), dtype=bool)
+            active = binary_opening(active, structure=structure)
+
+    except Exception:
+        # If scipy is unavailable, return thresholded active state directly.
+        pass
+
+    return active.astype(bool)
+
+
+def _baseline_window_prob_from_cumsum(
+    csum,
+    window_len,
+    T,
+    time_chunk_size=512,
+):
+    """
+    Probability that a random window of length window_len contains
+    at least one Ca-active frame.
+
+    csum:
+        shape (T + 1, N_chunk)
+    """
+    L = int(window_len)
+    L = max(1, min(L, T))
+
+    n_windows = T - L + 1
+    N = csum.shape[1]
+
+    if n_windows <= 0:
+        return np.zeros(N, dtype=np.float32)
+
+    hit_total = np.zeros(N, dtype=np.int64)
+
+    for s0 in range(0, n_windows, int(time_chunk_size)):
+        s1 = min(n_windows, s0 + int(time_chunk_size))
+        starts = np.arange(s0, s1, dtype=np.int32)
+        ends = starts + L
+
+        count = csum[ends, :] - csum[starts, :]
+        hit_total += np.sum(count > 0, axis=0)
+
+    return (hit_total.astype(np.float32) / float(n_windows)).astype(np.float32)
+
+
+def _event_window_hit_rate_from_cumsum(
+    csum,
+    starts,
+    window_len,
+    T,
+):
+    """
+    For each Ca site, compute how many event windows contain at least
+    one Ca-active frame.
+
+    starts:
+        event window start frames, shape (n_events,)
+    """
+    N = csum.shape[1]
+    L = int(window_len)
+
+    valid = []
+    for s in starts:
+        s = int(s)
+        e = s + L
+
+        if e <= 0 or s >= T:
+            continue
+
+        s = max(0, s)
+        e = min(T, e)
+
+        if e > s:
+            valid.append((s, e))
+
+    if len(valid) == 0:
+        return (
+            np.zeros(N, dtype=np.float32),
+            np.zeros(N, dtype=np.int32),
+            0,
+        )
+
+    hit_count = np.zeros(N, dtype=np.int32)
+
+    for s, e in valid:
+        has_ca = (csum[e, :] - csum[s, :]) > 0
+        hit_count += has_ca.astype(np.int32)
+
+    n_valid = len(valid)
+    hit_rate = hit_count.astype(np.float32) / float(n_valid)
+
+    return hit_rate, hit_count, n_valid
+
+
+# ============================================================
+# Class-level motion event construction
+# ============================================================
+
+def _build_local_mixed_intervals_from_grouped(
+    grouped,
+    regions,
+    n_frames,
+    classes=("local", "mixed"),
+    merge_gap=1,
+    merge_motion_events=True,
+):
+    """
+    Build one class-level event sequence for local and mixed.
+
+    For example:
+        all local region time_ranges
+        -> merge overlapping intervals
+        -> local class motion event sequence
+    """
+    class_intervals = {}
+
+    for cls in classes:
+        intervals = []
+
+        for rec in grouped.get(cls, []):
+            unit = _extract_unit_from_record(rec, units=regions)
+            interval = _interval_from_motion_region_scheme_a(unit, n_frames)
+
+            if interval is not None:
+                intervals.append(interval)
+
+        if merge_motion_events:
+            class_intervals[cls] = _merge_intervals(
+                intervals,
+                merge_gap=merge_gap,
+            )
+        else:
+            class_intervals[cls] = intervals
+
+    return class_intervals
+
+
+# ============================================================
+# Main function
+# ============================================================
+def _binomial_tail_pvalue_array(hit_count, n_windows, baseline_prob):
+    """
+    Vectorized right-tail p-value:
+        P(X >= hit_count), X ~ Binomial(n_windows, baseline_prob)
+
+    hit_count:     array
+    n_windows:     array or scalar
+    baseline_prob: array
+    """
+    hit_count = np.asarray(hit_count)
+    n_windows = np.asarray(n_windows)
+    baseline_prob = np.asarray(baseline_prob, dtype=np.float64)
+
+    pvals = np.full(hit_count.shape, np.nan, dtype=np.float32)
+
+    valid = (
+        np.isfinite(baseline_prob)
+        & (n_windows > 0)
+        & (hit_count >= 0)
+        & (baseline_prob >= 0)
+        & (baseline_prob <= 1)
+    )
+
+    if not np.any(valid):
+        return pvals
+
+    try:
+        from scipy.stats import binom
+
+        pvals[valid] = binom.sf(
+            hit_count[valid].astype(np.int64) - 1,
+            n_windows[valid].astype(np.int64),
+            baseline_prob[valid],
+        ).astype(np.float32)
+
+    except Exception:
+        # Fallback: slower, but works.
+        for idx in np.where(valid)[0]:
+            pvals[idx] = _binomial_tail_pvalue(
+                k=int(hit_count[idx]),
+                n=int(n_windows[idx]),
+                p=float(baseline_prob[idx]),
+            )
+
+    return pvals
+
+def analyze_roi_local_mixed_ca_dependency(
+    roi_mask,
+    regions,
+    ca_patch_stack,
+
+    # Time
+    n_frames=None,
+
+    # Optional spatial masks
+    valid_mask=None,
+    ca_valid_mask=None,
+
+    # ROI classification parameters
+    roi_dilation_iter=0,
+    min_intersection=1,
+    min_roi_coverage=0.01,
+
+    local_locality_thresh=0.50,
+    local_globalness_max=0.10,
+    global_globalness_thresh=0.25,
+    global_locality_max=0.25,
+
+    # Class event construction
+    motion_merge_gap=1,
+    merge_motion_events=True,
+    # Ca active-state construction
+    ca_use_dff=True,
+    ca_baseline_percentile=20,
+    ca_smooth_win=3,
+    ca_mad_k=3.0,
+    ca_min_len=2,
+    ca_merge_gap=1,
+
+    # Dependency test
+    max_lag=10,
+    lag_mode="positive",
+    window_len=3,
+
+    # Ranking
+    rank_by="dependency_score",
+    # "dependency_score": hit_rate - baseline_prob
+    # "hit_rate": raw probability of Ca activation after motion events
+    # "enrichment": hit_rate / baseline_prob
+
+    top_n_ca=20,
+    min_rank_score=None,
+
+    # Speed / memory
+    chunk_size=20000,
+    store_maps=True,
+    compute_top_p=True,
+
+    compute_p_map=True,
+    p_map_eps=1e-300,
+
+    verbose=True,
+
+):
+    """
+    ROI-guided local/mixed motion-Ca event dependency analysis.
+
+    Inputs
+    ------
+    roi_mask:
+        Spatial ROI mask used to classify motion regions.
+
+    regions:
+        Existing motion regions.
+
+    ca_patch_stack:
+        Shape can be:
+            (T, H, W)
+            (T, Z, H, W)
+
+    Main outputs
+    ------------
+    result["results"]["local"]["top_sites"]
+    result["results"]["mixed"]["top_sites"]
+
+    Each top site contains:
+        coord
+        probability / hit_rate
+        baseline_prob
+        dependency_score
+        enrichment
+        lag
+        optional p_binom
+    """
+    roi_mask = _as_bool_mask_fallback(roi_mask)
+    regions = list(regions)
+
+    ca = np.asarray(ca_patch_stack, dtype=np.float32)
+
+    if ca.ndim < 3:
+        raise ValueError("ca_patch_stack should have shape (T,H,W) or (T,Z,H,W).")
+
+    if n_frames is None:
+        n_frames = int(ca.shape[0])
+    else:
+        n_frames = int(n_frames)
+
+    if ca.shape[0] != n_frames:
+        raise ValueError(
+            f"ca_patch_stack time length {ca.shape[0]} != n_frames {n_frames}"
+        )
+
+    T = int(n_frames)
+    spatial_shape = ca.shape[1:]
+    N = int(np.prod(spatial_shape))
+    ca_flat = ca.reshape(T, N)
+
+    # ------------------------------------------------------------
+    # 1. Classify motion regions by ROI
+    # ------------------------------------------------------------
+    records, grouped = classify_motion_units_by_roi(
+        units=regions,
+        roi_mask=roi_mask,
+        valid_mask=valid_mask,
+        unit_type="region",
+
+        min_intersection=min_intersection,
+        min_roi_coverage=min_roi_coverage,
+
+        local_locality_thresh=local_locality_thresh,
+        local_globalness_max=local_globalness_max,
+
+        global_globalness_thresh=global_globalness_thresh,
+        global_locality_max=global_locality_max,
+
+        roi_dilation_iter=roi_dilation_iter,
+    )
+
+    # ------------------------------------------------------------
+    # 2. Build class-level event intervals
+    # ------------------------------------------------------------
+    classes = ("local", "mixed")
+
+    class_intervals = _build_local_mixed_intervals_from_grouped(
+        grouped=grouped,
+        regions=regions,
+        n_frames=T,
+        classes=classes,
+        merge_gap=motion_merge_gap,
+        merge_motion_events=merge_motion_events
+    )
+
+    class_onsets = {
+        cls: np.asarray([s for s, e in class_intervals[cls]], dtype=np.int32)
+        for cls in classes
+    }
+
+    lags = _make_lags(max_lag=max_lag, lag_mode=lag_mode)
+
+    # ------------------------------------------------------------
+    # 3. Valid Ca sites
+    # ------------------------------------------------------------
+    if ca_valid_mask is None:
+        valid_ca_flat = np.ones(N, dtype=bool)
+    else:
+        valid_ca_flat = np.asarray(ca_valid_mask).astype(bool).reshape(-1)
+        if valid_ca_flat.size != N:
+            raise ValueError(
+                f"ca_valid_mask shape does not match ca spatial shape {spatial_shape}"
+            )
+
+    valid_indices = np.where(valid_ca_flat)[0]
+
+    # ------------------------------------------------------------
+    # 4. Allocate outputs
+    # ------------------------------------------------------------
+    results = {}
+
+    for cls in classes:
+        results[cls] = {
+            "n_regions": len(grouped.get(cls, [])),
+            "n_events": len(class_onsets[cls]),
+            "intervals": class_intervals[cls],
+            "onsets": class_onsets[cls],
+
+            "best_rank_score": np.full(N, -np.inf, dtype=np.float32),
+            "best_probability": np.full(N, np.nan, dtype=np.float32),
+            "best_hit_rate": np.full(N, np.nan, dtype=np.float32),
+            "best_baseline_prob": np.full(N, np.nan, dtype=np.float32),
+            "best_dependency_score": np.full(N, np.nan, dtype=np.float32),
+            "best_enrichment": np.full(N, np.nan, dtype=np.float32),
+            "best_lag": np.full(N, 0, dtype=np.int32),
+
+            # Used only for top-site p-value.
+            "best_hit_count": np.zeros(N, dtype=np.int32),
+            "best_n_windows": np.zeros(N, dtype=np.int32),
+        }
+
+    # ------------------------------------------------------------
+    # 5. Chunked Ca processing
+    # ------------------------------------------------------------
+    for c0 in range(0, len(valid_indices), int(chunk_size)):
+        c1 = min(len(valid_indices), c0 + int(chunk_size))
+        idx_chunk = valid_indices[c0:c1]
+
+        if verbose:
+            print(f"[Ca valid chunk] {c0}:{c1} / {len(valid_indices)}")
+
+        ca_chunk = ca_flat[:, idx_chunk]
+
+        ca_active = _prepare_ca_active_chunk_fast(
+            ca_chunk,
+            use_dff=ca_use_dff,
+            baseline_percentile=ca_baseline_percentile,
+            smooth_win=ca_smooth_win,
+            mad_k=ca_mad_k,
+            min_len=ca_min_len,
+            merge_gap=ca_merge_gap,
+        )
+
+        csum = np.concatenate(
+            [
+                np.zeros((1, ca_active.shape[1]), dtype=np.int32),
+                np.cumsum(ca_active.astype(np.int32), axis=0),
+            ],
+            axis=0,
+        )
+
+        baseline_prob = _baseline_window_prob_from_cumsum(
+            csum=csum,
+            window_len=window_len,
+            T=T,
+        )
+
+        baseline_safe = np.maximum(baseline_prob, 1e-6)
+
+        for cls in classes:
+            onsets = class_onsets[cls]
+
+            if len(onsets) == 0:
+                continue
+
+            for lag in lags:
+                starts = onsets + int(lag)
+
+                hit_rate, hit_count, n_valid = _event_window_hit_rate_from_cumsum(
+                    csum=csum,
+                    starts=starts,
+                    window_len=window_len,
+                    T=T,
+                )
+
+                if n_valid == 0:
+                    continue
+
+                dependency_score = hit_rate - baseline_prob
+                enrichment = hit_rate / baseline_safe
+
+                if rank_by == "dependency_score":
+                    rank_score = dependency_score
+                elif rank_by == "hit_rate":
+                    rank_score = hit_rate
+                elif rank_by == "enrichment":
+                    rank_score = enrichment
+                else:
+                    raise ValueError(
+                        "rank_by should be 'dependency_score', 'hit_rate', or 'enrichment'."
+                    )
+
+                old_score = results[cls]["best_rank_score"][idx_chunk]
+                update = rank_score > old_score
+
+                if not np.any(update):
+                    continue
+
+                idx_update = idx_chunk[update]
+
+                results[cls]["best_rank_score"][idx_update] = rank_score[update]
+                results[cls]["best_probability"][idx_update] = hit_rate[update]
+                results[cls]["best_hit_rate"][idx_update] = hit_rate[update]
+                results[cls]["best_baseline_prob"][idx_update] = baseline_prob[update]
+                results[cls]["best_dependency_score"][idx_update] = dependency_score[update]
+                results[cls]["best_enrichment"][idx_update] = enrichment[update]
+                results[cls]["best_lag"][idx_update] = int(lag)
+                results[cls]["best_hit_count"][idx_update] = hit_count[update]
+                results[cls]["best_n_windows"][idx_update] = int(n_valid)
+
+    # ------------------------------------------------------------
+    # 6. Extract top sites
+    # ------------------------------------------------------------
+    final_results = {}
+
+    for cls in classes:
+        r = results[cls]
+
+        score_flat = r["best_rank_score"]
+        valid = np.isfinite(score_flat) & valid_ca_flat
+
+        if min_rank_score is not None:
+            valid &= score_flat >= float(min_rank_score)
+
+        candidate_idx = np.where(valid)[0]
+
+        if candidate_idx.size > 0:
+            order = np.argsort(score_flat[candidate_idx])[::-1]
+            order = order[:int(top_n_ca)]
+            top_idx = candidate_idx[order]
+        else:
+            top_idx = np.array([], dtype=np.int64)
+
+        top_sites = []
+
+        for flat_i in top_idx:
+            coord = tuple(int(v) for v in np.unravel_index(int(flat_i), spatial_shape))
+
+            item = {
+                "coord": coord,
+
+                # The most direct quantity requested by you:
+                # probability that Ca appears after this class of motion events.
+                "probability": float(r["best_probability"][flat_i]),
+                "hit_rate": float(r["best_hit_rate"][flat_i]),
+
+                # Baseline and dependency metrics.
+                "baseline_prob": float(r["best_baseline_prob"][flat_i]),
+                "dependency_score": float(r["best_dependency_score"][flat_i]),
+                "enrichment": float(r["best_enrichment"][flat_i]),
+
+                # Best temporal lag.
+                "lag": int(r["best_lag"][flat_i]),
+
+                # Class-level counts.
+                "n_regions": int(r["n_regions"]),
+                "n_events": int(r["n_events"]),
+                "hit_count": int(r["best_hit_count"][flat_i]),
+                "n_windows": int(r["best_n_windows"][flat_i]),
+
+                # Ranking score used internally.
+                "rank_score": float(r["best_rank_score"][flat_i]),
+            }
+
+            if compute_top_p:
+                item["p_binom"] = _binomial_tail_pvalue(
+                    k=item["hit_count"],
+                    n=item["n_windows"],
+                    p=item["baseline_prob"],
+                )
+
+            top_sites.append(item)
+
+        out = {
+            "n_regions": int(r["n_regions"]),
+            "n_events": int(r["n_events"]),
+            "intervals": r["intervals"],
+            "onsets": r["onsets"],
+            "top_sites": top_sites,
+        }
+
+        if store_maps:
+            out["best_probability"] = r["best_probability"].reshape(spatial_shape)
+            out["best_hit_rate"] = r["best_hit_rate"].reshape(spatial_shape)
+            out["best_baseline_prob"] = r["best_baseline_prob"].reshape(spatial_shape)
+            out["best_dependency_score"] = r["best_dependency_score"].reshape(spatial_shape)
+            out["best_enrichment"] = r["best_enrichment"].reshape(spatial_shape)
+            out["best_lag"] = r["best_lag"].reshape(spatial_shape)
+            out["best_rank_score"] = r["best_rank_score"].reshape(spatial_shape)
+
+            # Optional diagnostic maps.
+            out["best_hit_count"] = r["best_hit_count"].reshape(spatial_shape)
+            out["best_n_windows"] = r["best_n_windows"].reshape(spatial_shape)
+
+            if compute_p_map:
+                p_flat = _binomial_tail_pvalue_array(
+                    hit_count=r["best_hit_count"],
+                    n_windows=r["best_n_windows"],
+                    baseline_prob=r["best_baseline_prob"],
+                )
+
+                neglog10_p_flat = -np.log10(np.maximum(p_flat, p_map_eps))
+
+                out["best_p_binom"] = p_flat.reshape(spatial_shape)
+                out["best_neglog10_p"] = neglog10_p_flat.reshape(spatial_shape)
+
+        final_results[cls] = out
+
+        if verbose:
+            print(f"\n[{cls}]")
+            print(f"regions: {out['n_regions']}")
+            print(f"merged events: {out['n_events']}")
+
+            if len(top_sites) > 0:
+                s0 = top_sites[0]
+                print(
+                    f"top coord={s0['coord']}, "
+                    f"prob={s0['probability']:.3f}, "
+                    f"baseline={s0['baseline_prob']:.3f}, "
+                    f"dep={s0['dependency_score']:.3f}, "
+                    f"enrich={s0['enrichment']:.2f}, "
+                    f"lag={s0['lag']}"
+                )
+            else:
+                print("no top Ca sites")
+
+    result = {
+        "roi_mask": roi_mask,
+        "valid_mask": valid_mask,
+        "ca_valid_mask": ca_valid_mask,
+
+        "records": records,
+        "grouped": grouped,
+
+        "class_intervals": class_intervals,
+        "results": final_results,
+
+        "summary": {
+            "n_regions_total": len(regions),
+            "n_regions_matched": len(records),
+            "n_local": len(grouped.get("local", [])),
+            "n_mixed": len(grouped.get("mixed", [])),
+            "n_global_ignored": len(grouped.get("global", [])),
+            "n_frames": int(T),
+            "ca_spatial_shape": spatial_shape,
+            "n_valid_ca_sites": int(len(valid_indices)),
+        },
+
+        "params": {
+            "motion_merge_gap": motion_merge_gap,
+            "ca_use_dff": ca_use_dff,
+            "ca_baseline_percentile": ca_baseline_percentile,
+            "ca_smooth_win": ca_smooth_win,
+            "ca_mad_k": ca_mad_k,
+            "ca_min_len": ca_min_len,
+            "ca_merge_gap": ca_merge_gap,
+            "max_lag": max_lag,
+            "lag_mode": lag_mode,
+            "window_len": window_len,
+            "rank_by": rank_by,
+            "top_n_ca": top_n_ca,
+            "compute_p_map": compute_p_map,
+            "p_map_eps": p_map_eps,
+        },
+    }
+
+    return result
+
+
+
+# Main ROI-guided function
+def analyze_roi_motion_activation_ca(
+    roi_mask,
+
+    # Existing motion decomposition results
+    motion_regions=None,
+    motion_modes=None,
+
+    # Ca
+    ca_patch_stack=None,
+
+    # Unit choice
+    unit_type="region",  # "region" or "mode"
+
+    # Time length
+    n_frames=None,
+
+    # Spatial masks
+    valid_mask=None,
+    roi_dilation_iter=0,
+
+    # Mode mask construction
+    mode_support_rel_thresh=0.05,
+
+    # ROI overlap filtering
+    min_intersection=1,
+    min_roi_coverage=0.01,
+
+    # Classification thresholds
+    local_locality_thresh=0.50,
+    local_globalness_max=0.10,
+    global_globalness_thresh=0.25,
+    global_locality_max=0.25,
+
+    # Activation trace construction
+    weight_mode="roi_strength",
+    use_abs_activation=True,
+    normalize_unit_activation=True,
+    smooth_unit_win=None,
+    normalize_class_activation=True,
+
+    # Event detection
+    detect_events=True,
+    event_mad_k=3.0,
+    event_min_len=1,
+    event_merge_gap=1,
+
+    # Ca correlation
+    max_lag=10,
+    lag_mode="positive",
+    ca_use_dff=True,
+    ca_smooth_win=None,
+    top_n_ca=20,
+    min_top_corr=None,
+
+    verbose=True,
+):
+    """
+    ROI-guided motion activation and Ca coupling analysis.
+
+    This function uses existing MotionRegion or MotionMode results.
+
+    It does NOT require semantic segmentation.
+
+    Main outputs:
+        - ROI-overlapping units
+        - global/local/mixed classification
+        - class activation traces A_global/A_local/A_mixed
+        - optional Ca lag-correlation maps for each class
+    """
+    roi_mask = _as_bool_mask(roi_mask)
+
+    if unit_type == "region":
+        if motion_regions is None:
+            raise ValueError("motion_regions is required when unit_type='region'.")
+        units = list(motion_regions)
+    elif unit_type == "mode":
+        if motion_modes is None:
+            raise ValueError("motion_modes is required when unit_type='mode'.")
+        units = list(motion_modes)
+    else:
+        raise ValueError("unit_type should be 'region' or 'mode'.")
+
+    if n_frames is None:
+        if ca_patch_stack is not None:
+            n_frames = int(np.asarray(ca_patch_stack).shape[0])
+        else:
+            # Infer from unit time ranges
+            max_frame = 0
+            for u in units:
+                h = getattr(u, "activation", None)
+                tr = getattr(u, "time_range", None)
+                if h is None or tr is None:
+                    continue
+                h = np.asarray(h).reshape(-1)
+                start = int(tr[0])
+                max_frame = max(max_frame, start + len(h))
+            n_frames = max_frame
+
+    if n_frames is None or n_frames <= 0:
+        raise ValueError("Could not infer n_frames. Please provide n_frames explicitly.")
+
+    # ------------------------------------------------------------
+    # 1. Classify ROI-overlapping units
+    # ------------------------------------------------------------
+    records, grouped = classify_motion_units_by_roi(
+        units=units,
+        roi_mask=roi_mask,
+        valid_mask=valid_mask,
+        unit_type=unit_type,
+        mode_support_rel_thresh=mode_support_rel_thresh,
+
+        min_intersection=min_intersection,
+        min_roi_coverage=min_roi_coverage,
+
+        local_locality_thresh=local_locality_thresh,
+        local_globalness_max=local_globalness_max,
+
+        global_globalness_thresh=global_globalness_thresh,
+        global_locality_max=global_locality_max,
+
+        roi_dilation_iter=roi_dilation_iter,
+    )
+
+    # ------------------------------------------------------------
+    # 2. Build class activation traces
+    # ------------------------------------------------------------
+    class_traces = build_class_activation_traces(
+        grouped_records=grouped,
+        n_frames=n_frames,
+        weight_mode=weight_mode,
+        use_abs=use_abs_activation,
+        normalize_unit=normalize_unit_activation,
+        smooth_unit_win=smooth_unit_win,
+        normalize_class=normalize_class_activation,
+    )
+
+    # ------------------------------------------------------------
+    # 3. Detect class events
+    # ------------------------------------------------------------
+    class_events = {}
+
+    if detect_events:
+        for cls, trace in class_traces.items():
+            class_events[cls] = detect_activation_events_mad(
+                trace,
+                mad_k=event_mad_k,
+                min_len=event_min_len,
+                merge_gap=event_merge_gap,
+            )
+    else:
+        for cls in ["global", "local", "mixed"]:
+            class_events[cls] = []
+
+    # ------------------------------------------------------------
+    # 4. Ca lag-correlation maps
+    # ------------------------------------------------------------
+    ca_results = {}
+
+    if ca_patch_stack is not None:
+        ca_patch_stack = np.asarray(ca_patch_stack, dtype=np.float32)
+
+        if ca_patch_stack.shape[0] != n_frames:
+            raise ValueError(
+                f"ca_patch_stack time length {ca_patch_stack.shape[0]} != n_frames {n_frames}"
+            )
+
+        for cls, trace in class_traces.items():
+            if np.nanstd(trace) < 1e-8:
+                ca_results[cls] = {
+                    "corr_by_lag": None,
+                    "lags": None,
+                    "best_corr": None,
+                    "best_lag": None,
+                    "top_sites": [],
+                    "note": "activation trace is nearly constant",
+                }
+                continue
+
+            corr_res = compute_lagged_ca_correlation_map(
+                activation_trace=trace,
+                ca_patch_stack=ca_patch_stack,
+                max_lag=max_lag,
+                lag_mode=lag_mode,
+                use_dff=ca_use_dff,
+                ca_smooth_win=ca_smooth_win,
+            )
+
+            top_sites = get_top_ca_sites_from_corr_map(
+                corr_res["best_corr"],
+                lag_map=corr_res["best_lag"],
+                top_n=top_n_ca,
+                min_corr=min_top_corr,
+            )
+
+            corr_res["top_sites"] = top_sites
+            ca_results[cls] = corr_res
+
+    # ------------------------------------------------------------
+    # 5. Summary
+    # ------------------------------------------------------------
+    summary = {
+        "n_units_total": len(units),
+        "n_units_matched": len(records),
+        "n_global": len(grouped["global"]),
+        "n_local": len(grouped["local"]),
+        "n_mixed": len(grouped["mixed"]),
+        "unit_type": unit_type,
+        "n_frames": int(n_frames),
+    }
+
+    if verbose:
+        print("[ROI motion activation analysis]")
+        print(f"unit_type: {unit_type}")
+        print(f"total units: {len(units)}")
+        print(f"matched units: {len(records)}")
+        print(f"global: {len(grouped['global'])}")
+        print(f"local:  {len(grouped['local'])}")
+        print(f"mixed:  {len(grouped['mixed'])}")
+
+        if ca_patch_stack is not None:
+            for cls in ["global", "local", "mixed"]:
+                top = ca_results.get(cls, {}).get("top_sites", [])
+
+                if len(top) > 0:
+                    coord = top[0].get("coord", None)
+
+                    print(
+                        f"[Ca {cls}] top corr={top[0]['corr']:.3f}, "
+                        f"coord={coord}, "
+                        f"lag={top[0].get('lag', None)}"
+                    )
+                else:
+                    print(f"[Ca {cls}] no top sites")
+
+    result = {
+        "roi_mask": roi_mask,
+        "valid_mask": valid_mask,
+
+        "records": records,
+        "grouped": grouped,
+
+        "class_traces": class_traces,
+        "class_events": class_events,
+
+        "ca_results": ca_results,
+
+        "summary": summary,
+        "params": {
+            "unit_type": unit_type,
+            "mode_support_rel_thresh": mode_support_rel_thresh,
+            "min_intersection": min_intersection,
+            "min_roi_coverage": min_roi_coverage,
+            "local_locality_thresh": local_locality_thresh,
+            "local_globalness_max": local_globalness_max,
+            "global_globalness_thresh": global_globalness_thresh,
+            "global_locality_max": global_locality_max,
+            "weight_mode": weight_mode,
+            "use_abs_activation": use_abs_activation,
+            "normalize_unit_activation": normalize_unit_activation,
+            "max_lag": max_lag,
+            "lag_mode": lag_mode,
+        },
+    }
+
+    return result
+
+
+def _region_record_label(r):
+    """Build a compact label for one region record."""
+    ep = r.get("episode_id", None)
+    m = r.get("mode_id", None)
+    rid = r.get("region_id", None)
+
+    if ep is not None and m is not None and rid is not None:
+        return f"ep{ep}-m{m}-r{rid}"
+    elif rid is not None:
+        return f"r{rid}"
+    else:
+        return "region"
+
+
+def _mask_boundary(mask, iterations=1):
+    """Return boundary pixels of a binary mask."""
+    mask = np.asarray(mask).astype(bool)
+    if mask.sum() == 0:
+        return np.zeros_like(mask, dtype=bool)
+
+    dil = ndi.binary_dilation(mask, iterations=iterations)
+    ero = ndi.binary_erosion(mask, iterations=iterations)
+    return dil ^ ero
+
+
+def visualize_regions_of_one_class(
+    result,
+    cls="mixed",
+    max_regions=50,
+    start=0,
+    sort_by="roi_coverage",
+    descending=True,
+    background=None,
+    show_roi=True,
+    show_labels=True,
+    label_fontsize=7,
+    alpha=0.55,
+    boundary_alpha=0.95,
+    figsize=(8, 8),
+    cmap_name="tab20",
+    print_table=True,
+):
+    """
+    Visualize all regions from one ROI-guided class using different colors.
+
+    Parameters
+    ----------
+    result:
+        Output from analyze_roi_motion_activation_ca().
+
+    cls:
+        One of {"global", "local", "mixed"}.
+
+    max_regions:
+        Maximum number of regions to display in one figure.
+
+    start:
+        Start index after sorting. Useful when there are many regions.
+
+    sort_by:
+        Which metric to sort by before plotting.
+        Common choices:
+            "roi_coverage"
+            "locality"
+            "globalness"
+            "strength"
+            "support_area"
+
+    background:
+        Optional 2D image to show underneath.
+        Should have the same shape as the region masks.
+        Examples:
+            np.mean(ca_patch_stack, axis=0)
+            np.mean(motionMag_patched, axis=0)
+
+    show_roi:
+        Whether to draw query ROI boundary.
+
+    show_labels:
+        Whether to write region labels at region centroids.
+
+    Returns
+    -------
+    shown_records:
+        The records displayed in the plot.
+    """
+    if cls not in result["grouped"]:
+        raise ValueError(f"Unknown class {cls}. Available: {list(result['grouped'].keys())}")
+
+    records = list(result["grouped"][cls])
+
+    if len(records) == 0:
+        print(f"No regions found in class: {cls}")
+        return []
+
+    if sort_by is not None:
+        records = sorted(
+            records,
+            key=lambda r: r.get(sort_by, 0.0),
+            reverse=descending,
+        )
+
+    shown_records = records[start:start + max_regions]
+
+    if len(shown_records) == 0:
+        print(f"No regions to show for cls={cls}, start={start}, max_regions={max_regions}")
+        return []
+
+    roi_mask = np.asarray(result["roi_mask"]).astype(bool)
+
+    # Infer spatial shape
+    first_mask = np.asarray(shown_records[0]["mask"]).astype(bool)
+    H, W = first_mask.shape
+
+    if roi_mask.shape != (H, W):
+        raise ValueError(f"roi_mask shape {roi_mask.shape} != region mask shape {(H, W)}")
+
+    # ------------------------------------------------------------
+    # Prepare background RGB
+    # ------------------------------------------------------------
+    if background is None:
+        base = np.ones((H, W), dtype=np.float32)
+    else:
+        base = np.asarray(background, dtype=np.float32)
+        if base.shape != (H, W):
+            raise ValueError(f"background shape {base.shape} != region mask shape {(H, W)}")
+
+        lo, hi = np.nanpercentile(base, [1, 99])
+        base = (base - lo) / (hi - lo + 1e-12)
+        base = np.clip(base, 0, 1)
+
+    rgb = np.stack([base, base, base], axis=-1).astype(np.float32)
+
+    # ------------------------------------------------------------
+    # Draw each region with a different color
+    # ------------------------------------------------------------
+    cmap = plt.get_cmap(cmap_name)
+    n = len(shown_records)
+
+    colors = [cmap(i % cmap.N)[:3] for i in range(n)]
+
+    for i, (r, color) in enumerate(zip(shown_records, colors)):
+        mask = np.asarray(r["mask"]).astype(bool)
+
+        if mask.shape != (H, W):
+            raise ValueError(f"Region mask shape {mask.shape} != expected {(H, W)}")
+
+        color = np.asarray(color, dtype=np.float32)
+
+        # Transparent fill
+        rgb[mask] = (1 - alpha) * rgb[mask] + alpha * color
+
+        # Stronger boundary for each region
+        bd = _mask_boundary(mask, iterations=1)
+        rgb[bd] = (1 - boundary_alpha) * rgb[bd] + boundary_alpha * color
+
+    # ------------------------------------------------------------
+    # Draw ROI boundary in red
+    # ------------------------------------------------------------
+    if show_roi:
+        roi_bd = _mask_boundary(roi_mask, iterations=1)
+        rgb[roi_bd] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    # ------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.imshow(np.clip(rgb, 0, 1))
+    ax.set_title(
+        f"{cls} regions | showing {len(shown_records)} / {len(records)} "
+        f"| sorted by {sort_by}",
+        fontsize=12,
+    )
+    ax.axis("off")
+
+    # ------------------------------------------------------------
+    # Add region labels at centroids
+    # ------------------------------------------------------------
+    if show_labels:
+        for i, r in enumerate(shown_records):
+            mask = np.asarray(r["mask"]).astype(bool)
+            ys, xs = np.where(mask)
+
+            if len(xs) == 0:
+                continue
+
+            cy = float(np.mean(ys))
+            cx = float(np.mean(xs))
+
+            label = str(i)
+            ax.text(
+                cx,
+                cy,
+                label,
+                color="white",
+                fontsize=label_fontsize,
+                ha="center",
+                va="center",
+                bbox=dict(
+                    facecolor="black",
+                    alpha=0.55,
+                    edgecolor="none",
+                    boxstyle="round,pad=0.15",
+                ),
+            )
+
+    plt.tight_layout()
+    plt.show()
+
+    # ------------------------------------------------------------
+    # Print table
+    # ------------------------------------------------------------
+    if print_table:
+        print("\nDisplayed regions:")
+        print("-" * 100)
+        print(
+            f"{'idx':>4} | {'label':>18} | {'roi_cov':>7} | {'locality':>8} | "
+            f"{'global':>7} | {'area':>6} | {'strength':>9}"
+        )
+        print("-" * 100)
+
+        for i, r in enumerate(shown_records):
+            label = _region_record_label(r)
+            print(
+                f"{i:4d} | {label:>18} | "
+                f"{r.get('roi_coverage', np.nan):7.3f} | "
+                f"{r.get('locality', np.nan):8.3f} | "
+                f"{r.get('globalness', np.nan):7.3f} | "
+                f"{r.get('support_area', np.nan):6} | "
+                f"{r.get('strength', np.nan):9.3f}"
+            )
+
+    return shown_records
+
+
+def _select_corr_lag_slice(
+    corr_map,
+    lag_map,
+    z=None,
+    z_select="max",
+):
+    """
+    Convert 2D or 3D corr/lag map into one 2D slice for visualization.
+
+    corr_map:
+        2D: (H, W)
+        3D: (Z, H, W)
+
+    If 3D:
+        z is not None:
+            use corr_map[z]
+        z is None:
+            choose slice by z_select.
+    """
+    corr = np.asarray(corr_map, dtype=np.float32)
+    lag = np.asarray(lag_map)
+
+    if corr.shape != lag.shape:
+        raise ValueError(f"corr_map shape {corr.shape} != lag_map shape {lag.shape}")
+
+    if corr.ndim == 2:
+        return corr, lag, None
+
+    if corr.ndim != 3:
+        raise ValueError(
+            "corr_map should be 2D (H,W) or 3D (Z,H,W). "
+            f"Got shape {corr.shape}"
+        )
+
+    Z = corr.shape[0]
+
+    if z is None:
+        if z_select == "max":
+            # choose z with largest finite correlation
+            z_scores = []
+            for zi in range(Z):
+                vals = corr[zi]
+                if np.isfinite(vals).any():
+                    z_scores.append(float(np.nanmax(vals)))
+                else:
+                    z_scores.append(-np.inf)
+            z = int(np.argmax(z_scores))
+
+        elif z_select == "mean_top1":
+            z_scores = []
+            for zi in range(Z):
+                vals = corr[zi]
+                vals = vals[np.isfinite(vals)]
+                if vals.size == 0:
+                    z_scores.append(-np.inf)
+                else:
+                    z_scores.append(float(np.nanpercentile(vals, 99)))
+            z = int(np.argmax(z_scores))
+
+        else:
+            raise ValueError(f"Unknown z_select: {z_select}")
+
+    z = int(z)
+
+    if z < 0 or z >= Z:
+        raise ValueError(f"z={z} is outside valid range [0, {Z - 1}]")
+
+    return corr[z], lag[z], z
+
+
+def visualize_top_corr_components_with_lag(
+    corr_map,
+    lag_map,
+    top_n=10,
+    min_corr=None,
+    percentile=99,
+    min_area=3,
+    connectivity=2,
+    close_iter=1,
+    dilate_iter=0,
+
+    # 3D support
+    z=None,
+    z_select="max",
+
+    transpose_display=True,
+    background="corr",   # "corr", None, 2D array, or 3D array
+    background_z=None,
+    background_projection="slice",  # "slice", "max", "mean"
+    cmap_bg="magma",
+    cmap_regions="tab20",
+    alpha_region=0.55,
+    show_boundary=True,
+    figsize=(8, 6),
+    title="Top Ca regions correlated with ROI motion",
+    print_table=True,
+):
+    """
+    Detect and visualize top connected high-correlation Ca regions.
+
+    Supports:
+        corr_map: (H, W)
+        lag_map:  (H, W)
+
+    and:
+        corr_map: (Z, H, W)
+        lag_map:  (Z, H, W)
+
+    For 3D maps, this function visualizes one z-slice at a time.
+    If z is None, it automatically selects a representative z-slice.
+    """
+
+    # ------------------------------------------------------------
+    # 0. Select 2D slice if corr_map is 3D
+    # ------------------------------------------------------------
+    corr_full = np.asarray(corr_map, dtype=np.float32)
+    lag_full = np.asarray(lag_map)
+
+    corr, lag, used_z = _select_corr_lag_slice(
+        corr_full,
+        lag_full,
+        z=z,
+        z_select=z_select,
+    )
+
+    valid = np.isfinite(corr)
+
+    if not np.any(valid):
+        raise ValueError("Selected corr_map slice has no finite values.")
+
+    # ------------------------------------------------------------
+    # 1. Threshold high-correlation pixels
+    # ------------------------------------------------------------
+    if min_corr is None:
+        thr = float(np.nanpercentile(corr[valid], percentile))
+    else:
+        thr = float(min_corr)
+
+    high = valid & (corr >= thr)
+
+    if close_iter is not None and close_iter > 0:
+        high = ndi.binary_closing(high, iterations=int(close_iter))
+
+    if dilate_iter is not None and dilate_iter > 0:
+        high = ndi.binary_dilation(high, iterations=int(dilate_iter))
+
+    # ------------------------------------------------------------
+    # 2. Connected components on the selected 2D slice
+    # ------------------------------------------------------------
+    if connectivity == 1:
+        structure = ndi.generate_binary_structure(2, 1)
+    else:
+        structure = ndi.generate_binary_structure(2, 2)
+
+    labeled, num = ndi.label(high, structure=structure)
+
+    components = []
+
+    for cid in range(1, num + 1):
+        mask = labeled == cid
+        area = int(mask.sum())
+
+        if area < min_area:
+            continue
+
+        vals = corr[mask]
+        lags = lag[mask]
+
+        if vals.size == 0:
+            continue
+
+        coords = np.argwhere(mask)  # (n, 2), columns are h,w
+        max_idx_local = int(np.nanargmax(vals))
+        peak_h, peak_w = coords[max_idx_local]
+
+        max_corr = float(corr[peak_h, peak_w])
+        peak_lag = int(lag[peak_h, peak_w])
+
+        weights = vals - np.nanmin(vals)
+        if np.sum(weights) > 1e-12:
+            weighted_lag = float(np.sum(weights * lags) / np.sum(weights))
+        else:
+            weighted_lag = float(np.nanmean(lags))
+
+        w_cent = np.maximum(vals, 0)
+        if np.sum(w_cent) > 1e-12:
+            centroid_h = float(np.sum(coords[:, 0] * w_cent) / np.sum(w_cent))
+            centroid_w = float(np.sum(coords[:, 1] * w_cent) / np.sum(w_cent))
+        else:
+            centroid_h = float(np.mean(coords[:, 0]))
+            centroid_w = float(np.mean(coords[:, 1]))
+
+        comp = {
+            "component_id": cid,
+            "mask": mask,
+            "area": area,
+            "max_corr": max_corr,
+            "mean_corr": float(np.nanmean(vals)),
+            "median_corr": float(np.nanmedian(vals)),
+            "peak_h": int(peak_h),
+            "peak_w": int(peak_w),
+            "centroid_h": centroid_h,
+            "centroid_w": centroid_w,
+            "peak_lag": peak_lag,
+            "mean_lag": float(np.nanmean(lags)),
+            "median_lag": float(np.nanmedian(lags)),
+            "weighted_lag": weighted_lag,
+            "lag_min": int(np.nanmin(lags)),
+            "lag_max": int(np.nanmax(lags)),
+        }
+
+        if used_z is not None:
+            comp["z"] = int(used_z)
+            comp["peak_coord"] = (int(used_z), int(peak_h), int(peak_w))
+        else:
+            comp["peak_coord"] = (int(peak_h), int(peak_w))
+
+        components.append(comp)
+
+    components = sorted(components, key=lambda d: d["max_corr"], reverse=True)
+    components = components[:top_n]
+
+    # ------------------------------------------------------------
+    # 3. Prepare background
+    # ------------------------------------------------------------
+    if isinstance(background, str) and background == "corr":
+        bg = corr.copy()
+
+    elif background is None:
+        bg = np.zeros_like(corr, dtype=np.float32)
+
+    else:
+        bg_arr = np.asarray(background, dtype=np.float32)
+
+        if bg_arr.ndim == 2:
+            bg = bg_arr
+
+        elif bg_arr.ndim == 3:
+            # background is also (Z,H,W)
+            if used_z is None:
+                bz = 0 if background_z is None else int(background_z)
+            else:
+                bz = used_z if background_z is None else int(background_z)
+
+            if background_projection == "slice":
+                bg = bg_arr[bz]
+
+            elif background_projection == "max":
+                bg = np.nanmax(bg_arr, axis=0)
+
+            elif background_projection == "mean":
+                bg = np.nanmean(bg_arr, axis=0)
+
+            else:
+                raise ValueError(
+                    "background_projection should be 'slice', 'max', or 'mean'."
+                )
+
+        else:
+            raise ValueError(
+                "background should be None, 'corr', 2D array, or 3D array."
+            )
+
+        if bg.shape != corr.shape:
+            raise ValueError(
+                f"background 2D shape {bg.shape} != selected corr slice shape {corr.shape}"
+            )
+
+    # ------------------------------------------------------------
+    # 4. Display helper
+    # ------------------------------------------------------------
+    def disp(A):
+        return A.T if transpose_display else A
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    im = ax.imshow(disp(bg), cmap=cmap_bg)
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046)
+    cbar.set_label("Best lagged correlation")
+
+    cmap = plt.get_cmap(cmap_regions)
+
+    for i, comp in enumerate(components):
+        mask = comp["mask"]
+        color = cmap(i % cmap.N)
+
+        show_mask = disp(mask)
+
+        overlay = np.zeros((*show_mask.shape, 4), dtype=np.float32)
+        overlay[..., 0] = color[0]
+        overlay[..., 1] = color[1]
+        overlay[..., 2] = color[2]
+        overlay[..., 3] = show_mask.astype(np.float32) * alpha_region
+        ax.imshow(overlay)
+
+        if show_boundary:
+            bd = ndi.binary_dilation(mask) ^ ndi.binary_erosion(mask)
+            bd_show = disp(bd)
+
+            boundary = np.zeros((*bd_show.shape, 4), dtype=np.float32)
+            boundary[..., 0] = color[0]
+            boundary[..., 1] = color[1]
+            boundary[..., 2] = color[2]
+            boundary[..., 3] = bd_show.astype(np.float32) * 0.95
+            ax.imshow(boundary)
+
+        centroid_h = comp["centroid_h"]
+        centroid_w = comp["centroid_w"]
+
+        # Important coordinate convention:
+        # imshow(A):   display x = w, display y = h
+        # imshow(A.T): display x = h, display y = w
+        if transpose_display:
+            text_x, text_y = centroid_h, centroid_w
+        else:
+            text_x, text_y = centroid_w, centroid_h
+
+        ax.text(
+            text_x,
+            text_y,
+            f"{i+1}\nlag={comp['peak_lag']}",
+            color="white",
+            fontsize=9,
+            ha="center",
+            va="center",
+            bbox=dict(
+                facecolor="black",
+                alpha=0.65,
+                edgecolor="none",
+                boxstyle="round,pad=0.25",
+            ),
+        )
+
+    z_text = "" if used_z is None else f" | z={used_z}"
+    ax.set_title(
+        f"{title}{z_text}\nthreshold={thr:.3f}, components={len(components)}",
+        fontsize=12,
+    )
+    ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+    # ------------------------------------------------------------
+    # 5. Print table
+    # ------------------------------------------------------------
+    if print_table:
+        print("\nTop connected Ca regions:")
+        print("-" * 135)
+
+        if used_z is None:
+            print(
+                f"{'idx':>3} | {'area':>5} | {'max_corr':>8} | {'mean_corr':>9} | "
+                f"{'peak_lag':>8} | {'w_lag':>7} | {'lag_range':>12} | {'peak_hw':>14}"
+            )
+        else:
+            print(
+                f"{'idx':>3} | {'z':>3} | {'area':>5} | {'max_corr':>8} | {'mean_corr':>9} | "
+                f"{'peak_lag':>8} | {'w_lag':>7} | {'lag_range':>12} | {'peak_zhw':>18}"
+            )
+
+        print("-" * 135)
+
+        for i, comp in enumerate(components):
+            lag_range = f"[{comp['lag_min']},{comp['lag_max']}]"
+
+            if used_z is None:
+                peak_str = f"({comp['peak_h']},{comp['peak_w']})"
+                print(
+                    f"{i+1:3d} | "
+                    f"{comp['area']:5d} | "
+                    f"{comp['max_corr']:8.3f} | "
+                    f"{comp['mean_corr']:9.3f} | "
+                    f"{comp['peak_lag']:8d} | "
+                    f"{comp['weighted_lag']:7.2f} | "
+                    f"{lag_range:>12} | "
+                    f"{peak_str:>14}"
+                )
+            else:
+                peak_str = f"({used_z},{comp['peak_h']},{comp['peak_w']})"
+                print(
+                    f"{i+1:3d} | "
+                    f"{used_z:3d} | "
+                    f"{comp['area']:5d} | "
+                    f"{comp['max_corr']:8.3f} | "
+                    f"{comp['mean_corr']:9.3f} | "
+                    f"{comp['peak_lag']:8d} | "
+                    f"{comp['weighted_lag']:7.2f} | "
+                    f"{lag_range:>12} | "
+                    f"{peak_str:>18}"
+                )
+
+    return components
+
+def _select_2d_slice_from_3d_map(
+    score_map,
+    lag_map,
+    z=None,
+    z_select="max",
+):
+    """
+    Select one 2D slice from 2D or 3D score/lag maps.
+
+    score_map:
+        (H, W) or (Z, H, W)
+    lag_map:
+        same shape as score_map
+
+    z_select:
+        "max": select z with largest finite max score
+        "mean": select z with largest finite mean score
+        "sum": select z with largest finite sum score
+    """
+    score_full = np.asarray(score_map, dtype=np.float32)
+    lag_full = np.asarray(lag_map)
+
+    if score_full.shape != lag_full.shape:
+        raise ValueError(
+            f"score_map shape {score_full.shape} != lag_map shape {lag_full.shape}"
+        )
+
+    if score_full.ndim == 2:
+        return score_full, lag_full, None
+
+    if score_full.ndim != 3:
+        raise ValueError(
+            "score_map should be 2D (H,W) or 3D (Z,H,W)."
+        )
+
+    Z = score_full.shape[0]
+
+    if z is not None:
+        used_z = int(z)
+        if used_z < 0 or used_z >= Z:
+            raise ValueError(f"z={used_z} out of range [0, {Z-1}]")
+        return score_full[used_z], lag_full[used_z], used_z
+
+    z_scores = []
+
+    for zz in range(Z):
+        sl = score_full[zz]
+        valid = np.isfinite(sl)
+
+        if not np.any(valid):
+            z_scores.append(-np.inf)
+            continue
+
+        if z_select == "max":
+            z_scores.append(float(np.nanmax(sl[valid])))
+        elif z_select == "mean":
+            z_scores.append(float(np.nanmean(sl[valid])))
+        elif z_select == "sum":
+            z_scores.append(float(np.nansum(sl[valid])))
+        else:
+            raise ValueError("z_select should be 'max', 'mean', or 'sum'.")
+
+    used_z = int(np.argmax(z_scores))
+
+    return score_full[used_z], lag_full[used_z], used_z
+
+def _select_background_2d(
+    background,
+    used_z,
+    target_shape,
+    background_z=None,
+    background_projection="slice",
+):
+    """
+    Prepare 2D background image.
+    """
+    if background is None:
+        return np.zeros(target_shape, dtype=np.float32)
+
+    if isinstance(background, str):
+        raise ValueError(
+            "String background should be handled outside this helper."
+        )
+
+    bg_arr = np.asarray(background, dtype=np.float32)
+
+    if bg_arr.ndim == 2:
+        bg = bg_arr
+
+    elif bg_arr.ndim == 3:
+        if background_projection == "slice":
+            if background_z is not None:
+                bz = int(background_z)
+            elif used_z is not None:
+                bz = int(used_z)
+            else:
+                bz = 0
+            bg = bg_arr[bz]
+
+        elif background_projection == "max":
+            bg = np.nanmax(bg_arr, axis=0)
+
+        elif background_projection == "mean":
+            bg = np.nanmean(bg_arr, axis=0)
+
+        else:
+            raise ValueError(
+                "background_projection should be 'slice', 'max', or 'mean'."
+            )
+
+    else:
+        raise ValueError(
+            "background should be None, 2D array, or 3D array."
+        )
+
+    if bg.shape != target_shape:
+        raise ValueError(
+            f"background 2D shape {bg.shape} != target map shape {target_shape}"
+        )
+
+    return bg
+
+
+def visualize_top_dependency_components_with_lag(
+    res_dep=None,
+    cls="local",
+
+    # Direct map input, optional.
+    score_map=None,
+    lag_map=None,
+
+    # Which metric to visualize from res_dep
+    metric="best_dependency_score",
+    # alternatives:
+    #   "best_probability"
+    #   "best_hit_rate"
+    #   "best_enrichment"
+    #   "best_rank_score"
+
+    top_n=10,
+    min_score=None,
+    percentile=99,
+    min_area=3,
+    connectivity=2,
+    close_iter=1,
+    dilate_iter=0,
+
+    # 3D support
+    z=None,
+    z_select="max",
+
+    # Display
+    transpose_display=True,
+    background="score",
+    # background:
+    #   "score": use selected score map
+    #   None: blank
+    #   2D/3D array: custom background, e.g. reference image or mean Ca
+    background_z=None,
+    background_projection="slice",
+
+    cmap_bg="magma",
+    cmap_regions="tab20",
+    alpha_region=0.55,
+    show_boundary=True,
+
+    # colorbar/title
+    colorbar_label=None,
+    title=None,
+    figsize=(8, 6),
+
+    # Text label content
+    label_mode="rank_lag",
+    # "rank_lag":       rank + lag
+    # "rank_lag_score": rank + lag + score
+    # "rank_only":      rank only
+
+    print_table=True,
+):
+    """
+    Visualize top connected high-dependency Ca regions.
+
+    This is adapted for output from:
+        analyze_roi_local_mixed_ca_dependency(...)
+
+    Typical usage:
+        visualize_top_dependency_components_with_lag(
+            res_dep,
+            cls="local",
+            metric="best_dependency_score",
+            z=10,
+            percentile=99,
+        )
+
+    It detects connected components on a selected 2D slice:
+        high = score >= threshold
+
+    Then ranks components by peak score and annotates:
+        component rank
+        best lag at peak position
+    """
+
+    # ------------------------------------------------------------
+    # 0. Resolve input maps
+    # ------------------------------------------------------------
+    if res_dep is not None:
+        if cls not in res_dep["results"]:
+            raise ValueError(
+                f"cls={cls!r} not found in res_dep['results']. "
+                f"Available: {list(res_dep['results'].keys())}"
+            )
+
+        if metric not in res_dep["results"][cls]:
+            raise ValueError(
+                f"metric={metric!r} not found in res_dep['results'][{cls!r}]."
+            )
+
+        score_full = np.asarray(res_dep["results"][cls][metric], dtype=np.float32)
+        lag_full = np.asarray(res_dep["results"][cls]["best_lag"])
+
+        if title is None:
+            title = f"Top Ca regions coupled with {cls} ROI motion"
+
+    else:
+        if score_map is None or lag_map is None:
+            raise ValueError(
+                "Either provide res_dep, or provide score_map and lag_map."
+            )
+
+        score_full = np.asarray(score_map, dtype=np.float32)
+        lag_full = np.asarray(lag_map)
+
+        if title is None:
+            title = "Top Ca regions coupled with ROI motion"
+
+    if colorbar_label is None:
+        if metric == "best_dependency_score":
+            colorbar_label = "Best event dependency score"
+        elif metric in ["best_probability", "best_hit_rate"]:
+            colorbar_label = "Ca activation probability"
+        elif metric == "best_enrichment":
+            colorbar_label = "Activation enrichment"
+        elif metric == "best_rank_score":
+            colorbar_label = "Best rank score"
+        else:
+            colorbar_label = metric
+
+    # ------------------------------------------------------------
+    # 1. Select 2D slice
+    # ------------------------------------------------------------
+    score, lag, used_z = _select_2d_slice_from_3d_map(
+        score_full,
+        lag_full,
+        z=z,
+        z_select=z_select,
+    )
+
+    valid = np.isfinite(score)
+
+    if not np.any(valid):
+        raise ValueError("Selected score_map slice has no finite values.")
+
+    # ------------------------------------------------------------
+    # 2. Threshold high-score pixels
+    # ------------------------------------------------------------
+    if min_score is None:
+        thr = float(np.nanpercentile(score[valid], percentile))
+    else:
+        thr = float(min_score)
+
+    high = valid & (score >= thr)
+
+    if close_iter is not None and close_iter > 0:
+        high = ndi.binary_closing(high, iterations=int(close_iter))
+
+    if dilate_iter is not None and dilate_iter > 0:
+        high = ndi.binary_dilation(high, iterations=int(dilate_iter))
+
+    # ------------------------------------------------------------
+    # 3. Connected components
+    # ------------------------------------------------------------
+    if connectivity == 1:
+        structure = ndi.generate_binary_structure(2, 1)
+    else:
+        structure = ndi.generate_binary_structure(2, 2)
+
+    labeled, num = ndi.label(high, structure=structure)
+
+    components = []
+
+    for cid in range(1, num + 1):
+        mask = labeled == cid
+        area = int(mask.sum())
+
+        if area < min_area:
+            continue
+
+        vals = score[mask]
+        lags = lag[mask]
+
+        if vals.size == 0:
+            continue
+
+        coords = np.argwhere(mask)  # (n, 2), h,w
+
+        max_idx_local = int(np.nanargmax(vals))
+        peak_h, peak_w = coords[max_idx_local]
+
+        peak_score = float(score[peak_h, peak_w])
+        peak_lag = int(lag[peak_h, peak_w])
+
+        # score-weighted centroid
+        w_cent = np.maximum(vals, 0)
+        if np.sum(w_cent) > 1e-12:
+            centroid_h = float(np.sum(coords[:, 0] * w_cent) / np.sum(w_cent))
+            centroid_w = float(np.sum(coords[:, 1] * w_cent) / np.sum(w_cent))
+        else:
+            centroid_h = float(np.mean(coords[:, 0]))
+            centroid_w = float(np.mean(coords[:, 1]))
+
+        # score-weighted lag
+        lag_weights = vals - np.nanmin(vals)
+        if np.sum(lag_weights) > 1e-12:
+            weighted_lag = float(np.sum(lag_weights * lags) / np.sum(lag_weights))
+        else:
+            weighted_lag = float(np.nanmean(lags))
+
+        comp = {
+            "component_id": int(cid),
+            "mask": mask,
+            "area": int(area),
+
+            "peak_score": peak_score,
+            "max_score": peak_score,
+            "mean_score": float(np.nanmean(vals)),
+            "median_score": float(np.nanmedian(vals)),
+
+            "peak_h": int(peak_h),
+            "peak_w": int(peak_w),
+            "centroid_h": centroid_h,
+            "centroid_w": centroid_w,
+
+            "peak_lag": peak_lag,
+            "mean_lag": float(np.nanmean(lags)),
+            "median_lag": float(np.nanmedian(lags)),
+            "weighted_lag": weighted_lag,
+            "lag_min": int(np.nanmin(lags)),
+            "lag_max": int(np.nanmax(lags)),
+        }
+
+        if used_z is not None:
+            comp["z"] = int(used_z)
+            comp["peak_coord"] = (int(used_z), int(peak_h), int(peak_w))
+        else:
+            comp["peak_coord"] = (int(peak_h), int(peak_w))
+
+        components.append(comp)
+
+    components = sorted(components, key=lambda d: d["peak_score"], reverse=True)
+    components = components[:top_n]
+
+    # ------------------------------------------------------------
+    # 4. Background
+    # ------------------------------------------------------------
+    if isinstance(background, str):
+        if background == "score":
+            bg = score.copy()
+        else:
+            raise ValueError("String background only supports 'score'.")
+    else:
+        bg = _select_background_2d(
+            background=background,
+            used_z=used_z,
+            target_shape=score.shape,
+            background_z=background_z,
+            background_projection=background_projection,
+        )
+
+    # ------------------------------------------------------------
+    # 5. Display helper
+    # ------------------------------------------------------------
+    def disp(A):
+        return A.T if transpose_display else A
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    im = ax.imshow(disp(bg), cmap=cmap_bg)
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046)
+    cbar.set_label(colorbar_label)
+
+    cmap = plt.get_cmap(cmap_regions)
+
+    for i, comp in enumerate(components):
+        mask = comp["mask"]
+        color = cmap(i % cmap.N)
+
+        show_mask = disp(mask)
+
+        overlay = np.zeros((*show_mask.shape, 4), dtype=np.float32)
+        overlay[..., 0] = color[0]
+        overlay[..., 1] = color[1]
+        overlay[..., 2] = color[2]
+        overlay[..., 3] = show_mask.astype(np.float32) * alpha_region
+        ax.imshow(overlay)
+
+        if show_boundary:
+            bd = ndi.binary_dilation(mask) ^ ndi.binary_erosion(mask)
+            bd_show = disp(bd)
+
+            boundary = np.zeros((*bd_show.shape, 4), dtype=np.float32)
+            boundary[..., 0] = color[0]
+            boundary[..., 1] = color[1]
+            boundary[..., 2] = color[2]
+            boundary[..., 3] = bd_show.astype(np.float32) * 0.95
+            ax.imshow(boundary)
+
+        centroid_h = comp["centroid_h"]
+        centroid_w = comp["centroid_w"]
+
+        if transpose_display:
+            text_x, text_y = centroid_h, centroid_w
+        else:
+            text_x, text_y = centroid_w, centroid_h
+
+        if label_mode == "rank_lag":
+            label = f"{i+1}\nlag={comp['peak_lag']}"
+        elif label_mode == "rank_lag_score":
+            label = f"{i+1}\nlag={comp['peak_lag']}\n{comp['peak_score']:.2f}"
+        elif label_mode == "rank_only":
+            label = f"{i+1}"
+        else:
+            raise ValueError(
+                "label_mode should be 'rank_lag', 'rank_lag_score', or 'rank_only'."
+            )
+
+        ax.text(
+            text_x,
+            text_y,
+            label,
+            color="white",
+            fontsize=9,
+            ha="center",
+            va="center",
+            bbox=dict(
+                facecolor="black",
+                alpha=0.65,
+                edgecolor="none",
+                boxstyle="round,pad=0.25",
+            ),
+        )
+
+    z_text = "" if used_z is None else f" | z={used_z}"
+    ax.set_title(
+        f"{title}{z_text}\nthreshold={thr:.3f}, components={len(components)}",
+        fontsize=12,
+    )
+
+    ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+    # ------------------------------------------------------------
+    # 6. Print table
+    # ------------------------------------------------------------
+    if print_table:
+        print("\nTop connected Ca dependency regions:")
+        print("-" * 145)
+
+        if used_z is None:
+            print(
+                f"{'idx':>3} | {'area':>5} | {'peak_score':>10} | {'mean_score':>10} | "
+                f"{'peak_lag':>8} | {'w_lag':>7} | {'lag_range':>12} | {'peak_hw':>14}"
+            )
+        else:
+            print(
+                f"{'idx':>3} | {'z':>3} | {'area':>5} | {'peak_score':>10} | {'mean_score':>10} | "
+                f"{'peak_lag':>8} | {'w_lag':>7} | {'lag_range':>12} | {'peak_zhw':>18}"
+            )
+
+        print("-" * 145)
+
+        for i, comp in enumerate(components):
+            lag_range = f"[{comp['lag_min']},{comp['lag_max']}]"
+
+            if used_z is None:
+                peak_str = f"({comp['peak_h']},{comp['peak_w']})"
+                print(
+                    f"{i+1:3d} | "
+                    f"{comp['area']:5d} | "
+                    f"{comp['peak_score']:10.3f} | "
+                    f"{comp['mean_score']:10.3f} | "
+                    f"{comp['peak_lag']:8d} | "
+                    f"{comp['weighted_lag']:7.2f} | "
+                    f"{lag_range:>12} | "
+                    f"{peak_str:>14}"
+                )
+            else:
+                peak_str = f"({used_z},{comp['peak_h']},{comp['peak_w']})"
+                print(
+                    f"{i+1:3d} | "
+                    f"{used_z:3d} | "
+                    f"{comp['area']:5d} | "
+                    f"{comp['peak_score']:10.3f} | "
+                    f"{comp['mean_score']:10.3f} | "
+                    f"{comp['peak_lag']:8d} | "
+                    f"{comp['weighted_lag']:7.2f} | "
+                    f"{lag_range:>12} | "
+                    f"{peak_str:>18}"
+                )
+
+    return components
+
+def visualize_top_dependency_components_with_lag_and_p(
+    res_dep=None,
+    cls="local",
+
+    # direct map input (optional)
+    score_map=None,
+    lag_map=None,
+    p_map=None,
+
+    # which metric to use from res_dep
+    metric="best_dependency_score",
+    p_metric="best_p_binom",          # preferred if available
+    neglog10_p_metric="best_neglog10_p",  # fallback if best_p_binom not saved
+
+    top_n=10,
+    min_score=None,
+    percentile=99,
+    min_area=3,
+    connectivity=2,
+    close_iter=1,
+    dilate_iter=0,
+
+    # 3D support
+    z=None,
+    z_select="max",
+
+    # display
+    transpose_display=True,
+    background="score",
+    background_z=None,
+    background_projection="slice",
+    cmap_bg="magma",
+    cmap_regions="tab20",
+    alpha_region=0.55,
+    show_boundary=True,
+
+    # labels
+    show_p=True,
+    p_display_mode="peak",   # "peak" or "min"
+    p_format=".1e",
+    label_mode="rank_lag_p",  # "rank_lag_p", "rank_lag", "rank_only"
+
+    colorbar_label=None,
+    title=None,
+    figsize=(8, 6),
+
+    print_table=True,
+):
+    """
+    Visualize top connected high-dependency Ca regions on the dependency_score map,
+    and annotate lag + p-value on the same plot.
+
+    p-value shown:
+        - peak: p-value at the peak dependency pixel of each component
+        - min:  minimum p-value inside each component
+    """
+
+    # ------------------------------------------------------------
+    # helper
+    # ------------------------------------------------------------
+    def _select_2d_slice(arr, z=None, z_select="max"):
+        arr = np.asarray(arr)
+
+        if arr.ndim == 2:
+            return arr, None
+
+        if arr.ndim != 3:
+            raise ValueError("Input map must be 2D or 3D.")
+
+        Z = arr.shape[0]
+
+        if z is not None:
+            zz = int(z)
+            if zz < 0 or zz >= Z:
+                raise ValueError(f"z={zz} out of range [0, {Z-1}]")
+            return arr[zz], zz
+
+        scores = []
+        for zz in range(Z):
+            sl = arr[zz]
+            valid = np.isfinite(sl)
+
+            if not np.any(valid):
+                scores.append(-np.inf)
+                continue
+
+            if z_select == "max":
+                scores.append(float(np.nanmax(sl[valid])))
+            elif z_select == "mean":
+                scores.append(float(np.nanmean(sl[valid])))
+            elif z_select == "sum":
+                scores.append(float(np.nansum(sl[valid])))
+            else:
+                raise ValueError("z_select should be 'max', 'mean', or 'sum'.")
+
+        zz = int(np.argmax(scores))
+        return arr[zz], zz
+
+    def _select_background_2d(background, used_z, target_shape,
+                              background_z=None, background_projection="slice"):
+        if background is None:
+            return np.zeros(target_shape, dtype=np.float32)
+
+        if isinstance(background, str):
+            raise ValueError("String background should be handled outside helper.")
+
+        bg_arr = np.asarray(background, dtype=np.float32)
+
+        if bg_arr.ndim == 2:
+            bg = bg_arr
+        elif bg_arr.ndim == 3:
+            if background_projection == "slice":
+                if background_z is not None:
+                    bz = int(background_z)
+                elif used_z is not None:
+                    bz = int(used_z)
+                else:
+                    bz = 0
+                bg = bg_arr[bz]
+            elif background_projection == "max":
+                bg = np.nanmax(bg_arr, axis=0)
+            elif background_projection == "mean":
+                bg = np.nanmean(bg_arr, axis=0)
+            else:
+                raise ValueError("background_projection should be 'slice', 'max', or 'mean'.")
+        else:
+            raise ValueError("background must be None, 2D array, or 3D array.")
+
+        if bg.shape != target_shape:
+            raise ValueError(f"background shape {bg.shape} != target shape {target_shape}")
+
+        return bg
+
+    def disp(A):
+        return A.T if transpose_display else A
+
+    # ------------------------------------------------------------
+    # 0. resolve input maps
+    # ------------------------------------------------------------
+    if res_dep is not None:
+        if cls not in res_dep["results"]:
+            raise ValueError(f"{cls!r} not found in res_dep['results']")
+
+        score_full = np.asarray(res_dep["results"][cls][metric], dtype=np.float32)
+        lag_full = np.asarray(res_dep["results"][cls]["best_lag"])
+
+        # p map
+        if p_map is None:
+            if p_metric in res_dep["results"][cls]:
+                p_full = np.asarray(res_dep["results"][cls][p_metric], dtype=np.float32)
+            elif neglog10_p_metric in res_dep["results"][cls]:
+                neglog_full = np.asarray(res_dep["results"][cls][neglog10_p_metric], dtype=np.float32)
+                p_full = 10.0 ** (-neglog_full)
+            else:
+                p_full = None
+        else:
+            p_full = np.asarray(p_map, dtype=np.float32)
+
+        if title is None:
+            title = f"Top Ca regions coupled with {cls} ROI motion"
+
+    else:
+        if score_map is None or lag_map is None:
+            raise ValueError("Either provide res_dep, or provide score_map + lag_map.")
+
+        score_full = np.asarray(score_map, dtype=np.float32)
+        lag_full = np.asarray(lag_map)
+
+        if p_map is not None:
+            p_full = np.asarray(p_map, dtype=np.float32)
+        else:
+            p_full = None
+
+        if title is None:
+            title = "Top Ca regions coupled with ROI motion"
+
+    if colorbar_label is None:
+        colorbar_label = "Best event dependency score"
+
+    # ------------------------------------------------------------
+    # 1. select 2D slice
+    # ------------------------------------------------------------
+    score, used_z = _select_2d_slice(score_full, z=z, z_select=z_select)
+    lag, _ = _select_2d_slice(lag_full, z=used_z, z_select=z_select)
+
+    if p_full is not None:
+        p2d, _ = _select_2d_slice(p_full, z=used_z, z_select=z_select)
+    else:
+        p2d = None
+
+    valid = np.isfinite(score)
+    if not np.any(valid):
+        raise ValueError("Selected score map slice has no finite values.")
+
+    # ------------------------------------------------------------
+    # 2. threshold high-score pixels
+    # ------------------------------------------------------------
+    if min_score is None:
+        thr = float(np.nanpercentile(score[valid], percentile))
+    else:
+        thr = float(min_score)
+
+    high = valid & (score >= thr)
+
+    if close_iter is not None and close_iter > 0:
+        high = ndi.binary_closing(high, iterations=int(close_iter))
+
+    if dilate_iter is not None and dilate_iter > 0:
+        high = ndi.binary_dilation(high, iterations=int(dilate_iter))
+
+    # ------------------------------------------------------------
+    # 3. connected components
+    # ------------------------------------------------------------
+    if connectivity == 1:
+        structure = ndi.generate_binary_structure(2, 1)
+    else:
+        structure = ndi.generate_binary_structure(2, 2)
+
+    labeled, num = ndi.label(high, structure=structure)
+
+    components = []
+
+    for cid in range(1, num + 1):
+        mask = labeled == cid
+        area = int(mask.sum())
+
+        if area < min_area:
+            continue
+
+        vals = score[mask]
+        lags = lag[mask]
+        coords = np.argwhere(mask)
+
+        if vals.size == 0:
+            continue
+
+        peak_idx_local = int(np.nanargmax(vals))
+        peak_h, peak_w = coords[peak_idx_local]
+
+        peak_score = float(score[peak_h, peak_w])
+        peak_lag = int(lag[peak_h, peak_w])
+
+        # component p-values
+        if p2d is not None:
+            peak_p = float(p2d[peak_h, peak_w])
+            min_p = float(np.nanmin(p2d[mask]))
+        else:
+            peak_p = np.nan
+            min_p = np.nan
+
+        # score-weighted centroid
+        w_cent = np.maximum(vals, 0)
+        if np.sum(w_cent) > 1e-12:
+            centroid_h = float(np.sum(coords[:, 0] * w_cent) / np.sum(w_cent))
+            centroid_w = float(np.sum(coords[:, 1] * w_cent) / np.sum(w_cent))
+        else:
+            centroid_h = float(np.mean(coords[:, 0]))
+            centroid_w = float(np.mean(coords[:, 1]))
+
+        comp = {
+            "component_id": int(cid),
+            "mask": mask,
+            "area": int(area),
+
+            "peak_score": peak_score,
+            "mean_score": float(np.nanmean(vals)),
+            "median_score": float(np.nanmedian(vals)),
+
+            "peak_h": int(peak_h),
+            "peak_w": int(peak_w),
+            "centroid_h": centroid_h,
+            "centroid_w": centroid_w,
+
+            "peak_lag": peak_lag,
+            "mean_lag": float(np.nanmean(lags)),
+            "median_lag": float(np.nanmedian(lags)),
+
+            "peak_p": peak_p,
+            "min_p": min_p,
+        }
+
+        if used_z is not None:
+            comp["z"] = int(used_z)
+            comp["peak_coord"] = (int(used_z), int(peak_h), int(peak_w))
+        else:
+            comp["peak_coord"] = (int(peak_h), int(peak_w))
+
+        components.append(comp)
+
+    components = sorted(components, key=lambda d: d["peak_score"], reverse=True)
+    components = components[:top_n]
+
+    # ------------------------------------------------------------
+    # 4. background
+    # ------------------------------------------------------------
+    if isinstance(background, str):
+        if background == "score":
+            bg = score.copy()
+        else:
+            raise ValueError("String background only supports 'score'.")
+    else:
+        bg = _select_background_2d(
+            background=background,
+            used_z=used_z,
+            target_shape=score.shape,
+            background_z=background_z,
+            background_projection=background_projection,
+        )
+
+    # ------------------------------------------------------------
+    # 5. display
+    # ------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=figsize)
+
+    im = ax.imshow(disp(bg), cmap=cmap_bg)
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046)
+    cbar.set_label(colorbar_label)
+
+    cmap = plt.get_cmap(cmap_regions)
+
+    for i, comp in enumerate(components):
+        mask = comp["mask"]
+        color = cmap(i % cmap.N)
+
+        show_mask = disp(mask)
+
+        overlay = np.zeros((*show_mask.shape, 4), dtype=np.float32)
+        overlay[..., 0] = color[0]
+        overlay[..., 1] = color[1]
+        overlay[..., 2] = color[2]
+        overlay[..., 3] = show_mask.astype(np.float32) * alpha_region
+        ax.imshow(overlay)
+
+        if show_boundary:
+            bd = ndi.binary_dilation(mask) ^ ndi.binary_erosion(mask)
+            bd_show = disp(bd)
+
+            boundary = np.zeros((*bd_show.shape, 4), dtype=np.float32)
+            boundary[..., 0] = color[0]
+            boundary[..., 1] = color[1]
+            boundary[..., 2] = color[2]
+            boundary[..., 3] = bd_show.astype(np.float32) * 0.95
+            ax.imshow(boundary)
+
+        centroid_h = comp["centroid_h"]
+        centroid_w = comp["centroid_w"]
+
+        if transpose_display:
+            text_x, text_y = centroid_h, centroid_w
+        else:
+            text_x, text_y = centroid_w, centroid_h
+
+        if show_p and label_mode == "rank_lag_p":
+            p_to_show = comp["peak_p"] if p_display_mode == "peak" else comp["min_p"]
+
+            if np.isfinite(p_to_show):
+                p_str = format(p_to_show, p_format)
+                label = f"{i+1}\nlag={comp['peak_lag']}\np={p_str}"
+            else:
+                label = f"{i+1}\nlag={comp['peak_lag']}"
+        elif label_mode == "rank_lag":
+            label = f"{i+1}\nlag={comp['peak_lag']}"
+        elif label_mode == "rank_only":
+            label = f"{i+1}"
+        else:
+            label = f"{i+1}\nlag={comp['peak_lag']}"
+
+        ax.annotate(
+            label,
+            xy=(text_x, text_y),                 # 箭头指向 component 的中心
+            xytext=(-50, -50),                     # 标签相对中心偏移，单位是 points
+            textcoords="offset points",
+            color="white",
+            fontsize=9,
+            ha="left",
+            va="bottom",
+            bbox=dict(
+                facecolor="black",
+                alpha=0.65,
+                edgecolor="none",
+                boxstyle="round,pad=0.25",
+            ),
+            arrowprops=dict(
+                arrowstyle="-",
+                color="white",
+                alpha=0.8,
+                linewidth=0.8,
+            ),
+        )
+
+    z_text = "" if used_z is None else f" | z={used_z}"
+    ax.set_title(
+        f"{title}{z_text}\nthreshold={thr:.3f}, components={len(components)}",
+        fontsize=12,
+    )
+
+    ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+    # ------------------------------------------------------------
+    # 6. print table
+    # ------------------------------------------------------------
+    if print_table:
+        print("\nTop connected Ca dependency regions:")
+        print("-" * 150)
+        if used_z is None:
+            print(
+                f"{'idx':>3} | {'area':>5} | {'peak_score':>10} | {'peak_lag':>8} | "
+                f"{'peak_p':>10} | {'min_p':>10} | {'peak_hw':>14}"
+            )
+        else:
+            print(
+                f"{'idx':>3} | {'z':>3} | {'area':>5} | {'peak_score':>10} | {'peak_lag':>8} | "
+                f"{'peak_p':>10} | {'min_p':>10} | {'peak_zhw':>18}"
+            )
+        print("-" * 150)
+
+        for i, comp in enumerate(components):
+            if used_z is None:
+                peak_str = f"({comp['peak_h']},{comp['peak_w']})"
+                print(
+                    f"{i+1:3d} | "
+                    f"{comp['area']:5d} | "
+                    f"{comp['peak_score']:10.3f} | "
+                    f"{comp['peak_lag']:8d} | "
+                    f"{comp['peak_p']:10.2e} | "
+                    f"{comp['min_p']:10.2e} | "
+                    f"{peak_str:>14}"
+                )
+            else:
+                peak_str = f"({used_z},{comp['peak_h']},{comp['peak_w']})"
+                print(
+                    f"{i+1:3d} | "
+                    f"{used_z:3d} | "
+                    f"{comp['area']:5d} | "
+                    f"{comp['peak_score']:10.3f} | "
+                    f"{comp['peak_lag']:8d} | "
+                    f"{comp['peak_p']:10.2e} | "
+                    f"{comp['min_p']:10.2e} | "
+                    f"{peak_str:>18}"
+                )
+
+    return components
