@@ -396,7 +396,8 @@ def reliability_map_v2(template, sigma=1.5, eps=1e-6):
     R = gaussian_smooth_per_slice(R, sigma=sigma)
     R = R / (cp.max(R) + eps)
 
-    return cp.asnumpy(R)
+    # cp may be the numpy fallback, which has no asnumpy
+    return R.get() if hasattr(R, "get") else np.asarray(R)
 
 
 # pre version
