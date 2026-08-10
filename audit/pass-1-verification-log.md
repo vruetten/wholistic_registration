@@ -138,18 +138,6 @@ R6 cross-chunk: mid-file `import numpy as np` at 5249 + `_as_bool_mask_fallback`
 - B-076 🟨 main_function.py:780 — head_mem filled only from batch 0 (`if i == 0`) → backward seed under-filled when reference_chunk > batch_size.
 - B-077 🟨 reference.py:82 — block ≤1 frame → ncorr=0 → mean over empty axis → all-NaN reference propagates silently.
 
-## From R15 (v2 io/tests/examples)
-- B-078 🟥 v2/io/readers.py:226 — ND2Reader.read_frames misuses nd2.read_frame: arg is T×Z plane-sequence index, returns 2D plane (C first) not (Z,Y,X) volume → 3D ND2 silently yields z-planes-as-timepoints / unselected channels (verified against nd2 lib source).
-- B-079 🟧 v2/io/readers.py:610 — TiffSeriesReader reads pages[0].shape (2D page) → n_z=1 for multi-page z-stack files; metadata is_3d=False for 3D data.
-- B-080 🟧 v2/io/readers.py:457 — TiffReader: no-T-axis 3D tiff → n_frames=len(pages) → z-planes become fake timepoints.
-- B-081 🟧 v2/io/readers.py:471 — Z inference: TCYX with C≠1 → n_z=shape[2]=image height → shape_zyx (512,512,512), is_3d=True for 2D data.
-- B-082 🟨 v2/io/readers.py:339 — ZarrReader unpacks all 5D as (T,C,Z,Y,X); own writer emits TZCYX → C/Z swapped, data[channel] selects z-plane.
-- B-083 🟨 v2/io/readers.py:167,480 — bare excepts default voxel_size/framerate to 1.0 silently → wrong PhysicalSize stamped into all OME output.
-- B-084 🟨 v2/examples/synthetic_example.py:19 — sys.path bootstrap off by one dir (3 parents not 4) → documented invocation crashes without pip install.
-- B-085 🟨 v2/tests/test_reference.py:59 — smoothness test passes for zero-averaging reference (ref_var ≤ 1.5×frame var can't fail plausibly).
-- B-086 🟨 v2/tests/test_synthetic_data.py:85 — motion test only upper-bounds; zero-motion regression passes suite.
-- B-087 🟦 v2/tests/test_io.py:225 — TimeIncrement assert inside conditional loop → vacuous pass if Pixels missing.
-- B-088 🟦 v2/tests/conftest.py:45 — synthetic_tiff_data requests fixture it never uses; sample_config used by zero tests.
 
 ## From R9 (calFlowCrossResolution.py 1311–2610)
 - B-089 🟥 cfcr.py:2063 — neiDiff[:,:,2] *= zRatio_hr scales z-SLICE index 2 (all components) instead of z-component everywhere (siblings use [...,2] at 2100/2132); IndexError if nz≤2; final recompute at 2169 applies no scaling (objective inconsistency). Confirms R8's cross-chunk flag.
@@ -198,19 +186,6 @@ R6 cross-chunk: mid-file `import numpy as np` at 5249 + `_as_bool_mask_fallback`
 - B-044 CONFIRMED-run (ValueError via real MotionEpisode with K=0 model; K=0 explicitly supported by producer; leaks first figure before crash).
 - B-045 CONFIRMED 3/4 (visualize_episode_regions_overview returns fig → partially refuted for that one).
 
-## From R14 (v2 core/config/pipeline/utils)
-- B-103 🟥 v2/core/registration.py:97 — imports nonexistent `wholistic_registration.utils.prep` (only preprocess.py exists); except swallows → every register_batch raises RuntimeError "Legacy motion estimation modules not available" → v2 registration can NEVER run.
-- B-104 🟥 v2/core/registration.py:223 — getMotion called (moving, ref, smooth_penalty, option) vs v1 signature (dat_mov, dat_ref, option, verbose) → float lands in option → TypeError; smoothPenalty never delivered.
-- B-105 🟥 v2/core/registration.py:160 — option dict missing zRatio/tol/save_ite/smoothPenalty → KeyError 'zRatio' at calFlow3d:321.
-- B-106 🟥 v2/core/registration.py:179 — motion init (X,Y,Z,2,3) (copy-paste from v1 2D fake-z path) vs required (X,Y,Z,3); both is_3d branches identical (dead conditional).
-- B-107 🟧 v2/core/registration.py:247 — motion.transpose(2,1,0,3,4) on 4-D return → AxisError when save_motion=True.
-- B-108 🟧 v2/core/registration.py:198 — 2D path passes bare 2-D arrays into strictly-3D algorithm (v1 stacks fake z=2; v2 dropped it).
-- B-109 🟧 v2/core/reference.py:174 — v1's min(len//2,50) cap dropped → averages ~whole window instead of top-correlated half → all references differ from v1.
-- B-110 🟧 v2/pipeline/runner.py:157 — no clamp: n_frames < initial_frames → negative middle start → range(-5,35) requested from reader; validate_frame_range helper exists but never called.
-- B-111 🟧 v2/pipeline/runner.py:334 — short-chunk pad repeats ONE frame (ref_window_mem[-1:].repeat) though comment says keep-previous → duplicated frame dominates reference (same at 459-468).
-- B-112 🟨 v2/core/reference.py:180 — cc_sorted[:,1:ncorr+1] vs v1's [:,1:ncorr] → off-by-one score → possibly different reference frame.
-- B-113 🟨 v2/core/reference.py:174 — T=1 window → ncorr=0 → all-NaN reference silently (mirror of B-077).
-- B-114 🟨 v2/config/settings.py:141 — intensity_range documented as intensity but used as component SIZE range (bwareafilt3_wei voxel counts).
 
 ## VERDICTS (B-060..065) — all confirmed
 - B-060 CONFIRMED-run (1 draw instead of 9; all cells identical constant velocity; top-level test doesn't catch it).
@@ -233,12 +208,6 @@ R6 cross-chunk: mid-file `import numpy as np` at 5249 + `_as_bool_mask_fallback`
 - B-032 CONFIRMED-read (wording fix: fallback is INSIDE except but unguarded; nd2 0.11.3 source confirms IndexError on 1-frame file).
 - B-033 CONFIRMED-run (dict mutated; in-repo callers unharmed today; 🟦 stands).
 
-## VERDICTS (B-084..088) — all confirmed
-- B-084 CONFIRMED-run (both documented invocations fail with ModuleNotFoundError; bootstrap needs 4 parents).
-- B-085 CONFIRMED-run (single-raw-frame "reference": ratio 1.0031 → passes; test can't detect zero averaging).
-- B-086 CONFIRMED-run (monkeypatched zero-motion generator: 12/12 tests still pass).
-- B-087 CONFIRMED-read (vacuous window = OME-XML without Pixels; sibling test at 209 does it right; 🟦).
-- B-088 CONFIRMED-read (unused-but-executed fixture; sample_config dead; 🟦).
 
 ## VERDICTS (B-066..071) — all confirmed
 - B-066 CONFIRMED-run (UnboundLocalError reproduced; aggravator: bare `from utils import cp` fails on ANY normal install so parallel=True always crashes; pipeline.py dodges via parallel=False).
@@ -302,19 +271,4 @@ R6 cross-chunk: mid-file `import numpy as np` at 5249 + `_as_bool_mask_fallback`
 - B-027 CONFIRMED-run (resolution tag 0.8µm vs embedded JSON 0.4µm; the one real caller exercises the buggy branch).
 - B-028 CONFIRMED-run (WORSE than claimed: zip is invalid AT FUNCTION RETURN until a gc cycle; hard exit after return → BadZipFile; normal exit repairs via finalizers).
 
-## VERDICTS (B-103..108) — all CONFIRMED-run via layered monkeypatch cascade
-- B-103 CONFIRMED-run (RuntimeError at guard 138; runner calls register_batch at 206/312/437 — not dead within v2).
-- B-104 CONFIRMED-run (nuance: IndexError not TypeError — numpy scalar subscripted at calFlow3d:314).
-- B-105 CONFIRMED-run (KeyError 'zRatio' at calFlow3d:321; no .get() anywhere).
-- B-106 CONFIRMED-run (hard ValueError broadcast crash in imresize — not silent).
-- B-107 CONFIRMED-run (ValueError at 247 iff return_motion; runner passes save_motion → triggers when motion saving on).
-- B-108 CONFIRMED-run (dies even earlier than claimed: getMask binary_opening dimensionality at 156).
-- Meta: zero tests exercise FrameRegistrar/register_batch — explains how a 6-layer-deep dead path shipped. With 103-106 fixed + motion saving off, register_batch completes on synthetic 3D.
 
-## VERDICTS (B-078..083) — all confirmed
-- B-078 CONFIRMED-read (nd2 source: read_frame = one 2D plane over T×Z sequence; both 3D cases wrong; correct asarray fallback unreachable; primary README example path).
-- B-079 CONFIRMED-run (metadata n_z=1 vs read data (2,5,8,8); caveat: v2 registration derives 3D-ness from data ndim — damage is metadata.json/OME output + external consumers).
-- B-080 CONFIRMED-run (all four writer variants: z-planes served as timepoints; ZYX axes also double-counts n_z).
-- B-081 CONFIRMED-run (TCYX C=2: n_z=16=height; frame data itself correct — metadata-only damage, 🟧 fair).
-- B-082 CONFIRMED-run (TZCYX zarr: data[channel] returns z-slice with all channels; caveat: no in-repo zarr round-trip — needs external 5D zarr).
-- B-083 CONFIRMED-run (2015-01 namespace → silent (1,1,1) voxel size; zero logging on any default path; propagates into all OME output; registration math unaffected).

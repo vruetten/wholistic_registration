@@ -106,7 +106,7 @@ There is no `wholistic_registration` console script. Runs are config-driven:
   ```
 - **Type checker:** `mypy`, advisory only for now (loose settings; ratchet up over time).
 - **Excluded from lint/format/mypy** (legacy / WIP, deliberately untouched):
-  `archive/`, `v2/`, `code/`, `demos/`, `tests/` (the src-level ones), `macros/`,
+  `archive/`, `code/`, `demos/`, `tests/` (the src-level ones), `macros/`,
   `simulations/`. Don't burn time reformatting these.
 - **`.git-blame-ignore-revs`** records the big format-pass SHA so `git blame`
   skips it. If you land another bulk-format commit, add its SHA there.
@@ -177,7 +177,7 @@ lands.
 ### Don't
 - Add CLI flags, error handling, or abstractions "for the future." Add them when needed.
 - Add comments that re-state what the code does. Only comment the *why* when non-obvious.
-- Inline-reformat the excluded legacy dirs (`archive/`, `v2/`, `code/`, …).
+- Inline-reformat the excluded legacy dirs (`archive/`, `code/`, …).
 - Re-read a file Claude just edited; the harness tracks state.
 
 ### Communication

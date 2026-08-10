@@ -326,8 +326,7 @@ tells anyone how to set up dev, README has a working quickstart.
   └── integration/
       └── test_registration_smoke.py  # tiny 16x16x3 synthetic volume, 3 frames
   ```
-- **Synthetic data:** crib the patterns from `v2/tests/synthetic_data.py` (the
-  shape is reasonable, just adapt to the v1 entry points). Never depend on
+- **Synthetic data:** generate tiny in-memory volumes. Never depend on
   ND2 paths, NFS, or `/home/cyf/...`.
 - **Coverage target:** start with ≥ 30 %, gate at >= current value in CI to
   prevent regression.

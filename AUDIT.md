@@ -1,6 +1,6 @@
 # `wholistic_registration` — Repository Audit
 
-**Scope:** Whole repo, **excluding** `src/wholistic_registration/v2/` (per user request).
+**Scope:** Whole repo.
 **Date:** 2026-05-27
 **Branch audited:** `main` @ `84637ab` (1 ahead of `origin/main`).
 **Tracked files:** 104. **Working-tree size:** ~683 MB (672 MB of which is an untracked `registrated_data/` blob).
@@ -14,7 +14,7 @@
 | 1 | 🟥 Critical | `pyproject.toml` declares `"json"` as a dep (stdlib module — `pip install` breaks) | trivial |
 | 2 | 🟥 Critical | Broken intra-package imports (`from core import …`, `from utils import …`) make the installed package unusable from outside the source tree | small |
 | 3 | 🟥 Critical | Top-level `__init__.py` is **empty** — no public API surface; users can't `from wholistic_registration import …` | small |
-| 4 | 🟥 Critical | Heavy runtime deps imported but undeclared: `nd2`, `h5py`, `dask`, `zarr`, `scikit-image`, `pandas` (in v2), `cupy` (declared only as optional) | small |
+| 4 | 🟥 Critical | Heavy runtime deps imported but undeclared: `nd2`, `h5py`, `dask`, `zarr`, `scikit-image`, `cupy` (declared only as optional) | small |
 | 5 | 🟥 Critical | Hardcoded absolute user paths (`/home/cyf/...`, `/nrs/ahrens/...`) in 30+ files | medium |
 | 6 | 🟥 Critical | `tests/` contains scripts & notebooks, **no real pytest tests**; no CI | medium |
 | 7 | 🟧 High | Build/runtime artifacts tracked in git: `*.egg-info/`, `src/.DS_Store`, 5 large PNGs (1–1.6 MB each) | trivial |
@@ -58,7 +58,7 @@ gpu = ["cupy"]
 ```
 
 - **🟥 `json` is a stdlib module.** A package by that name *does* exist on PyPI (an abandoned shim), but listing it here is wrong and at best installs noise.
-- **🟥 Missing declared deps** (all imported by tracked code outside `v2/`):
+- **🟥 Missing declared deps** (all imported by tracked code):
   `dask`, `h5py`, `nd2`, `zarr`, `scikit-image` (`from skimage…`), `cupy` (only optional, but pipeline crashes at import-time without it on machines without it because of `from utils import cp` chain logic that *prints* but still runs… still needs declaring as a hard runtime dep or guarded better).
 - **🟥 No version pins** anywhere → unreproducible builds.
 - Missing standard metadata: `authors`, `readme = "README.md"`, `urls = {…}`, `classifiers = [...]`, `keywords`, dynamic version from VCS.
@@ -130,7 +130,7 @@ echo "*.egg-info/" >> .gitignore
 
 ### Findings
 
-**Package skeleton (excluding v2):**
+**Package skeleton:**
 
 ```
 src/wholistic_registration/
@@ -362,7 +362,7 @@ pre-commit install
 
 Files >1 kLOC are red flags. `main_function.py` mixes config validation, IO, pipeline orchestration, downsampling, OME-TIFF writing, and reliable analysis — clear cohesion problem.
 
-**No type hints** anywhere outside `v2/`.
+**No type hints** anywhere.
 
 ### Recommendations
 
@@ -427,7 +427,7 @@ test_crossresolution_registration.py ← script with broken `from utils import �
 zarr_to_tiffseries.py              ← utility script
 ```
 
-- **No pytest-style tests** (no `test_*` functions with `assert`s outside `v2/`).
+- **No pytest-style tests** (no `test_*` functions with `assert`s).
 - **No CI run** would catch anything because there's no `tests/` at the project root, no `.github/workflows/`, no `tox.ini`, no `noxfile.py`.
 - Notebooks are committed with outputs (some 450 KB+).
 - `tests/` lives **inside the package**, which is unusual and makes `pytest --pyargs wholistic_registration` find scripts that aren't tests.
@@ -449,7 +449,7 @@ tests/                       # at repo root, NOT inside the package
     └── synthetic_5x5x3.tif
 ```
 
-- Reuse `v2/tests/synthetic_data.py` style — generate tiny in-memory volumes; never depend on real ND2 paths.
+- Generate tiny synthetic volumes in-memory; never depend on real ND2 paths.
 - Add `pytest-cov`, target ≥40 % to start, ratchet up.
 - Move notebooks into `examples/` (executable but not test artefacts) and strip outputs via `nbstripout`.
 
@@ -625,7 +625,7 @@ No copyright violations spotted in cursory scan; nothing vendored from third par
 13. Add `dependabot.yml`.
 
 ### Phase 3 — Tests & docs (a few days)
-14. Move `tests/` to repo root; write real pytest tests using synthetic data (borrow from `v2/`).
+14. Move `tests/` to repo root; write real pytest tests using synthetic data.
 15. Expand README with install/quickstart/usage; move `HighResolution.md` to `docs/`.
 16. Add `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `CHANGELOG.md`, `CITATION.cff`.
 

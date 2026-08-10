@@ -11,44 +11,42 @@ minimal repros in a local CPU venv wherever executable.
 ## Tally
 
 - **114 findings reported → 96 confirmed · 18 refuted** (refuted entries kept below
-  so they aren't re-found).
-- Confirmed by severity: **13 🟥** (crash / wrong results on a main path) ·
-  **~30 🟧** (wrong results on a plausible path) · rest 🟨 latent/edge and 🟦 minor.
+  so they aren't re-found). 23 confirmed findings were in a subpackage deleted on
+  2026-08-10 and are retired from this ledger (IDs B-078–B-088 and B-103–B-114
+  stay reserved, never reused), leaving **73 live confirmed findings**.
+- Live confirmed by severity: **9 🟥** (crash / wrong results on a main path) ·
+  **~24 🟧** (wrong results on a plausible path) · rest 🟨 latent/edge and 🟦 minor.
 - Verification quality: ~60% of confirmed findings are `CONFIRMED-run`
   (reproduced by executed snippet); the rest `CONFIRMED-read` (mostly GPU-only
   paths, tagged `[gpu-unverified]`, to re-verify on the Janelia server).
 
 ## Headline findings
 
-1. **v2 registration has never run** — a six-layer dead cascade, each crash
-   verified by fixing the previous layer: nonexistent `prep` import swallowed into
-   a misleading RuntimeError (B-103) → wrong `getMotion` argument order (B-104) →
-   option dict missing 4 required keys (B-105) → motion init shaped for v1's 2D
-   fake-z path (B-106) → 5-axis transpose of a 4-D array (B-107) → 2D path dies in
-   `getMask` (B-108). Zero tests exercise `register_batch`, which is how it shipped.
-2. **v1 pipeline: every 3D run uses the hardcoded `zRatio=27.693`** regardless of
+1. **The pipeline: every 3D run uses the hardcoded `zRatio=27.693`** regardless of
    the dataset's real anisotropy — the config value is read but never reaches the
    algorithm (B-071). Warm-start motion is also fed back transposed (Z,Y,X,3) into
    an (X,Y,Z,3) slot and silently `imresize`d into garbage every batch after the
    first (B-070).
-3. **The GPU accel of cyf's motion module is dead**: `cupyx.scipy.ndi` is a
+2. **The GPU accel of cyf's motion module is dead**: `cupyx.scipy.ndi` is a
    misspelling of `ndimage`, silently caught → `HAS_CUPY` always False (B-001);
    consequently `close_gap_frames` gap-closing never runs anywhere (B-017), and
    the artifact filter that should drop whole-body-motion episodes correlates
    delta against cumulative motion and never fires — measured corr 0.06 where the
    fix gives 1.00 (B-018).
-4. **calFlowCrossResolution can't even be imported on CPU** (module-level
+3. **calFlowCrossResolution can't even be imported on CPU** (module-level
    `cp.RawKernel` under the numpy fallback, B-034), and on GPU carries a
    wrong-axis unit conversion `neiDiff[:,:,2] *= zRatio_hr` — scales z-slice 2
    instead of the z-component, `IndexError` if nz≤2 (B-089).
-5. **IO writes corrupted metadata/files** on several paths: zarr ZipStore archive
+4. **IO writes corrupted metadata/files** on several paths: zarr ZipStore archive
    is invalid at the moment `saveZarr_fast` returns (B-028); 5D TIFF downsampling
    silently no-ops while stamping downsampled pixel sizes (B-026); embedded TIFF
    spacing off by the downsample factor (B-027); single-channel 2D ND2s crash
    metadata reading (B-024).
-6. **Three functions in `simulation.py`/`preprocess.py` cannot run at all**
+5. **Three functions in `simulation.py`/`preprocess.py` cannot run at all**
    (NameErrors from missing imports: B-054, B-055, B-056) — direct evidence these
-   paths have never been executed since the refactor.
+   paths have never been executed since the refactor. The existing unit tests are
+   too weak to catch any of this (the `generate_demo_data` test passes despite
+   B-060's constant-velocity bug) — hence the regression-test follow-up below.
 
 ## Confirmed findings
 
@@ -157,43 +155,6 @@ mechanism proven but no in-repo caller currently triggers it.
 | B-064 | 🟨 | reliableAnalysis.py:229 | debug branch `.get()` on numpy fallback → AttributeError | run |
 | B-065 | 🟦 | visualization.py:57 | threshold param: identical if/else branches, dead parameter | read |
 
-### v2 — readers, registration, reference, runner, config, tests
-
-> **RESOLVED 2026-08-10 — v2 deleted entirely.** Virginia removed
-> `src/wholistic_registration/v2/` (old code) after the review showed its
-> registration path had never run (B-103…B-108) and nothing outside v2 imported
-> it (Pass 0). All 23 findings below are **RESOLVED-by-deletion**; the table is
-> kept as the record of what the tree contained and why it went. Two v1-relevant
-> lessons survive the deletion: the B-109/B-112 reference-selection analysis
-> (v1's own off-by-one at `utils/reference.py:84` NaNs at T=2 — see B-077), and
-> the vacuous-test patterns (B-085/086) to avoid when writing the new test suite.
-
-| ID | Sev | Location | Claim | Status |
-|---|---|---|---|---|
-| B-103 | 🟥 | v2/core/registration.py:97 | imports nonexistent `utils.prep`; swallowed → register_batch always RuntimeError | run |
-| B-104 | 🟥 | :223 | getMotion wrong argument order (scalar subscripted at calFlow3d:314) | run |
-| B-105 | 🟥 | :160 | option dict missing zRatio/tol/save_ite/smoothPenalty → KeyError | run |
-| B-106 | 🟥 | :179 | motion init (X,Y,Z,2,3) from v1's 2D path; dead is_3d conditional → broadcast crash | run |
-| B-078 | 🟥 | v2/io/readers.py:226 | ND2Reader misuses read_frame (plane sequence, not timepoints) → 3D ND2 silently scrambled; primary README path | read |
-| B-107 | 🟧 | v2/core/registration.py:247 | 5-axis transpose of 4-D motion → ValueError when motion saving on | run |
-| B-108 | 🟧 | :198 | 2D path passes bare 2-D arrays → dies in getMask (v1's fake-z stacking dropped) | run |
-| B-109 | 🟧 | v2/core/reference.py:174 | v1's `len//2` cap dropped → averages 39/40 frames vs v1's 20/40 — top-correlated selection effectively disabled | run |
-| B-110 | 🟧 | v2/pipeline/runner.py:157 | no clamp for short videos → **silent index-wraparound corruption** at boundary parity, crash otherwise; validate_frame_range never called | run |
-| B-111 | 🟧 | :334,459 | short-chunk pad duplicates ONE frame (comment claims keep-previous) → duplicate gets 58% reference weight (live when t_chunk<window_size) | run |
-| B-079 | 🟧 | v2/io/readers.py:610 | TiffSeriesReader metadata from pages[0] → n_z=1 for z-stack files (metadata.json/OME damage) | run |
-| B-080 | 🟧 | :457 | no-T-axis 3D tiff → z-planes served as timepoints | run |
-| B-081 | 🟧 | :471 | TCYX C≠1 → n_z = image height in metadata | run |
-| B-082 | 🟨 | :339 | 5D zarr unpacked as TCZYX only; TZCYX (own writer's convention) → channel selects z-slice (needs external zarr) | run |
-| B-083 | 🟨 | :167,480 | bare excepts silently default voxel size/framerate to 1.0 → stamped into all OME output; 2015-01 namespace parses silently wrong | run |
-| B-112 | 🟨 | v2/core/reference.py:180 | scoring off-by-one vs v1 — v2 is arguably the *fix*; flagged as silent behavioral divergence | read |
-| B-113 | 🟨 | :174 | window_size=1 (allowed by validation) → all-NaN reference silently | run |
-| B-114 | 🟨 | v2/config/settings.py:141 | `intensity_range` documented as intensity, used as component-size-in-voxels | read |
-| B-084 | 🟨 | v2/examples/synthetic_example.py:19 | sys.path bootstrap off by one dir → both documented invocations fail | run |
-| B-085 | 🟨 | v2/tests/test_reference.py:59 | smoothness test passes for zero-averaging reference (ratio 1.003) | run |
-| B-086 | 🟨 | v2/tests/test_synthetic_data.py:85 | suite passes 12/12 with all motion zeroed (no lower bound anywhere) | run |
-| B-087 | 🟦 | v2/tests/test_io.py:225 | TimeIncrement assert vacuous if Pixels missing | read |
-| B-088 | 🟦 | v2/tests/conftest.py:45 | fixture requested-but-unused (executes and discards); sample_config dead | read |
-
 ## Refuted (kept so they aren't re-found)
 
 B-004 (dead code), B-005 (NaN-gate returns first), B-006 (shape mismatch can't
@@ -223,7 +184,7 @@ B-101 (zero callers use the mislabeled method names).
 
 All live+demo-only files from Pass 0 reviewed in full (reviewers report zero
 unread ranges in scope): core/ (2), utils/ (18 incl. 7-chunk sweep of
-motion_correlation_pattern.py and 2-chunk calFlowCrossResolution.py), v2/ (27),
+motion_correlation_pattern.py and 2-chunk calFlowCrossResolution.py) and
 pipeline scripts (2). Excluded per Pass-0 scope notes: `demos/`+src `tests/`
 script roots, `archive/`, `ImmuneCell.py` (D-001). GPU/cupy execution paths
 reviewed by reading only — every such finding tagged `[gpu-unverified]`.
@@ -239,5 +200,7 @@ reviewed by reading only — every such finding tagged `[gpu-unverified]`.
 3. **Coordination with cyf** before fixing anything in
    `motion_correlation_pattern.py` / `calFlowCrossResolution.py` (his active
    branch may have moved).
-4. Convention split (channel↔axis vs channel↔axis-1) and v1/v2 divergences
-   (B-109/B-112) → Pass 4 architecture agenda.
+4. Convention split (channel↔axis in the core vs channel↔axis-1 in
+   `preprocess.generate_artificial_motion`) → Pass 4 agenda; fold the
+   reference-scoring off-by-one (`utils/reference.py:84`, NaNs at T=2 — see
+   B-077 evidence) into the same fix batch.

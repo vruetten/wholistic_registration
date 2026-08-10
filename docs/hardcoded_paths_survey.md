@@ -4,8 +4,8 @@
 hardcoded user paths under `src/wholistic_registration/` so they can be
 removed in Phase 4 (per `REMEDIATION_PLAN.md`).
 
-Excluded from this survey: `src/wholistic_registration/archive/`,
-`src/wholistic_registration/v2/`, and `__pycache__/` artifacts.
+Excluded from this survey: `src/wholistic_registration/archive/` and
+`__pycache__/` artifacts.
 
 ## Path roots observed
 
@@ -86,8 +86,7 @@ Per `REMEDIATION_PLAN.md` §F22:
    that ships with the notebook.
 3. **Tests** (`tests/*.py`, `tests/*.ipynb`):
    replace with real pytest tests that use synthetic in-memory data
-   (see F6 / `tests/conftest.py` and the `v2/tests/synthetic_data.py`
-   pattern for inspiration).
+   (see F6 / `tests/conftest.py`).
 4. **Config TOMLs** (`configs/config_*.toml`):
    either move out to a per-user `examples/configs/` directory with
    placeholder paths (`<INPUT_PATH>`, `<OUTPUT_PATH>`), or generate them

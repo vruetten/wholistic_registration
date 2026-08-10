@@ -7,15 +7,8 @@ there. This file holds only what is specific to *this* run.
 
 ## Scope decisions (2026-08-10)
 
-1. **v2/ fully in scope** — all passes. (The 2026-05-27 `AUDIT.md` had
-   excluded it.)
-   - **Superseded later same day:** Virginia deleted `v2/` entirely (old code;
-     Pass 1 showed its registration path never ran). v2 leaves the scope of
-     passes 2–4; its 23 Pass-1 findings are RESOLVED-by-deletion in the ledger.
-     Stale `v2` mentions remain in `pyproject.toml` excludes and `CLAUDE.md`
-     (harmless; clean up with the next pyproject edit).
-2. **`journal/`, `plan/`, `audit/` committed to git.**
-3. **Execution: parallel fan-out + adversarial verification.**
+1. **`journal/`, `plan/`, `audit/` committed to git.**
+2. **Execution: parallel fan-out + adversarial verification.**
 
 ## Prior audits (settled ground — append there, not here)
 
@@ -60,7 +53,6 @@ package still untested (todo).
 | 4 | `utils/calFlow3d_Wei_v1.py`, `utils/interp.py`, `utils/imresize.py`, `utils/calculate.py` | 1,488 |
 | 5 | `utils/IO.py`, `utils/motion_stage_cache.py`, `utils/converters.py` | 1,668 |
 | 6 | remaining live utils (`preprocess`, `mask`, `reliableAnalysis`, `visualization`, `simulation`, `ImmuneCell`, `generate_demo_data`, `__init__`) | ~2,600 |
-| 7 | `v2/` (27 files) | 4,539 |
 | 8 | `pipeline.py`, `pipeline_vmsr.py` | 279 |
 
 Batch membership may shrink after Pass 0 removes dead files.

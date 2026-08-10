@@ -4,7 +4,7 @@
 (script: session scratchpad `pass0_graph.py`) over all 65 package `.py` files,
 14 notebooks, and top-level `tests/`; resolves proper absolute, relative, and
 the repo's broken bare (`from utils import …`) import styles. Roots: pipeline
-scripts, v2 runner, demo/test scripts, notebooks, pytest trees.
+scripts, demo/test scripts, notebooks, pytest trees.
 
 ## Classification
 
@@ -15,12 +15,6 @@ scripts, v2 runner, demo/test scripts, notebooks, pytest trees.
 `utils/calculate.py` · `utils/imresize.py` · `utils/interp.py` ·
 `utils/mask.py` · `utils/preprocess.py` · plus entry scripts `pipeline.py`,
 `pipeline_vmsr.py`.
-
-### Live — v2 chain (reachable from `v2/pipeline/runner.py`)
-All of `v2/core/`, `v2/config/`, `v2/io/`, `v2/utils/` (incl.
-`array_ops.py`, `logging.py`, `validation.py`), `v2/pipeline/`,
-`v2/__init__.py`. `v2/tests/*` are pytest roots; `v2/examples/*` are script
-roots — both in scope as test/demo roots.
 
 ### Live-standalone (zero in-repo callers; adjudicated manually)
 - `utils/motion_correlation_pattern.py` (7,941 LOC) — no in-repo importer, no
@@ -73,13 +67,9 @@ module; cannot run. Out of scope (existing `AUDIT.md` F2 territory).
 
 ## Looks wrong but is fine
 
-- `v2/config/settings.py` shows as reachable only via `v2/config/__init__` —
-  fine: it is the module's implementation file, re-exported by the package.
-- `pipeline.py` imported by nothing — fine: it is a root (script entry), and
-  `v2/__init__` importing `pipeline` was a resolver artifact, fixed before
-  this ledger was written.
-- 13 `v2/tests`+`examples` files with zero importers — fine: pytest/script
-  roots, reached by convention not import.
+- `pipeline.py` imported by nothing — fine: it is a root (script entry); an
+  early resolver artifact suggesting otherwise was fixed before this ledger
+  was written.
 
 ## Coverage
 
