@@ -226,13 +226,15 @@ def local_mind_difference(
 
         if debug_dir is not None:
             os.makedirs(debug_dir, exist_ok=True)
-            tifffile.imwrite(os.path.join(debug_dir, "M_ref.tif"), M_ref.get())
+            # arrays are numpy under the cp fallback, which has no .get()
+            tonp = lambda x: x.get() if hasattr(x, "get") else np.asarray(x)
+            tifffile.imwrite(os.path.join(debug_dir, "M_ref.tif"), tonp(M_ref))
             tifffile.imwrite(
                 os.path.join(debug_dir, "diff_raw.tif"),
-                cp.abs(cp.mean(M_ref - M_mov, axis=0)).get(),
+                tonp(cp.abs(cp.mean(M_ref - M_mov, axis=0))),
             )
-            tifffile.imwrite(os.path.join(debug_dir, "weight_map.tif"), weight.get())
-            tifffile.imwrite(os.path.join(debug_dir, "diff_weighted.tif"), diff.get())
+            tifffile.imwrite(os.path.join(debug_dir, "weight_map.tif"), tonp(weight))
+            tifffile.imwrite(os.path.join(debug_dir, "diff_weighted.tif"), tonp(diff))
 
         return cp.clip(diff, 0.0, 1.0)
 
