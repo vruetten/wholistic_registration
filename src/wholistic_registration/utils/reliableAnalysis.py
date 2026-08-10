@@ -311,7 +311,7 @@ def local_zscore_difference(
     D = np.abs(mu_ref - mu_mov) / denom * mask
     if clip is not None:
         D = np.clip(D, clip[0], clip[1])
-    D = D / (clip[1] - clip[0])
+        D = D / (clip[1] - clip[0])
     return D.astype(np.float32)
 
 
