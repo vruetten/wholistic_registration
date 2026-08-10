@@ -3818,8 +3818,9 @@ def _auto_contrast(img):
 
 
 def _get_BH_from_episode(ep):
-    if not hasattr(ep, "mode_model") or ep.mode_model is None:
-        raise ValueError("episode.mode_model is missing.")
+    model = getattr(ep, "mode_model", None)
+    if not model or "B" not in model:
+        raise ValueError("episode.mode_model is missing or empty (episode not fitted).")
     B = np.asarray(ep.mode_model["B"], dtype=np.float32)  # (2N, K)
     H = np.asarray(ep.mode_model["H"], dtype=np.float32)  # (K, T)
     return B, H
@@ -4346,7 +4347,8 @@ def summarize_temporal_basis_likeness(episodes):
     rows = []
 
     for ei, ep in enumerate(episodes):
-        if not hasattr(ep, "mode_model") or ep.mode_model is None:
+        model = getattr(ep, "mode_model", None)
+        if not model or "B" not in model:
             continue
 
         B, H = _get_BH_from_episode(ep)
