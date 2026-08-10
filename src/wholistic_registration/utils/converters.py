@@ -18,6 +18,8 @@ def save_zarr_as_tiffs_simple(
     if metadata is not None:
         spacing_x = metadata.get("spacing_x", 1) * xy_downsample
         spacing_y = metadata.get("spacing_y", 1) * xy_downsample
+        # embed the downsample-corrected spacing (copy: don't mutate the caller's dict)
+        metadata = {**metadata, "spacing_x": spacing_x, "spacing_y": spacing_y}
     else:
         spacing_x = xy_downsample
         spacing_y = xy_downsample
