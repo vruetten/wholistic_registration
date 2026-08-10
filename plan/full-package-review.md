@@ -40,7 +40,7 @@ package still untested (todo).
 | Pass | Ledger | Status |
 |---|---|---|
 | 0 — liveness | `audit/pass-0-inventory.md` | **done 2026-08-10** |
-| 1 — bugs | `audit/pass-1-bugs.md` | not started |
+| 1 — bugs | `audit/pass-1-bugs.md` | **done 2026-08-10** — 114 findings, 96 confirmed (13 🟥) / 18 refuted; open debt: regression tests, GPU re-verification on Janelia |
 | 2 — math | `audit/pass-2-math.md` | not started |
 | 3 — performance | `audit/pass-3-performance.md` | not started |
 | 4 — architecture | `audit/pass-4-architecture.md` | not started |

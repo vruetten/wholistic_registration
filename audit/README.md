@@ -7,8 +7,9 @@ severity scale, and statuses are defined in the `/full-package-review` skill
 
 | File | Pass | Status |
 |---|---|---|
-| `pass-0-inventory.md` | Inventory & liveness (dead files) | not started |
-| `pass-1-bugs.md` | Bugs & errors | not started |
+| `pass-0-inventory.md` | Inventory & liveness (dead files) | **done 2026-08-10** |
+| `pass-1-bugs.md` | Bugs & errors | **done 2026-08-10** (96 confirmed / 18 refuted; regression tests pending) |
+| `pass-1-verification-log.md` | Full verifier evidence for Pass 1 | archive |
 | `pass-2-math.md` | Math & numerics | not started |
 | `pass-3-performance.md` | Performance | not started |
 | `pass-4-architecture.md` | Architecture | not started |
