@@ -200,13 +200,16 @@ def readND2Frame(
         if idx is None:
             return slice(None)
         elif isinstance(idx, (int, np.integer)):
-            return slice(idx, idx + 1)  # Convert int to slice
+            # Convert int to dimension-preserving slice; stop=None when idx==-1
+            # (slice(-1, 0) would be an empty selection)
+            return slice(idx, idx + 1 if idx != -1 else None)
         elif isinstance(idx, (list, tuple, np.ndarray)):
             # For lists, ensure at least 2 elements to preserve dimensions
             idx_list = list(idx)
             if len(idx_list) == 1:
                 # Duplicate the single element to preserve dimension
-                return slice(idx_list[0], idx_list[0] + 1)
+                i0 = idx_list[0]
+                return slice(i0, i0 + 1 if i0 != -1 else None)
             return idx_list
         elif isinstance(idx, slice):
             return idx
@@ -648,7 +651,7 @@ def downsample_nd2_to_tiff_folder(
         if idx is None:
             return slice(None)
         if isinstance(idx, (int, np.integer)):
-            return slice(idx, idx + 1)
+            return slice(idx, idx + 1 if idx != -1 else None)
         return idx
 
     def ensure_5d_tzcyx(dask_data, dims, verbose=False):
