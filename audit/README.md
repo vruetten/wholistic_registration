@@ -2,7 +2,7 @@
 
 One ledger per review pass. The process, evidence protocol, finding format,
 severity scale, and statuses are defined in the `/full-package-review` skill
-(`.claude/skills/full-package-review/SKILL.md`); the instance plan is
+(`~/.claude/skills/full-package-review/SKILL.md`, user-level); the instance plan is
 `plan/full-package-review.md`.
 
 | File | Pass | Status |

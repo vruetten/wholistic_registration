@@ -1,7 +1,7 @@
 # Full-package review — instance plan
 
 **Started:** 2026-08-10 · **Owner:** Virginia + Claude
-**Process:** `/full-package-review` skill (`.claude/skills/full-package-review/`)
+**Process:** `/full-package-review` skill (`~/.claude/skills/full-package-review/`, user-level)
 — passes, evidence protocol, ledger format, and subagent briefs all live
 there. This file holds only what is specific to *this* run.
 
