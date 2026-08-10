@@ -19,7 +19,7 @@ main_function.DefineParams(
     function="raw",
     batch_size=60,  # in frames
     mid_stride=1,  # in frames
-    referece_chunk=50,  # NO COMMENT ON THIS ONE
+    reference_chunk=50,
     preprocess=False,  # WHETHER TO NORMALIZE THE IMAGE TO [0,255]
     thresFactor=5,  # IMMUNE CELL THRESHOLD - REMOVE REGIONS THAT ARE NSTD OF THE WHOLE IMAGE
     maskRange=[
