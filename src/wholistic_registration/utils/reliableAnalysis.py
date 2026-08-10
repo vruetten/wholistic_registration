@@ -287,6 +287,9 @@ def local_zscore_difference(
 
     var_ref = gaussian_filter(I_ref**2, sigma=sigma) - mu_ref**2
     var_mov = gaussian_filter(I_mov**2, sigma=sigma) - mu_mov**2
+    # float32 cancellation can make these slightly negative (NaN after sqrt)
+    var_ref[var_ref < 0] = 0
+    var_mov[var_mov < 0] = 0
 
     threshold_mu_ref = np.percentile(mu_ref, p_mu)
     threshold_var_ref = np.percentile(var_ref, p_var)
