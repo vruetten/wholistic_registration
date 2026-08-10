@@ -552,7 +552,9 @@ def downsample_tifs_dask(
         # Expected format: TZCYX (5D) or ZCYX (4D) or ZYX (3D) or YX (2D)
         ndim = image.ndim
 
-        if ndim == 4:  # ZCYX or TCYX
+        if ndim == 5:  # TZCYX
+            image = image[:, :, :, ::downsample_xy, ::downsample_xy]
+        elif ndim == 4:  # ZCYX or TCYX
             image = image[:, :, ::downsample_xy, ::downsample_xy]
         elif ndim == 3:  # ZYX or TYX
             image = image[:, ::downsample_xy, ::downsample_xy]
