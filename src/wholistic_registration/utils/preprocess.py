@@ -340,6 +340,10 @@ def canny_edge_map(frame, sigma=1.0, low_threshold=0.05, high_threshold=0.15, ep
 
 
 def Yunfeng_edge_map(frame, r=1, sigma=4, outcoef=3, min_size=40):
+    from skimage.measure import label, regionprops
+
+    from . import calculate, cp
+
     frame_smooth = cp.asarray(ndi.gaussian_filter(frame, sigma=sigma, mode="nearest"))
     # initialize
     average_kernel = cp.ones((2 * r + 1, 2 * r + 1), dtype=np.float64)
