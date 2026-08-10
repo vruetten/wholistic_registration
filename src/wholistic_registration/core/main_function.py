@@ -803,9 +803,11 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
             num_gpus = cp.cuda.runtime.getDeviceCount()  # Get number of available GPUs
             print(f"[INFO]Detected {num_gpus} GPU(s).")
         except Exception:
+            num_gpus = 0
             print("[ERROR]Failed to query GPU devices via CuPy.")
             print("[INFO]Falling back to serial mode.")
     except ImportError:
+        num_gpus = 0
         print("[ERROR]CuPy is not installed or failed to import.")
         print("[INFO]Falling back to serial mode.")
 
