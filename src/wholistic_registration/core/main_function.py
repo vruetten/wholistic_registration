@@ -640,8 +640,12 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
     # Calculate the middle window position
     half_chunk = mid_window_size_frames // 2
     total_mid = total_process_frames // 2  # Middle frame of entire dataset
-    mid_start = total_mid - half_chunk  # Start frame of middle window
-    mid_end = mid_start + mid_window_size_frames  # End frame of middle window
+    # Clamp the window to the dataset: a mid_window_size larger than the
+    # recording would otherwise make mid_start negative (Python indexing wraps,
+    # silently pulling end-of-recording frames into the "middle" reference)
+    # and mid_end overrun into an IndexError.
+    mid_start = max(0, total_mid - half_chunk)  # Start frame of middle window
+    mid_end = min(mid_start + mid_window_size_frames, total_process_frames)  # End frame
 
     # Read middle block from ND2 file
     # Channel 1 = membrane, channel 0 = calcium
