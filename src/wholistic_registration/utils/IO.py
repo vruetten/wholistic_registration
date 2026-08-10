@@ -784,7 +784,8 @@ def saveTiff_new(image, save_path, config_path=None, metadata=None, verbose=True
     if metadata is not None:
         spacing_x = metadata["spacing_x"]
         spacing_y = metadata["spacing_y"]
-        metadata["data_shape"] = image.shape
+        # copy so the caller's dict is not mutated
+        metadata = {**metadata, "data_shape": image.shape}
     else:
         metadata = {}
         spacing_x = 1
