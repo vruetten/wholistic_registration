@@ -39,7 +39,7 @@ package still untested (todo).
 |---|---|---|
 | 0 — liveness | `audit/pass-0-inventory.md` | **done 2026-08-10** |
 | 1 — bugs | `audit/pass-1-bugs.md` | **done 2026-08-10** — 114 findings, 96 confirmed (13 🟥) / 18 refuted; open debt: regression tests, GPU re-verification on Janelia |
-| 2 — math | `audit/pass-2-math.md` | not started |
+| 2 — math | `audit/pass-2-math.md` | **done 2026-08-10** — core numerics sound; 8 findings (1 🟨 live: reference off-by-one M-C1; getMask robustness M-C4); GPU re-verification complete |
 | 3 — performance | `audit/pass-3-performance.md` | not started |
 | 4 — architecture | `audit/pass-4-architecture.md` | not started |
 
