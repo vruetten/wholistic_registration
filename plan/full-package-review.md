@@ -39,7 +39,7 @@ package still untested (todo).
 
 | Pass | Ledger | Status |
 |---|---|---|
-| 0 — liveness | `audit/pass-0-inventory.md` | not started |
+| 0 — liveness | `audit/pass-0-inventory.md` | **done 2026-08-10** |
 | 1 — bugs | `audit/pass-1-bugs.md` | not started |
 | 2 — math | `audit/pass-2-math.md` | not started |
 | 3 — performance | `audit/pass-3-performance.md` | not started |
