@@ -413,20 +413,21 @@ def save_patterns_stage(
     """
     out_dir = stage_path(cache_root, stage_name)
 
+    # Save the (large) distance matrix in its own npz and keep it OUT of the
+    # pickle — pop from a copy before the pickle is written
+    info_saved = dict(info) if isinstance(info, dict) else info
+    if isinstance(info_saved, dict) and "distance_matrix" in info_saved:
+        dist = info_saved.pop("distance_matrix")
+        save_npz(out_dir / "distance_matrix.npz", compressed=False, distance_matrix=dist)
+
     obj = {
         "patterns": patterns,
         "kept_regions": kept_regions,
         "groups": groups,
         "labels": labels,
-        "info": info,
+        "info": info_saved,
     }
     save_pickle(obj, out_dir / "objects.pkl")
-
-    # Save distance matrix separately if it exists and is large
-    info_saved = dict(info) if isinstance(info, dict) else {}
-    if isinstance(info_saved, dict) and "distance_matrix" in info_saved:
-        dist = info_saved.pop("distance_matrix")
-        save_npz(out_dir / "distance_matrix.npz", compressed=False, distance_matrix=dist)
 
     save_json(
         {
@@ -442,10 +443,6 @@ def save_patterns_stage(
         },
         out_dir / "metadata.json",
     )
-
-    # Also save a lighter object without the distance matrix duplication in metadata.
-    if isinstance(info, dict) and "distance_matrix" in info:
-        obj["info_without_distance_matrix"] = info_saved
 
     return out_dir
 
