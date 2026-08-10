@@ -1107,7 +1107,7 @@ def create_downsample_dataset_v3(
     base_dsXY = config["downsample"]["downsampleXY"]
     base_dsZ = config["downsample"]["downsampleZ"]
     if config["MetaData"]["Dim"] == 3:
-        base_dsZ = list(range(config["MetaData"]["SIZE"][2]))
+        base_dsZ = list(range(config["MetaData"]["SIZE"][1]))
     elif config["MetaData"]["Dim"] == 2:
         base_dsZ = [0]
     else:
@@ -1325,7 +1325,7 @@ def create_downsample_dataset_v4(
     base_dsZ = config["downsample"]["downsampleZ"]
     frames = config["frames"]["frames"]
     if config["MetaData"]["Dim"] == 3:
-        base_dsZ = list(range(config["MetaData"]["SIZE"][2]))
+        base_dsZ = list(range(config["MetaData"]["SIZE"][1]))
     elif config["MetaData"]["Dim"] == 2:
         base_dsZ = [0]
     else:
