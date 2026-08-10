@@ -1,11 +1,7 @@
-import warnings
-
 import numpy as np
 
 from . import calculate, cp, cupy_ndimage, interp
 from .imresize import imresize
-
-warnings.filterwarnings("ignore", category=UserWarning)
 
 
 ####################################################################################################
