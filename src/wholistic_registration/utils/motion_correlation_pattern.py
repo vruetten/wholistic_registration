@@ -3196,24 +3196,24 @@ def compute_region_distance_matrix_simple(
                                 D_b = _response_field_distance_on_overlap(
                                     regions[i], regions[j], sign2=sign_j)
 
-                        if not np.isfinite(D_h) or not np.isfinite(D_b):
-                            dist = incompatible_dist
-                            compatible = False
-                            reason = "invalid_distance"
-                        else:
-                            dist = omega * D_h + mu * D_b
-                            compatible = True
-                            reason = "ok"
+                            if not np.isfinite(D_h) or not np.isfinite(D_b):
+                                dist = incompatible_dist
+                                compatible = False
+                                reason = "invalid_distance"
+                            else:
+                                dist = omega * D_h + mu * D_b
+                                compatible = True
+                                reason = "ok"
 
-                        info = {
-                            "compatible": bool(compatible),
-                            "reason": reason,
-                            "iou": float(iou),
-                            "D_h": float(D_h),
-                            "D_b": float(D_b),
-                            "distance": float(dist),
-                            "sign": float(sign_j),
-                        }
+                            info = {
+                                "compatible": bool(compatible),
+                                "reason": reason,
+                                "iou": float(iou),
+                                "D_h": float(D_h),
+                                "D_b": float(D_b),
+                                "distance": float(dist),
+                                "sign": float(sign_j),
+                            }
 
             D[i, j] = dist
             D[j, i] = dist
