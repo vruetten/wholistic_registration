@@ -159,6 +159,15 @@ mechanism proven but no in-repo caller currently triggers it.
 
 ### v2 — readers, registration, reference, runner, config, tests
 
+> **RESOLVED 2026-08-10 — v2 deleted entirely.** Virginia removed
+> `src/wholistic_registration/v2/` (old code) after the review showed its
+> registration path had never run (B-103…B-108) and nothing outside v2 imported
+> it (Pass 0). All 23 findings below are **RESOLVED-by-deletion**; the table is
+> kept as the record of what the tree contained and why it went. Two v1-relevant
+> lessons survive the deletion: the B-109/B-112 reference-selection analysis
+> (v1's own off-by-one at `utils/reference.py:84` NaNs at T=2 — see B-077), and
+> the vacuous-test patterns (B-085/086) to avoid when writing the new test suite.
+
 | ID | Sev | Location | Claim | Status |
 |---|---|---|---|---|
 | B-103 | 🟥 | v2/core/registration.py:97 | imports nonexistent `utils.prep`; swallowed → register_batch always RuntimeError | run |

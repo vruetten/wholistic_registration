@@ -9,6 +9,11 @@ there. This file holds only what is specific to *this* run.
 
 1. **v2/ fully in scope** — all passes. (The 2026-05-27 `AUDIT.md` had
    excluded it.)
+   - **Superseded later same day:** Virginia deleted `v2/` entirely (old code;
+     Pass 1 showed its registration path never ran). v2 leaves the scope of
+     passes 2–4; its 23 Pass-1 findings are RESOLVED-by-deletion in the ledger.
+     Stale `v2` mentions remain in `pyproject.toml` excludes and `CLAUDE.md`
+     (harmless; clean up with the next pyproject edit).
 2. **`journal/`, `plan/`, `audit/` committed to git.**
 3. **Execution: parallel fan-out + adversarial verification.**
 
