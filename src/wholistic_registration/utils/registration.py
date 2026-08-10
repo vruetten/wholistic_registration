@@ -167,7 +167,7 @@ def wbi_registration_2d(
                     f"        Frame: {frame[i]}\tInitial Error is:{initial_error}\tEventual Error: {eventual_error}"
                 )
 
-        error = dict["initial_error":initial_error, "eventual_error":eventual_error]
+        error = {"initial_error": initial_error, "eventual_error": eventual_error}
 
         # store the result
         errors.append(error)
@@ -318,7 +318,7 @@ def wbi_registration_3d(
                 print(
                     f"        Frame: {frame[i]}\tInitial Error is:{initial_error:.4f}\tEventual Error: {eventual_error:.4f}"
                 )
-        error = dict["initial_error":initial_error, "eventual_error":eventual_error]
+        error = {"initial_error": initial_error, "eventual_error": eventual_error}
 
         # store the result
         errors.append(error)
