@@ -79,18 +79,21 @@ def generate_cell_movement(
 
         # Add cells to frame
         for i, center in enumerate(centers):
-            # Add some random movement
+            # Add some random movement (fresh draw per cell per frame unless
+            # the caller fixed a displacement)
             if frame_idx > 0:
                 if displacement is None:
-                    displacement = np.random.uniform(-max_displacement, max_displacement, size=2)
+                    step = np.random.uniform(-max_displacement, max_displacement, size=2)
+                else:
+                    step = displacement
 
-                centers[i] = (center[0] + displacement[0], center[1] + displacement[1])
+                centers[i] = (center[0] + step[0], center[1] + step[1])
                 # Update motion field
                 y, x = np.mgrid[: image_size[0], : image_size[1]]
                 dist = np.sqrt((y - center[0]) ** 2 + (x - center[1]) ** 2)
                 mask = dist < 20  # Only update motion near cell
-                motion_field[mask, 0] = displacement[0]
-                motion_field[mask, 1] = displacement[1]
+                motion_field[mask, 0] = step[0]
+                motion_field[mask, 1] = step[1]
 
             # Generate cell with higher intensity and sharper profile
             cell = generate_cell(centers[i], radius=radius, intensity=2.0, image_size=image_size)
