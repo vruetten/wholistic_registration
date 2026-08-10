@@ -46,9 +46,9 @@ def generateMotion(raw_data, art_R, amp_art, zRatio=1):
     # motion_Z.flat[cp_art] = np.random.randn(L)
 
     # Apply 3D Gaussian filtering
-    motion_X = cupy_ndimge.gaussian_filter(motion_X, sigma=filter_sigma)
-    motion_Y = cupy_ndimge.gaussian_filter(motion_Y, sigma=filter_sigma)
-    # motion_Z = cupy_ndimge.gaussian_filter(motion_Z, sigma=filter_sigma)  # Commented out as in original code
+    motion_X = cupy_ndimage.gaussian_filter(motion_X, sigma=filter_sigma)
+    motion_Y = cupy_ndimage.gaussian_filter(motion_Y, sigma=filter_sigma)
+    # motion_Z = cupy_ndimage.gaussian_filter(motion_Z, sigma=filter_sigma)  # Commented out as in original code
 
     # Calculate scaling factors based on standard deviation
     # Note: Using motion_Y's standard deviation for both X and Y scaling
