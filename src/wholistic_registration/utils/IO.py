@@ -900,19 +900,25 @@ def saveZarr_fast(
         store = zarr.ZipStore(save_path + ".zip", mode="w")
     else:
         store = save_path
-    root = zarr.open(store, mode="w")
+    try:
+        root = zarr.open(store, mode="w")
 
-    # create datasets
-    root.create_dataset(
-        "membrane", data=mem_data, chunks=chunks, compressor=compressor, overwrite=True
-    )
-    root.create_dataset(
-        "calcium", data=ca_data, chunks=chunks, compressor=compressor, overwrite=True
-    )
-    root.create_dataset("reference", data=reference, compressor=compressor, overwrite=True)
+        # create datasets
+        root.create_dataset(
+            "membrane", data=mem_data, chunks=chunks, compressor=compressor, overwrite=True
+        )
+        root.create_dataset(
+            "calcium", data=ca_data, chunks=chunks, compressor=compressor, overwrite=True
+        )
+        root.create_dataset("reference", data=reference, compressor=compressor, overwrite=True)
 
-    # save config
-    root.attrs["config"] = config_str
+        # save config
+        root.attrs["config"] = config_str
+    finally:
+        # ZipStore only writes the zip central directory on close(); without this
+        # the archive is unreadable until interpreter shutdown (and corrupt on crash)
+        if single_file:
+            store.close()
 
     print(f"Saved fast Zarr at {save_path}")
     print(f"  - membrane: {mem_data.shape}")
