@@ -48,6 +48,35 @@ minimal repros in a local CPU venv wherever executable.
    too weak to catch any of this (the `generate_demo_data` test passes despite
    B-060's constant-velocity bug) — hence the regression-test follow-up below.
 
+## Fix log (2026-08-10) — RESOLVED findings
+
+26 findings fixed, one commit per bug, each verified by a before/after repro
+(evidence in the commit messages). Table rows below remain as the finding
+record; these IDs are now **RESOLVED**:
+
+| ID → commit | | | |
+|---|---|---|---|
+| B-001 → c81e861 | B-002 → 5b3c725 | B-009 → c33e6ce | B-012 → 83fd55b |
+| B-026 → 8eab9cf | B-027 → 9b326e9 | B-028 → aba9ee0 | B-029 → 6725eb8 |
+| B-030 → 49cf6c7 | B-033 → bd1ee1a | B-037 → 5103565 | B-041 → 867e82c |
+| B-043 → 8bfd0e2 | B-044 → 603282b | B-054 → cbf274c | B-055 → 8f9e3d3 |
+| B-056 → 283b255 | B-057 → 4ce9113 | B-060 → d728309 | B-061 → e41224c |
+| B-062 → c0d03ec | B-064 → fcbc933 | B-066 → f657d78 | B-068 → 98dea5b |
+| B-069 → 8893b4d | B-073 → 2910ffe | | |
+
+Deliberately NOT fixed in this batch (need a decision or GPU validation):
+- **Results-changing algorithmic fixes needing sign-off:** B-018 (artifact
+  filter delta→abs), B-008 (merge semantics), B-063 (min vs max — Virginia's
+  own unresolved flip-flop), B-058 (canny NMS fold), B-092 (highresidual
+  metric), B-014/B-016/B-046 (API semantics), B-039/B-040/B-042 (viz
+  conventions — adjudicate component order with cyf first).
+- **Pipeline window logic (results-changing, GPU validation):** B-070
+  (transpose warm-start), B-071 (zRatio plumbing), B-074/075/076/077.
+- **Needs restructuring / GPU testing:** B-067 (hard cupy import), B-034
+  (module-level RawKernels → lazy init), B-089/B-090/B-091 (cyf, GPU),
+  B-017/B-019/B-020 (gap-closing semantics), B-024/B-031/B-032 (ND2/tiff
+  shape handling), B-035/B-036/B-049/B-051/B-052 + latents + 🟦 minors.
+
 ## Confirmed findings
 
 Severity · location · claim · status. `[gpu]` = [gpu-unverified] · "(latent)" =
