@@ -174,12 +174,12 @@ comment). Changes the reliability weighting of difference maps.
 
 ## 5 · Restructuring / environment work (bigger than one-line fixes)
 
-- **B-067** 🟥 unconditional `import cupy` in `process_directional_chunks`
-  kills serial CPU runs — route through the shim; part of the larger
-  AUDIT.md F2 import cleanup.
-- **B-034** 🟧 module-level `cp.RawKernel` makes calFlowCrossResolution
-  unimportable on CPU machines (GPU nodes fine — verified) — wrap kernels in
-  lazy initialization.
+- ~~**B-067** 🟥 unconditional `import cupy` in `process_directional_chunks`
+  kills serial CPU runs~~ **RESOLVED → 869775b** (routed through the shim;
+  GPU-only calls CUPY_AVAILABLE-guarded).
+- ~~**B-034** 🟧 module-level `cp.RawKernel` makes calFlowCrossResolution
+  unimportable on CPU machines~~ **RESOLVED → 555f8ec** (lazy compilation +
+  cache; GPU no-op validated on an L4, LSF job 153314832).
 - **B-024/B-031/B-032** 🟧/🟨 ND2/TIFF shape handling: single-channel 2D ND2s
   crash metadata reading (nd2 drops singleton axes); 3D→5D padding puts
   z-stacks in the channel slot; single-frame ND2s crash the framerate

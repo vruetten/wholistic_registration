@@ -63,7 +63,7 @@ record; these IDs are now **RESOLVED**:
 | B-043 → 8bfd0e2 | B-044 → 603282b | B-054 → cbf274c | B-055 → 8f9e3d3 |
 | B-056 → 283b255 | B-057 → 4ce9113 | B-060 → d728309 | B-061 → e41224c |
 | B-062 → c0d03ec | B-064 → fcbc933 | B-066 → f657d78 | B-068 → 98dea5b |
-| B-069 → 8893b4d | B-073 → 2910ffe | | |
+| B-069 → 8893b4d | B-073 → 2910ffe | B-067 → 869775b (2026-08-11) | B-034 → 555f8ec (2026-08-11) |
 
 Deliberately NOT fixed in this batch — now tracked with per-item explanations in [plan/fix-queue.md](../plan/fix-queue.md):
 - **Results-changing algorithmic fixes needing sign-off:** B-018 (artifact
@@ -88,7 +88,7 @@ mechanism proven but no in-repo caller currently triggers it.
 | ID | Sev | Location | Claim | Status |
 |---|---|---|---|---|
 | B-066 | 🟥 | main_function.py:819 | `num_gpus` unbound after failed GPU probe → `parallel=True` (the default) always crashes; bare `from utils import cp` makes the probe fail on every normal install | run |
-| B-067 | 🟥 | main_function.py:1536 | unconditional `import cupy` bypasses shim → serial CPU runs die after the middle block | read |
+| B-067 (RESOLVED → 869775b) | 🟥 | main_function.py:1536 | unconditional `import cupy` bypasses shim → serial CPU runs die after the middle block | read |
 | B-068 | 🟥 | main_function.py:1108,1326 | z-slice list built from `SIZE[2]` (=C) not `SIZE[1]` (=Z) → raw volumes read with C planes (downsample utilities) | read |
 | B-069 | 🟥 | pipeline_vmsr.py:22 | `referece_chunk` kwarg typo → TypeError before any work | run |
 | B-070 (RESOLVED → 521cf33) | 🟥 | registration.py:328 | 3D warm-start motion re-ingested transposed; imresize-stretched AND wrong SZ/dim scale divisors → warm start wrong in geometry and magnitude every batch after the first (empirically quantified: corr 0.50, divisors 0.33x/3.0x) — severity raised from 🟧 on fix-time re-verification | run |
@@ -104,7 +104,7 @@ mechanism proven but no in-repo caller currently triggers it.
 | ID | Sev | Location | Claim | Status |
 |---|---|---|---|---|
 | B-089 | 🟥 | :2063 | `neiDiff[:,:,2] *= zRatio_hr` scales z-slice 2 (all components) instead of z-component; IndexError if nz≤2; in-loop vs returned error use different metrics | read `[gpu]` |
-| B-034 | 🟧 | :484,575 | module-level `cp.RawKernel` → unimportable under numpy fallback; kills all CPU consumers (exact traceback reproduced) | run |
+| B-034 (RESOLVED → 555f8ec) | 🟧 | :484,575 | module-level `cp.RawKernel` → unimportable under numpy fallback; kills all CPU consumers (exact traceback reproduced) | run |
 | B-090 | 🟧 | :1342,1430 | `_make_ball` uses reciprocal of the module's zRatio convention → trap-mask ball 11 slices where 1 intended (and collapses at coarse layers — hits current zRatio_HR=1 runs) | read `[gpu]` |
 | B-091 | 🟨 | :2192 | `option["tol"]` ignored whenever `wrong_region_enable=True`; actual victim test_F260517_v2 frames>75 run 1e-3 vs configured 1e-6 | read |
 | B-092 | 🟨 | :2296 | "highresidual" mode excludes most-IMPROVED voxels, keeps never-improved — inverts name, docstring, and detection criterion | read |
