@@ -193,11 +193,22 @@ def test_b019_closes_exactly_gaps_up_to_close_gap_frames():
 
 
 def test_b019_border_runs_are_not_eroded():
-    """Activity touching t=0 and t=T-1 survives closing (binary_closing would erode it). Regression for B-019."""
+    """Border-touching activity survives AND a closeable gap still closes.
+
+    Both halves are needed: asserting only that t=0/t=T-1 survive would also pass
+    on code that does no closing at all (the pre-fix CPU path), so the trace also
+    contains a gap of exactly n that MUST close. Regression for B-019 (erosion)
+    and B-017 (CPU path did not close).
+    """
     for n in (1, 2, 3, 5):
-        pattern = [1, 1, 1, 1] + [0] * 12 + [1, 1, 1, 1]
+        # run at t=0 | closeable gap of n | run | wide gap (stays open) | run at t=T-1
+        pattern = [1, 1, 1, 1] + [0] * n + [1, 1] + [0] * 12 + [1, 1, 1, 1]
+        T = len(pattern)
         units = _run_units(pattern, n)
-        assert _spans(units) == [(0, 3), (16, 19)], f"n={n}: {_spans(units)}"
+        spans = _spans(units)
+        assert spans == [(0, 5 + n), (18 + n, T - 1)], f"n={n}: {spans}"
+        assert spans[0][0] == 0, f"n={n}: activity at t=0 was eroded"
+        assert spans[-1][1] == T - 1, f"n={n}: activity at t=T-1 was eroded"
 
 
 def test_b017_close_gap_frames_zero_is_a_strict_noop():
