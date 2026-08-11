@@ -303,8 +303,12 @@ def canny_edge_map(frame, sigma=1.0, low_threshold=0.05, high_threshold=0.15, ep
     gy = ndi.sobel(smoothed, axis=-2, mode="nearest")  # y gradient
 
     grad_mag = np.sqrt(gx**2 + gy**2 + eps)
+    # Edge orientation is periodic in 180 deg, not symmetric about 0: a gradient
+    # and its reverse describe the same edge and must land in the same NMS bin.
+    # abs() reflects instead of wrapping, sending angles in (-157.5,-112.5) U
+    # (-67.5,-22.5) to the PERPENDICULAR diagonal's neighbours.
     grad_dir = np.arctan2(gy, gx) * (180 / np.pi)
-    grad_dir = np.abs(grad_dir)
+    grad_dir = np.mod(grad_dir, 180.0)  # -> [0,180); mod, not abs
 
     H, W = frame.shape
     suppressed = np.zeros((H, W), dtype=np.float32)
