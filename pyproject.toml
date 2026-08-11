@@ -26,6 +26,7 @@ gpu = ["cupy"]
 dev = [
     "pytest>=7",
     "pytest-cov",
+    "imagecodecs",  # tifffile LZW encoding (exercised by utils/converters.py + its tests)
     "ruff>=0.6",
     "black>=24",
     "mypy>=1.10",

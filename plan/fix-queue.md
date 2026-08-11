@@ -24,7 +24,7 @@ unchanged in 20/20 trials — effectively only the broken small-window paths
 change. Verified: T=1/2/3 now finite, planted-cluster selection still exact,
 suite green. **Committed 2026-08-11; also resolves B-077's T=1 NaN path.**
 
-### B-076 — backward reference seed under-filled (main_function.py:780)
+### B-076 · [#11](https://github.com/vruetten/wholistic_registration/issues/11) — backward reference seed under-filled (main_function.py:780)
 While registering the middle block in batches, the pipeline saves the first
 `reference_chunk` registered frames as the seed reference for the backward
 pass (`head_mem`) and the last ones for the forward pass (`tail_mem`).
@@ -37,7 +37,7 @@ silently. **Fix:** remove the batch-0 gate so the buffer fills until it holds
 no-op whenever `reference_chunk ≤ batch_size` (most configs); f2013-style
 configs get the reference window they asked for.
 
-### B-018 — the whole-body-motion artifact filter never fires (motion_correlation_pattern.py:1407)
+### B-018 · [#12](https://github.com/vruetten/wholistic_registration/issues/12) — the whole-body-motion artifact filter never fires (motion_correlation_pattern.py:1407)
 The filter's documented job is to discard episodes that are "just the whole
 sample moving together". It should compare each episode's mean patch motion
 with the global (whole-body) motion — correlation ≈ 1 ⇒ artifact ⇒ drop. The
@@ -69,7 +69,7 @@ new outputs. **Committed 2026-08-11 after fresh re-verification: unfixed warm
 start corr 0.50 (x-comp) with wrong 0.33x/3.0x magnitude divisors; fixed
 round-trip bit-exact.**
 
-### B-071 — the dataset's real zRatio never reaches the algorithm (registration.py:262)
+### B-071 · [#13](https://github.com/vruetten/wholistic_registration/issues/13) — the dataset's real zRatio never reaches the algorithm (registration.py:262)
 `DefineParams` reads the true z-anisotropy into `config["MetaData"]["zRatio"]`,
 but nothing copies it into the `option` dict the flow solver reads — so every
 pipeline 3D run has used the hardcoded default **27.693** regardless of
@@ -90,7 +90,7 @@ verified: dim artifact 0.00→1.00 caught, single-artifact cases unchanged,
 clean-data masks measured IDENTICAL post-morphology (better than the
 'slight change' predicted).**
 
-### B-075 — one frame registered twice at the middle/forward seam (main_function.py:649/855/1437)
+### B-075 · [#14](https://github.com/vruetten/wholistic_registration/issues/14) — one frame registered twice at the middle/forward seam (main_function.py:649/855/1437)
 The middle block registers frames `mid_start..mid_end` **inclusive**; the
 forward pass then starts at `mid_end` — so that one frame is registered twice
 and its output overwritten with a different reference (and its own converged
@@ -99,7 +99,7 @@ forward pass at `mid_end + 1` (keep the middle-block result), or make the
 middle block exclusive. Small, but changes which reference produced one output
 frame per run. Backward seam verified clean.
 
-### B-058 — canny edge-map suppresses against the wrong diagonal (preprocess.py:307)
+### B-058 · [#15](https://github.com/vruetten/wholistic_registration/issues/15) — canny edge-map suppresses against the wrong diagonal (preprocess.py:307)
 Non-maximum suppression folds the gradient angle with `abs()` instead of
 mod-180°, so angles in (−157.5°,−112.5°)∪(−67.5°,−22.5°) are compared against
 the perpendicular diagonal — measured ~15% differing edge pixels on curved
@@ -107,7 +107,7 @@ edges (under-suppression: thicker/spurious edges). **Fix:** fold with
 `angle[angle<0] += 180`. Strict-xfail test pins it. **Impact:** edge maps
 change on diagonal/curved structure.
 
-### B-049 — event detection's `mad_k` knob is inert on sparse traces (motion_correlation_pattern.py:5001)
+### B-049 · [#16](https://github.com/vruetten/wholistic_registration/issues/16) — event detection's `mad_k` knob is inert on sparse traces (motion_correlation_pattern.py:5001)
 Class activation traces are mostly exact zeros, so median=0 and MAD=0: the
 threshold collapses to ~1e-12 and *any* nonzero frame counts as an event —
 mad_k=3 and mad_k=1000 give identical output (measured). The sibling function
@@ -119,7 +119,7 @@ mad_k on exactly the traces the caller produces.
 
 ## 3 · Virginia's design decision
 
-### B-063 — `maximum` vs `minimum` in structural_difference_map (reliableAnalysis.py:447)
+### B-063 · [#17](https://github.com/vruetten/wholistic_registration/issues/17) — `maximum` vs `minimum` in structural_difference_map (reliableAnalysis.py:447)
 The comment block above the line documents *why minimum is required* ("only
 trust difference where BOTH images have structure; maximum flags background →
 false positives"), and your commit `b17778d`'s message says "set back to
