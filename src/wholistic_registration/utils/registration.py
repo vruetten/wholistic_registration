@@ -278,6 +278,11 @@ def wbi_registration_3d(
     option["iter"] = pyramid["iter"]
     option["movRange"] = 5.0
     option["tol"] = pyramid["tolerance"]
+    # getMotion scales its z gradients / z smoothness by option["zRatio"]; only the
+    # config carries the ratio measured from the acquisition (DefineParams writes it
+    # from the ND2 metadata), so without this the solver silently used the module
+    # default in utils/__init__.py for every dataset.
+    option["zRatio"] = config["MetaData"].get("zRatio", option["zRatio"])
     smoothPenalty_raw = pyramid["smoothPenalty"]
 
     # get smoothPenalty
