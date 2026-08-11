@@ -1354,6 +1354,12 @@ def get_wrong_regions(
     return region_coor, connected_components
 
 
+# Upper bound on the z half-extent of a structuring element. radius_z scales as
+# 1/z_ratio, so a degenerate ratio would otherwise allocate an unbounded element.
+# 64 covers every in-repo configuration (worst realistic case is 32).
+_MAX_BALL_RADIUS_Z = 64
+
+
 def _make_ball(radius_xy, z_ratio):
     """
     Small anisotropic 3D structuring element, isotropic in physical space.
@@ -1368,11 +1374,18 @@ def _make_ball(radius_xy, z_ratio):
     zRatio_HR / 2**layer) *grows* it.
     """
     radius_xy = int(max(1, radius_xy))
-    z_ratio = max(float(z_ratio), 1e-6)
+    z_ratio = float(z_ratio)
+    if not np.isfinite(z_ratio) or z_ratio <= 0:
+        raise ValueError(
+            f"_make_ball: z_ratio must be a positive, finite physical-units-per-z-index "
+            f"ratio, got {z_ratio!r}."
+        )
 
-    # ceil, not round/floor: the index box must contain the whole physical ball
-    # even when radius_xy / z_ratio lands just under an integer numerically.
-    radius_z = int(max(1, np.ceil(radius_xy / z_ratio)))
+    # ceil, not round/floor: over-covering costs one all-False plane (inert for
+    # binary morphology), under-covering would clip the physical ball.
+    # Capped because radius_z grows as 1/z_ratio: without it a near-zero ratio
+    # would allocate a multi-million-voxel element and a dilation that never returns.
+    radius_z = int(max(1, min(np.ceil(radius_xy / z_ratio), _MAX_BALL_RADIUS_Z)))
 
     xs = cp.arange(-radius_xy, radius_xy + 1, dtype=cp.float32)
     ys = cp.arange(-radius_xy, radius_xy + 1, dtype=cp.float32)
