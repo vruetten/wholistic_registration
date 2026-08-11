@@ -761,6 +761,68 @@ def motions_obtain(motion, mask, patch_size, return_abs=False):
     return patch_delta.astype(np.float32), mask_patched.astype(bool)
 
 
+def _resolve_use_gpu(use_gpu, func_name):
+    """
+    Resolve a ``use_gpu`` argument to a bool.
+
+    ``"auto"`` follows CuPy availability. An explicit ``True`` on a machine
+    without a working CuPy import is an error here rather than an opaque
+    ``AttributeError: 'NoneType' object has no attribute 'asarray'`` further down.
+    """
+    if isinstance(use_gpu, str):
+        if use_gpu != "auto":
+            raise ValueError(
+                f"{func_name}: use_gpu must be True, False or 'auto', got {use_gpu!r}."
+            )
+        return HAS_CUPY
+
+    if bool(use_gpu) and not HAS_CUPY:
+        raise RuntimeError(
+            f"{func_name}: use_gpu=True was requested but CuPy is unavailable "
+            "(import of `cupy` / `cupyx.scipy.ndimage` failed). Install the GPU "
+            'extra (`pip install -e ".[gpu]"`) or pass use_gpu=False / use_gpu="auto".'
+        )
+    return bool(use_gpu)
+
+
+def _close_temporal_gaps(active, close_gap_frames, use_gpu):
+    """
+    Merge active runs separated by temporal gaps of at most ``close_gap_frames``.
+
+    Shared by the GPU and CPU paths of :func:`getMotionUnit` so both backends
+    produce identical active masks.
+
+    Two non-obvious details:
+
+    - a 1-D closing structure of length ``s`` bridges gaps of at most ``s - 1``
+      frames, so the structure has to be ``close_gap_frames + 1`` long;
+    - ``binary_closing`` treats outside-the-array as inactive, so runs touching
+      t=0 / t=T-1 get eroded. Replicating the edge frames before closing and
+      cropping afterwards leaves those runs intact.
+
+    Parameters
+    ----------
+    active : (T, X, Y) bool array (numpy or cupy, matching ``use_gpu``)
+    close_gap_frames : int or None
+        Gaps strictly wider than this are left open. <= 0 (or None) is a no-op.
+    """
+    if close_gap_frames is None:
+        return active
+    n = int(close_gap_frames)
+    if n <= 0:
+        return active
+
+    xp, xndi = (cp, cupy_ndi) if use_gpu else (np, ndi)
+
+    struct_len = n + 1
+    pad = struct_len
+    T = active.shape[0]
+    padded = xp.pad(active, ((pad, pad), (0, 0), (0, 0)), mode="edge")
+    structure = xp.ones((struct_len, 1, 1), dtype=bool)
+    closed = xndi.binary_closing(padded, structure=structure)
+    return closed[pad:pad + T]
+
+
 def estimate_rest_state_motion(
     motionMag_patched,
     window_size_t=21,
@@ -789,7 +851,7 @@ def estimate_rest_state_motion(
         when use_abs_dev=True, so abs_dev = |motionMag - median_local| can be
         compared against restMotion instead of raw motionMag).
     """
-    use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
+    use_gpu = _resolve_use_gpu(use_gpu, "estimate_rest_state_motion")
 
     motionMag_np = np.asarray(motionMag_patched, dtype=np.float32)
     T, X, Y = motionMag_np.shape
@@ -868,9 +930,12 @@ def getMotionUnit(
     ----------
     close_gap_frames : int
         If > 0, apply temporal binary closing to the active mask before
-        start/end detection. This merges nearby active intervals separated
-        by gaps <= close_gap_frames, dramatically reducing CPU loop time
-        when using noisy signals like cumulative displacement.
+        start/end detection. This merges active intervals separated by gaps
+        of at most close_gap_frames frames (gaps of close_gap_frames + 1 or
+        more are left open), dramatically reducing CPU loop time when using
+        noisy signals like cumulative displacement. Applied identically on
+        the GPU and CPU paths, and activity touching t=0 / t=T-1 is preserved
+        rather than eroded. 0 (the default) is a strict no-op.
     use_abs_dev : bool
         If True (default), the active condition is:
             |motionMag - median_local| > restMotion
@@ -888,7 +953,7 @@ def getMotionUnit(
         Spatial window for median_local computation (only used when
         use_abs_dev=True and median_local is not provided).
     """
-    use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
+    use_gpu = _resolve_use_gpu(use_gpu, "getMotionUnit")
 
     motion_np = np.asarray(motion_patched, dtype=np.float32)
     motionMag_np = np.asarray(motionMag_patched, dtype=np.float32)
@@ -917,10 +982,7 @@ def getMotionUnit(
             active = motionMag_gpu > rest_gpu  # (T, X, Y)
 
         # Merge nearby active gaps on GPU to reduce CPU loop iterations
-        if close_gap_frames is not None and close_gap_frames > 0:
-            import cupy as _cp
-            structure = _cp.ones((int(close_gap_frames) + 2, 1, 1), dtype=bool)
-            active = cupy_ndi.binary_closing(active, structure=structure)
+        active = _close_temporal_gaps(active, close_gap_frames, use_gpu=True)
 
         prev_active = cp.zeros_like(active)
         prev_active[1:] = active[:-1]
@@ -1026,6 +1088,8 @@ def getMotionUnit(
     else:
         active = motionMag_np > rest_np
 
+    active = _close_temporal_gaps(active, close_gap_frames, use_gpu=False)
+
     units_map = [[[] for _ in range(Y)] for _ in range(X)]
     active_mask = np.zeros((T, X, Y), dtype=bool)
 
@@ -1079,7 +1143,7 @@ def filterMotionUnits(
     """
     Remove isolated MotionUnits using local spatiotemporal active support.
     """
-    use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
+    use_gpu = _resolve_use_gpu(use_gpu, "filterMotionUnits")
 
     active_np = np.asarray(active_mask, dtype=np.float32)
 
