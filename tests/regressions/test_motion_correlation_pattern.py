@@ -211,12 +211,59 @@ def test_b019_border_runs_are_not_eroded():
         assert spans[-1][1] == T - 1, f"n={n}: activity at t=T-1 was eroded"
 
 
+def _raw_runs(pattern):
+    """Independent oracle: the runs of a thresholded trace, with NO gap closing."""
+    spans, t = [], 0
+    pattern = list(pattern)
+    while t < len(pattern):
+        if pattern[t]:
+            s = t
+            while t + 1 < len(pattern) and pattern[t + 1]:
+                t += 1
+            spans.append((s, t))
+        t += 1
+    return spans
+
+
 def test_b017_close_gap_frames_zero_is_a_strict_noop():
-    """close_gap_frames=0 (the default) leaves the mask untouched — protects every existing config. Regression for B-017."""
+    """close_gap_frames=0 (the default) leaves the mask untouched — protects every existing config.
+
+    Asserted against an INDEPENDENT oracle (the raw thresholded runs), not against
+    a sibling call with a different argument: comparing 0 against None would be
+    satisfied by code that closes gaps in *both* cases. Regression for B-017.
+    """
     rng = np.random.default_rng(0)
     for _ in range(20):
         pattern = (rng.random(30) > 0.5).astype(np.float32)
-        assert _spans(_run_units(pattern, 0)) == _spans(_run_units(pattern, None))
+        expected = _raw_runs(pattern)
+        assert _spans(_run_units(pattern, 0)) == expected
+        assert _spans(_run_units(pattern, None)) == expected
+
+
+def test_b017_gpu_branch_also_closes_gaps():
+    """Both backends route through the shared closing helper — the GPU call site is not silently dropped.
+
+    No test can execute the GPU branch on a CPU host, so removing its
+    `_close_temporal_gaps(...)` call would otherwise leave the whole suite green
+    while reintroducing B-017 on the path that actually runs in production.
+    This pins the structure instead. Regression for B-017.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(mcp.getMotionUnit)))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_close_temporal_gaps"
+    ]
+    use_gpu_args = sorted(
+        ast.unparse(kw.value) for c in calls for kw in c.keywords if kw.arg == "use_gpu"
+    )
+    assert use_gpu_args == ["False", "True"], (
+        f"expected one closing call per backend, got {use_gpu_args}"
+    )
 
 
 def test_b020_explicit_use_gpu_without_cupy_raises_clearly():
