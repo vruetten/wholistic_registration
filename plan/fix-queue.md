@@ -80,14 +80,15 @@ given one — it's just never given yours. **Fix:** one line in
 dataset whose true ratio ≠ 27.693 — that's the point, but past/future outputs
 won't be comparable. Sanity-check the config value on a real run first.
 
-### M-C4 — getMask misses dim artifacts when a bright one coexists (mask.py:83)
+### ~~M-C4 — getMask misses dim artifacts when a bright one coexists~~ **RESOLVED → 3a3bb10**
 Outlier masking thresholds on |z-score| with a global mean/std — but the std
 is computed *including* the outliers. A large bright artifact inflates σ
 (measured 10 → 1013), so a coexisting dim artifact sits at |z|=1.16 and is
 missed entirely. **Fix:** use the robust (percentile-clipped) mean/std that
-already exists in `preprocess.robust_mean_std`. **Impact:** masks change
-slightly on all datasets (robust σ ≈ classic σ on clean data), meaningfully on
-multi-artifact ones.
+already exists in `preprocess.robust_mean_std`. **Committed 2026-08-11 —
+verified: dim artifact 0.00→1.00 caught, single-artifact cases unchanged,
+clean-data masks measured IDENTICAL post-morphology (better than the
+'slight change' predicted).**
 
 ### B-075 — one frame registered twice at the middle/forward seam (main_function.py:649/855/1437)
 The middle block registers frames `mid_start..mid_end` **inclusive**; the
