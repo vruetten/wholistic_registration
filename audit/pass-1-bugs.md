@@ -184,9 +184,16 @@ mechanism proven but no in-repo caller currently triggers it.
 | B-063 | 🟨 | reliableAnalysis.py:447 | maximum-vs-minimum unresolved: commit b17778d's message says "set back to minimum" but the diff flips TO maximum; `# minimum?...` left in code | read |
 | B-064 | 🟨 | reliableAnalysis.py:229 | debug branch `.get()` on numpy fallback → AttributeError | run |
 | B-065 | 🟦 | visualization.py:57 | threshold param: identical if/else branches, dead parameter | read |
-| B-115 | 🟧 | preprocess.py:359-361 | Yunfeng_edge_map at DEFAULT params detects nothing real: unclamped variance + division by `std==0` means the only pixels that ever fire are float-residue/0 = `±inf` | run |
+| B-115 | 🟨 | preprocess.py (canny NMS) | diagonal neighbour pairs swapped relative to the array convention — **found by Cursor Bugbot on PR #24**, filed as issue [#25](https://github.com/vruetten/wholistic_registration/issues/25) | read |
+| B-116 | 🟨 | reliableAnalysis.py:447 | structural_difference_map switches its scale basis when the reliable set is small — **found by Cursor Bugbot on PR #22**, filed as issue [#26](https://github.com/vruetten/wholistic_registration/issues/26) | read |
+| B-117 | 🟧 | preprocess.py:359-361 | Yunfeng_edge_map at DEFAULT params detects nothing real: unclamped variance + division by `std==0` means the only pixels that ever fire are float-residue/0 = `±inf` | run |
 
-#### B-115 — `Yunfeng_edge_map` defaults are inert, and its only detections are division-by-zero artifacts
+> **ID allocation.** B-115 and B-116 were allocated to Bugbot findings directly
+> on GitHub and never written back here, so a later finding was briefly filed as
+> B-115 too. **Next free ID: B-118.** Before allocating, check GitHub as well as
+> this file: `gh issue list --state all --limit 100 --json title`.
+
+#### B-117 — `Yunfeng_edge_map` defaults are inert, and its only detections are division-by-zero artifacts
 
 Found while hardening the B-055 regression test (which had only ever asserted
 that the function *runs*). Distinct from B-055: that was the `NameError`, this
@@ -321,7 +328,7 @@ Coverage gap **`margin_z` in the B-090 fix** — closed on `fix/b090-make-ball-z
 confirming the gap had been total.
 
 Two defects in the *implementation* were surfaced by this hardening rather than
-absorbed into the tests: **B-115** (`Yunfeng_edge_map` defaults inert +
+absorbed into the tests: **B-117** (`Yunfeng_edge_map` defaults inert +
 divide-by-zero, filed above) and a figure leak in the B-056 test itself (a
 stubbed `plt.close` silently neutered the test's own cleanup — fixed with an
 explicit `monkeypatch.undo()`).

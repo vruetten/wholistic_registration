@@ -65,7 +65,7 @@ def test_b055_yunfeng_edge_map_runs():
     sigma=4/outcoef=3 this function returns an all-zero map for every smooth
     input tried, because max finite |Norm| is 0.775 against a threshold of 3.
     Its only non-empty output comes from dividing a float residue by std==0.
-    Filed as B-115; the all-zero assertion below PINS THAT KNOWN-SUSPECT
+    Filed as B-117; the all-zero assertion below PINS THAT KNOWN-SUSPECT
     BEHAVIOUR so a fix has to come past this test, and is not evidence the
     defaults work.
     """
@@ -79,10 +79,10 @@ def test_b055_yunfeng_edge_map_runs():
     assert set(np.unique(edges)).issubset({0.0, 1.0})
 
     # The two assertions above are the original smoke check and are satisfied by
-    # an all-zero map -- which is what the defaults return (B-115).  Pinned, not
-    # endorsed: when B-115 is fixed this line is expected to fail and should be
+    # an all-zero map -- which is what the defaults return (B-117).  Pinned, not
+    # endorsed: when B-117 is fixed this line is expected to fail and should be
     # updated to the corrected behaviour, not deleted.
-    assert float(edges.sum()) == 0.0, "B-115 default-parameter behaviour changed; re-derive"
+    assert float(edges.sum()) == 0.0, "B-117 default-parameter behaviour changed; re-derive"
 
     # Geometric oracle.  Input is the 1-px-wide boundary ring of a disk of
     # radius R.  With the pre-smoothing disabled (sigma=0) the statistic is
