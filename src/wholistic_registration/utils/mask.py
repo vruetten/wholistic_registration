@@ -2,6 +2,8 @@ import numpy as np
 from skimage.measure import label, regionprops
 from skimage.morphology import binary_dilation, binary_opening
 
+from .preprocess import robust_mean_std
+
 
 def bwareafilt3_wei(vol, size_range):
     """
@@ -79,9 +81,12 @@ def getMask(dat_mov, thres_factor):
     # Convert input data to float32 for consistent numerical operations
     dat_mov = dat_mov.astype(np.float32)
 
-    # Calculate statistical measures of the entire volume
-    mu = np.mean(dat_mov)  # Mean intensity value
-    sigma = np.std(dat_mov)  # Standard deviation of intensity values
+    # Robust (top-percentile-clipped) statistics instead of plain mean/std:
+    # the outliers this mask exists to catch would otherwise be part of the
+    # estimate itself — a single large bright artifact inflates sigma by
+    # orders of magnitude (measured: 10 -> 1013), leaving any coexisting dim
+    # artifact at |z| ~ 1 and invisible to every reasonable thres_factor.
+    mu, sigma = robust_mean_std(dat_mov)
 
     # Normalize data by converting to z-scores and taking absolute values
     # This measures how many standard deviations each voxel is from the mean
