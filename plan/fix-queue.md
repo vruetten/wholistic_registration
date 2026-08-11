@@ -13,7 +13,7 @@ repro, and committed one bug per commit only on her word.
 
 ## 1 · Awaiting Virginia's verdict now
 
-### M-C1 — reference scoring off-by-one *(APPLIED to working tree, verified, NOT yet committed)*
+### ~~M-C1 — reference scoring off-by-one~~ **RESOLVED** (committed, see ledger)
 `pick_initial_reference` averages the top correlations excluding self, but the
 slice `1:ncorr` drops one column: it averages ncorr−1 values, and for tiny
 reference blocks it degenerates — a 2-frame block produces all-NaN scores and
@@ -22,7 +22,7 @@ The applied fix uses `1:ncorr+1` and adds a guard that averages everything for
 degenerate blocks. **Impact:** on healthy windows the selected frame set was
 unchanged in 20/20 trials — effectively only the broken small-window paths
 change. Verified: T=1/2/3 now finite, planted-cluster selection still exact,
-suite green. *Say the word and it gets committed.*
+suite green. **Committed 2026-08-11; also resolves B-077's T=1 NaN path.**
 
 ### B-076 — backward reference seed under-filled (main_function.py:780)
 While registering the middle block in batches, the pipeline saves the first

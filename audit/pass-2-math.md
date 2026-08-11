@@ -42,7 +42,7 @@ overwhelmingly clean:
 
 | ID | Sev | Location | Claim | Status |
 |---|---|---|---|---|
-| M-C1 | 🟨 | utils/reference.py:84 | `CCsort[:, 1:ncorr]` averages ncorr−1 values (off-by-one): T=2 → all-NaN scores → silently selects frame 0; T=3 → single-value "average". At healthy T the selected frame **set** never changed in 20 trials (imax moved in 3/20). Fix: `1:ncorr+1` + guard T≥3. | run |
+| M-C1 (RESOLVED → c07112f) | 🟨 | utils/reference.py:84 | `CCsort[:, 1:ncorr]` averages ncorr−1 values (off-by-one): T=2 → all-NaN scores → silently selects frame 0; T=3 → single-value "average". At healthy T the selected frame **set** never changed in 20 trials (imax moved in 3/20). Fix: `1:ncorr+1` + guard T≥3. | run |
 | M-C4 | 🟨 | utils/mask.py:83 | getMask uses non-robust global mean/std: a bright artifact inflates σ (10→1013) so a coexisting dim artifact (z=1.16) is missed entirely; `robust_mean_std` already exists in preprocess.py | run |
 | M-B3 | 🟨 (latent) | calFlow3d_Wei_v1.py:822,948 | getMapping's z phase-update factor is the reciprocal of its init factor → returned z-motion scaled by (zRatio/zRatio_hr)² (measured 1 → 4.000 at zRatio=2); phase converges anyway (GN absorbs it) but motion output / movRange / penalty mix units. Newer cfcr.py copy removed exactly this factor. Dead code today (B-094). | run |
 | M-C2 | 🟨 (latent) | calculate.py:58 | `imfilter(output="valid")` broken 3 ways (size-1 kernel dim → empty output; 3D third axis never trimmed; even kernels over-trim). Zero callers — proper filing of Pass-1's refuted-as-unreachable B-099. | run |
