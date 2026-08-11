@@ -55,7 +55,7 @@ xfail test pins the bug and will flip when fixed.
 
 ## 2 · High-confidence next tranche (Claude recommends; results change by design)
 
-### B-070 — warm-start motion fed back transposed (registration.py:328 ↔ main_function.py:1644)
+### ~~B-070 — warm-start motion fed back transposed~~ **RESOLVED → 521cf33** (severity raised to 🟥 after re-verification)
 The 3D registration returns each motion field transposed to (Z,Y,X,3), but the
 next batch re-ingests `motion[-1]` into a slot expecting (X,Y,Z,3); `imresize`
 then silently stretches the garbled field into shape. Net effect: every batch
@@ -65,7 +65,9 @@ back at the hand-off (one line) — components don't need permuting (verified:
 component c ↔ axis c). **Impact:** warm starts become meaningful; likely
 faster convergence / better continuity between batches. Shape-level logic is
 verified; a full-pipeline GPU validation run is recommended before trusting
-new outputs.
+new outputs. **Committed 2026-08-11 after fresh re-verification: unfixed warm
+start corr 0.50 (x-comp) with wrong 0.33x/3.0x magnitude divisors; fixed
+round-trip bit-exact.**
 
 ### B-071 — the dataset's real zRatio never reaches the algorithm (registration.py:262)
 `DefineParams` reads the true z-anisotropy into `config["MetaData"]["zRatio"]`,

@@ -57,6 +57,7 @@ record; these IDs are now **RESOLVED**:
 | ID → commit | | | |
 |---|---|---|---|
 | B-001 → c81e861 | B-002 → 5b3c725 | B-009 → c33e6ce | B-012 → 83fd55b |
+| B-070 → 521cf33 (2026-08-11, 🟥) | M-C1 → c07112f (2026-08-11) | B-074 → e21e08f (2026-08-11) | |
 | B-026 → 8eab9cf | B-027 → 9b326e9 | B-028 → aba9ee0 | B-029 → 6725eb8 |
 | B-030 → 49cf6c7 | B-033 → bd1ee1a | B-037 → 5103565 | B-041 → 867e82c |
 | B-043 → 8bfd0e2 | B-044 → 603282b | B-054 → cbf274c | B-055 → 8f9e3d3 |
@@ -90,7 +91,7 @@ mechanism proven but no in-repo caller currently triggers it.
 | B-067 | 🟥 | main_function.py:1536 | unconditional `import cupy` bypasses shim → serial CPU runs die after the middle block | read |
 | B-068 | 🟥 | main_function.py:1108,1326 | z-slice list built from `SIZE[2]` (=C) not `SIZE[1]` (=Z) → raw volumes read with C planes (downsample utilities) | read |
 | B-069 | 🟥 | pipeline_vmsr.py:22 | `referece_chunk` kwarg typo → TypeError before any work | run |
-| B-070 | 🟧 | registration.py:328 | 3D warm-start motion re-ingested transposed; silently imresized → garbled init every batch after first | read `[gpu]` |
+| B-070 (RESOLVED → 521cf33) | 🟥 | registration.py:328 | 3D warm-start motion re-ingested transposed; imresize-stretched AND wrong SZ/dim scale divisors → warm start wrong in geometry and magnitude every batch after the first (empirically quantified: corr 0.50, divisors 0.33x/3.0x) — severity raised from 🟧 on fix-time re-verification | run |
 | B-071 | 🟧 | registration.py:262 | `option["zRatio"]` never set from config → hardcoded 27.693 for every pipeline 3D run | read |
 | B-073 | 🟧 | registration.py:170,321 | `dict["k":v, ...]` is class subscription → errors output is `GenericAlias` garbage, silently discarded | run |
 | B-074 | 🟨 | main_function.py:643-656 | mid window unclamped → negative wrap pulls end-frames into "middle", then IndexError (or silent duplicates with large stride) | run |
