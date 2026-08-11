@@ -1356,21 +1356,30 @@ def get_wrong_regions(
 
 def _make_ball(radius_xy, z_ratio):
     """
-    Small anisotropic 3D structuring element.
-    Distance:
-        d^2 = dx^2 + dy^2 + (dz / z_ratio)^2
+    Small anisotropic 3D structuring element, isotropic in physical space.
+
+    Convention (module-wide, see `zRatio_hr`): z_ratio is *physical units per
+    z index*, i.e. dz_phys = dz_idx * z_ratio, with one xy index = one physical
+    unit. So an index offset (dx, dy, dz) is at physical distance
+        d^2 = dx^2 + dy^2 + (dz * z_ratio)^2
+    and the ball of physical radius radius_xy reaches radius_xy / z_ratio
+    z indices. z_ratio > 1 (z coarser than xy) therefore *shrinks* the element
+    in z; z_ratio < 1 (as at coarse pyramid layers, where zRatio_hr =
+    zRatio_HR / 2**layer) *grows* it.
     """
     radius_xy = int(max(1, radius_xy))
     z_ratio = max(float(z_ratio), 1e-6)
 
-    radius_z = int(max(1, round(radius_xy * z_ratio)))
+    # ceil, not round/floor: the index box must contain the whole physical ball
+    # even when radius_xy / z_ratio lands just under an integer numerically.
+    radius_z = int(max(1, np.ceil(radius_xy / z_ratio)))
 
     xs = cp.arange(-radius_xy, radius_xy + 1, dtype=cp.float32)
     ys = cp.arange(-radius_xy, radius_xy + 1, dtype=cp.float32)
     zs = cp.arange(-radius_z, radius_z + 1, dtype=cp.float32)
 
     XX, YY, ZZ = cp.meshgrid(xs, ys, zs, indexing="ij")
-    dist2 = XX**2 + YY**2 + (ZZ / z_ratio) ** 2
+    dist2 = XX**2 + YY**2 + (ZZ * z_ratio) ** 2
     return (dist2 <= radius_xy**2 + 1e-6).astype(cp.bool_)
 
 
@@ -1451,7 +1460,9 @@ def build_reference_trap_mask_from_bad_moving_fast_roi(
     zmax = int(seed_z.max().item())
 
     margin_xy = int(max(1, expand_radius_xy + 2))
-    margin_z = int(max(1, round((expand_radius_xy + 2) * z_ratio_ref)))
+    # z_ratio_ref (= zRatio_hr) is physical units per z index, so the same
+    # physical margin is (expand_radius_xy + 2) / z_ratio_ref indices in z.
+    margin_z = int(max(1, np.ceil((expand_radius_xy + 2) / max(float(z_ratio_ref), 1e-6))))
 
     x0 = max(0, xmin - margin_xy)
     x1 = min(x_ref, xmax + margin_xy + 1)
