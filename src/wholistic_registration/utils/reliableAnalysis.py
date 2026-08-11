@@ -447,10 +447,12 @@ def structural_difference_map(
     R_ref = reliability_map_v2(I_ref, sigma=sigma_reliability)
     R_mov = reliability_map_v2(I_mov, sigma=sigma_reliability)
 
-    # Use minimum — only trust difference where BOTH images have structure.
-    # np.maximum would flag background regions where only one image has structure,
-    # producing false positives from intensity differences unrelated to misregistration.
-    R = np.maximum(R_ref, R_mov)  # minimum?...
+    # Minimum — only trust the difference where BOTH images have structure.
+    # With maximum, a region where only one image has structure keeps a high
+    # reliability, so a pure appearance/intensity difference there is scored as
+    # misalignment (false positive). The cost is that structure which genuinely
+    # appears or disappears between the two volumes is down-weighted.
+    R = np.minimum(R_ref, R_mov)
     I_mov_corr = photometric_align_hist(I_ref, I_mov)
     if len(I_ref.shape) == 2:
         mu_ref = gaussian_filter(I_ref, sigma_structure)
