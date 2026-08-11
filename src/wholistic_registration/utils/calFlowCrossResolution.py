@@ -2234,6 +2234,7 @@ def correct_wrong_regions_one_layer(
     smoothPenaltySum,
     zRatio,
     zRatio_hr,
+    tol=1e-3,
     error_metric="mse",
     mad_threshold=3.0,
     min_component_size=2,
@@ -2278,6 +2279,7 @@ def correct_wrong_regions_one_layer(
         smoothPenaltySum=smoothPenaltySum,
         zRatio=zRatio,
         zRatio_hr=zRatio_hr,
+        tol=tol,
         verbose=verbose,
         layer=layer,
     )
@@ -2385,6 +2387,7 @@ def correct_wrong_regions_one_layer(
         smoothPenaltySum=smoothPenaltySum,
         zRatio=zRatio,
         zRatio_hr=zRatio_hr,
+        tol=tol,
         verbose=verbose,
         layer=layer,
     )
@@ -2410,6 +2413,7 @@ def correct_wrong_regions_one_layer(
         smoothPenaltySum=smoothPenaltySum,
         zRatio=zRatio,
         zRatio_hr=zRatio_hr,
+        tol=tol,
         verbose=verbose,
         layer=layer,
     )
@@ -2574,6 +2578,7 @@ def getMotion_v2(data_mov, data_ref, option, verbose=False):
                 smoothPenaltySum=smoothPenaltySum,
                 zRatio=zRatio,
                 zRatio_hr=zRatio_hr,
+                tol=tol,
                 error_metric=wrong_region_metric,
                 mad_threshold=wrong_region_mad_threshold,
                 min_component_size=wrong_region_min_component_size,
