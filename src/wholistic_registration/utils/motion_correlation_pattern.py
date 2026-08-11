@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import math
+import warnings
 from pathlib import Path
 from dataclasses import dataclass, field
 from collections import defaultdict
@@ -2378,6 +2379,12 @@ def _merge_or_discard_small_region_masks(
     region_masks: list of bool masks
     A: response_strength, (X, Y)
     B: response_field, (X, Y, 2)
+
+    NOTE (audit B-008): as wired up today this helper is a no-op. Its only caller,
+    `split_mode_to_regions`, has already dropped every mask with
+    area < min_region_area before calling it, so `small_ids` below is always empty
+    and the merge loop never runs. Kept as the implementation to re-enable if the
+    merge semantics are ever wanted; see the long note in `split_mode_to_regions`.
     """
     if len(region_masks) == 0:
         return []
@@ -2464,7 +2471,17 @@ def split_mode_to_regions(
         3. connected components are computed on the tolerant grouping mask
         4. final region masks only contain raw_support pixels
         5. small regions are directly discarded
+
+    Small fragments are ALWAYS discarded, for every split_mode.
+    `merge_small_regions=True` does not change that (audit B-008): it is accepted
+    for backwards compatibility, warns, and produces exactly the same regions as
+    `merge_small_regions=False`. `discard_region_area`, `merge_small_max_dist` and
+    `merge_small_vector_cos` are inert for the same reason. See the note in
+    section 2 below.
     """
+    # Recorded before the gap_tolerant_discard_small branch overwrites the local.
+    merge_small_regions_requested = bool(merge_small_regions)
+
     A = np.asarray(mode.response_strength, dtype=np.float32)
     B = np.asarray(mode.response_field, dtype=np.float32)
     h = np.asarray(mode.activation, dtype=np.float32)
@@ -2549,10 +2566,50 @@ def split_mode_to_regions(
         raise ValueError(f"Unknown split_mode: {split_mode}")
 
     # ------------------------------------------------------------
-    # 2. Optional old behavior: merge small regions
+    # 2. Small-fragment handling: discard only
     # ------------------------------------------------------------
-    # Current recommendation: keep merge_small_regions=False.
-    # If you explicitly set merge_small_regions=True, this restores old behavior.
+    # audit B-008. `merge_small_regions=True` does NOT merge anything today.
+    # Every branch in section 1 has already dropped the components with
+    # area < min_region_area, so `_merge_or_discard_small_region_masks` only ever
+    # receives masks it classifies as large: its `small_ids` is empty by
+    # construction, its merge loop never runs, and it returns its input unchanged.
+    # `discard_region_area`, `merge_small_max_dist` and `merge_small_vector_cos`
+    # therefore have no effect on the output either.
+    #
+    # This is deliberately NOT "fixed" by letting sub-min_region_area components
+    # through to the helper. Doing that would change region membership, area and
+    # mean response vector on real data; discard-only is what the methods
+    # write-up documents ("small isolated fragments below a minimum area
+    # threshold are discarded directly"), it is what the default split_mode
+    # ("gap_tolerant_discard_small") hard-codes, and the merge path has never
+    # executed in this file's history. Re-enabling it is a method decision, and
+    # it would also need the `area < min_region_area` guard in section 3 relaxed,
+    # otherwise the helper's "all regions small -> keep the largest" fallback is
+    # discarded again immediately afterwards.
+    #
+    # What is fixed here is the silence: the request is warned about and the
+    # region metadata records the strategy that actually ran.
+    if merge_small_regions_requested:
+        if split_mode == "gap_tolerant_discard_small":
+            warnings.warn(
+                "split_mode='gap_tolerant_discard_small' ignores "
+                "merge_small_regions=True: small fragments are discarded while "
+                "splitting. Regions are identical to merge_small_regions=False.",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            warnings.warn(
+                "merge_small_regions=True has no effect (audit B-008): components "
+                "smaller than min_region_area are discarded before the merge step "
+                "runs, so no fragment is ever merged and discard_region_area / "
+                "merge_small_max_dist / merge_small_vector_cos are inert. Regions "
+                "are identical to merge_small_regions=False.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    # Kept as the seam to re-enable merging; provably a no-op, see above.
     if merge_small_regions and len(region_masks) > 0:
         region_masks = _merge_or_discard_small_region_masks(
             region_masks=region_masks,
@@ -2620,14 +2677,15 @@ def split_mode_to_regions(
                 "gap_dilation_iter": gap_dilation_iter,
                 "gap_close_iter": gap_close_iter,
                 "min_region_area": min_region_area,
+                # Inert (B-008); recorded only so the call is reproducible.
                 "discard_region_area": discard_region_area,
-                "merge_small_regions": merge_small_regions,
                 "merge_small_max_dist": merge_small_max_dist,
                 "merge_small_vector_cos": merge_small_vector_cos,
+                # What actually ran vs what the caller asked for (B-008).
+                "merge_small_regions": False,
+                "merge_small_regions_requested": merge_small_regions_requested,
                 "raw_area": area,
-                "small_region_strategy": (
-                    "discard" if not merge_small_regions else "merge_or_discard"
-                ),
+                "small_region_strategy": "discard",
                 "final_region_mask": "raw_support_only",
             },
         )
@@ -2672,6 +2730,8 @@ def split_episode_modes_to_regions(
         - use gap-tolerant connectivity to avoid over-fragmentation;
         - directly discard small regions;
         - do not merge small fragments into nearby regions.
+
+    `merge_small_regions=True` is inert here too and only warns (audit B-008).
     """
     regions_all = []
     region_id = 0
@@ -2728,8 +2788,8 @@ def getMotionRegions(
     min_region_area=20,
     discard_region_area=4,
 
-    # Current recommendation: do not merge small regions.
-    # Small fragments are more likely noise / episode extraction artifacts.
+    # Small fragments are more likely noise / episode extraction artifacts and
+    # are always discarded; setting this True only warns (audit B-008).
     merge_small_regions=False,
     merge_small_max_dist=4.0,
     merge_small_vector_cos=0.0,
