@@ -26,7 +26,7 @@ def test_b090_z_ratio_one_is_isotropic():
 
 @pytest.mark.parametrize(
     "z_ratio,expected_z_extent",
-    [(3.0, 1), (2.0, 1), (1.0, 5), (0.5, 9), (0.25, 17), (0.125, 33)],
+    [(3.0, 1), (2.0, 3), (1.0, 5), (0.5, 9), (0.25, 17), (0.125, 33)],
 )
 def test_b090_z_extent_follows_physical_reach(z_ratio, expected_z_extent):
     """The ball reaches radius_xy / z_ratio z-indices: coarser z (ratio>1) shrinks it, finer z (ratio<1) grows it. Regression for B-090."""
