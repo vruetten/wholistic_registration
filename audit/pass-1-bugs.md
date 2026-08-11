@@ -64,7 +64,7 @@ record; these IDs are now **RESOLVED**:
 | B-062 → c0d03ec | B-064 → fcbc933 | B-066 → f657d78 | B-068 → 98dea5b |
 | B-069 → 8893b4d | B-073 → 2910ffe | | |
 
-Deliberately NOT fixed in this batch (need a decision or GPU validation):
+Deliberately NOT fixed in this batch — now tracked with per-item explanations in [plan/fix-queue.md](../plan/fix-queue.md):
 - **Results-changing algorithmic fixes needing sign-off:** B-018 (artifact
   filter delta→abs), B-008 (merge semantics), B-063 (min vs max — Virginia's
   own unresolved flip-flop), B-058 (canny NMS fold), B-092 (highresidual
