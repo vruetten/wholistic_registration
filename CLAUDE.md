@@ -188,6 +188,87 @@ lands.
 
 ---
 
+## Test discipline
+
+A test that cannot fail is worse than no test: it converts "unverified" into
+"verified" without doing any work. This section exists because that happened
+here — an audit ran mutation testing over `tests/regressions/` and found tests
+that passed while the bug they named was fully reintroduced.
+
+### The falsification gate (mandatory)
+
+**A regression test is not finished until it has been shown to FAIL against the
+unfixed code.** Passing is half the evidence; failing-when-it-should is the
+other half.
+
+```bash
+# in a scratch copy, reverse-apply ONLY the fix under test
+git show <fix-sha> -- src/ | git apply -R
+<venv>/bin/python -m pytest tests/regressions/test_x.py::test_bNNN_slug -q   # MUST fail
+git checkout -- src/
+```
+
+Record the observed failure (the assertion text, not "it failed") in the commit
+message. If the test passes on the unfixed code it is **vacuous** — rewrite it
+or delete it, never ship it.
+
+### The dangerous moment: a test you just wrote fails
+
+This is where vacuity is manufactured. Editing a failing test until it goes
+green is how you end up asserting "the code does what the code does".
+
+- First establish **whether the test or the code is wrong**, from the spec or
+  from first principles — not by reading the code's actual output.
+- If the expected value changes, derive the new one **independently** (a
+  separate calculation that never calls the function under test) and say so.
+- Then **re-run the falsification gate**. An edited test has no credibility
+  until it has failed on the unfixed code again.
+
+### Assertion quality — ask "what would still pass?"
+
+Before accepting an assertion, name a broken implementation that satisfies it.
+If you can name one, the assertion is too weak. Known-bad patterns, all of
+which have been found in this repo:
+
+- **Value-blind**: asserting only shape/dtype/`isfinite`/"no exception". Would
+  it pass if the function returned zeros, `None`, or `[]`? (found: B-057, B-061)
+- **Upper-bound only**: `assert x.max() <= K` is satisfied by `x == 0`
+  (found: B-086, B-062). Bound two-sided, or assert the value.
+- **Self-comparison**: comparing the code to itself with different arguments
+  (`f(0) == f(None)`) never encodes "unchanged" — assert against an
+  **independent oracle** you wrote separately (found: `test_b017_..._noop`).
+- **Conditional assertions**: `assert` inside `if`/`for` that may not execute
+  passes vacuously when the loop is empty (found: B-087). Assert the guard
+  itself first.
+- **Substring/structural checks without semantics**: grepping source for a
+  token proves nothing about polarity or reachability — a guard inverted to
+  `if not X:` still contains `X` (found: `test_b067_..._guarded`). Use AST and
+  assert the meaning.
+
+### Structural tests need mutation, not falsification
+
+When a test asserts on source structure (AST, call sites) rather than
+behaviour, the fix-revert gate is often inconclusive. Instead **mutate the
+source into the plausible wrong version** — invert the guard, delete the call,
+swap the branch — and confirm the test fails. Quote the mutant in the commit.
+
+### Unreachable paths (GPU, cluster, real data)
+
+If a code path cannot execute in the test environment, say so explicitly and
+pin what you can (usually structure via AST). **Never describe an unexercised
+path as covered.** Here: nothing in `tests/regressions/` runs a CuPy path, so
+deleting a GPU-side call left the suite green — that gap is now pinned
+structurally and labelled as such.
+
+### Anchors must be labelled
+
+A test that legitimately passes both before and after a fix (asserting
+behaviour deliberately left unchanged) is a **no-regression anchor**. Say so in
+its docstring. An unlabelled anchor inflates the apparent regression count and
+is indistinguishable from a vacuous test.
+
+---
+
 ## When the session ends
 
 1. All in-session tasks are either `completed` or written down as concrete

@@ -219,6 +219,27 @@ pipeline scripts (2). Excluded per Pass-0 scope notes: `demos/`+src `tests/`
 script roots, `archive/`, `ImmuneCell.py` (D-001). GPU/cupy execution paths
 reviewed by reading only — every such finding tagged `[gpu-unverified]`.
 
+## Test-suite vacuity audit (2026-08-11)
+
+An independent auditor mutation-tested `tests/regressions/`. Result: **25/26
+falsifiable tests on main genuinely pin their fix** and all 5 strict-xfails
+fail for their documented mechanism — but three defects were found and fixed:
+
+| test | defect | mutant that beat it | fixed in |
+|---|---|---|---|
+| `test_b017_..._strict_noop` | **vacuous** — compared code to itself (`0` vs `None`) | make BOTH close 1-frame gaps → suite green | `f7e95ba` |
+| `test_b067_gpu_only_calls_are_guarded` | **near-vacuous** — substring grep, no polarity | invert both guards → suite green | `3a0a097` |
+| *(none)* — GPU branch untested | delete the GPU-side closing call → suite green | AST structural test added | `f7e95ba` |
+
+Still weak (assertions that pass on degenerate output — tracked, not yet fixed):
+B-061 (NaN count only), B-062 (upper-bound only, B-086 pattern), B-055 / B-054 /
+B-056 (smoke-only), B-043 (source grep, never calls the function), B-034
+kernel-sources (string containment), B-090 cap (upper-bound only). Coverage gap:
+**`margin_z` in the B-090 fix has no test at all** — highest-value missing test.
+
+Process changes to prevent recurrence: `CLAUDE.md` → "Test discipline"; the
+`/full-package-review` skill → `reference/regression-tests.md`.
+
 ## Open follow-ups (Pass 1 exit debt)
 
 1. **Regression tests not yet written.** The skill requires a failing test per
