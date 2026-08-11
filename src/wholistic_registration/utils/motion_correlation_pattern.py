@@ -930,12 +930,18 @@ def getMotionUnit(
     ----------
     close_gap_frames : int
         If > 0, apply temporal binary closing to the active mask before
-        start/end detection. This merges active intervals separated by gaps
-        of at most close_gap_frames frames (gaps of close_gap_frames + 1 or
-        more are left open), dramatically reducing CPU loop time when using
-        noisy signals like cumulative displacement. Applied identically on
-        the GPU and CPU paths, and activity touching t=0 / t=T-1 is preserved
-        rather than eroded. 0 (the default) is a strict no-op.
+        start/end detection, bridging gaps of at most close_gap_frames
+        frames. Dramatically reduces CPU loop time on noisy signals like
+        cumulative displacement. Applied identically on the GPU and CPU
+        paths, and activity touching t=0 / t=T-1 is preserved rather than
+        eroded. 0 (the default) is a strict no-op.
+
+        NOTE: this is the closing step's contract, not the function's.
+        The interval-extension step below independently merges intervals
+        separated by gaps of at most 2 * extend_radius, so the EFFECTIVE
+        end-to-end merge width is max(close_gap_frames, 2 * extend_radius).
+        At the default extend_radius=1, close_gap_frames of 1 or 2 therefore
+        make no difference to the emitted units.
     use_abs_dev : bool
         If True (default), the active condition is:
             |motionMag - median_local| > restMotion
