@@ -142,7 +142,7 @@ R6 cross-chunk: mid-file `import numpy as np` at 5249 + `_as_bool_mask_fallback`
 ## From R9 (calFlowCrossResolution.py 1311–2610)
 - B-089 🟥 cfcr.py:2063 — neiDiff[:,:,2] *= zRatio_hr scales z-SLICE index 2 (all components) instead of z-component everywhere (siblings use [...,2] at 2100/2132); IndexError if nz≤2; final recompute at 2169 applies no scaling (objective inconsistency). Confirms R8's cross-chunk flag.
 - B-090 🟧 cfcr.py:1342 — _make_ball uses reciprocal of module's zRatio convention (phys-per-index) → trap-mask ball anisotropic in wrong direction (±6 z-slices where 2 intended; collapses when zRatio_hr<1); margin at 1430 same.
-- B-091 🟨 cfcr.py:2192 — correct_wrong_regions_one_layer has no tol param → option["tol"] ignored whenever wrong_region_enable=True (default); run_F260517 sets 1e-6, gets 1e-3.
+- B-091 🟨 cfcr.py:2192 — correct_wrong_regions_one_layer has no tol param → option["tol"] ignored whenever wrong_region_enable=True (default); run_F260517 sets 1e-6, gets 1e-3.  **[SUPERSEDED — see verdict below: run_F260517 sets wrong_region_enable=False and was never a victim; the real victim is test_F260517_v2.py]**
 - B-092 🟨 cfcr.py:2296 — "highresidual" mode thresholds on error IMPROVEMENT (init−last) not residual → never-improved voxels (the actual bad ones) kept, well-corrected ones excluded.
 - B-093 🟦 cfcr.py:2038 — Xcp/Ycp/Zcp/phase_identity_cp computed per call, used only by commented-out code.
 

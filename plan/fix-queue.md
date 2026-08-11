@@ -165,7 +165,7 @@ comment). Changes the reliability weighting of difference maps.
   ball spans 21 z-slices where physics says 1 (GPU-measured). Fix is invert
   the factor; affects wrong-region reruns incl. current zRatio_HR=1 runs at
   coarse layers.
-- 📋 ISSUE-WORTHY · **B-091** 🟨 `option["tol"]` ignored whenever wrong-region correction is on
+- 🔀 PR OPEN · [#28](https://github.com/vruetten/wholistic_registration/pull/28) (issue [#27](https://github.com/vruetten/wholistic_registration/issues/27)) · **B-091** 🟨 `option["tol"]` ignored whenever wrong-region correction is on
   (default): plumb `tol` through `correct_wrong_regions_one_layer`.
 - 📋 ISSUE-WORTHY · **B-092** 🟨 "highresidual" mode excludes the most-*improved* voxels instead
   of the highest-residual ones — inverts name, docstring, and the detection
