@@ -80,8 +80,12 @@ def pick_initial_reference(
     # Step 5: pick best frame
     # -----------------------------
     ncorr = min(max_corr_frames, T - 1)
+    if ncorr < 1:
+        # degenerate block (T <= 1 or max_corr_frames == 0): average everything
+        return frames.mean(axis=0), cp.arange(T)
+    # mean of the top-ncorr correlations excluding self (column 0)
     CCsort = -cp.sort(-cc, axis=1)
-    bestCC = CCsort[:, 1:ncorr].mean(axis=1)
+    bestCC = CCsort[:, 1:ncorr + 1].mean(axis=1)
 
     imax = int(cp.argmax(bestCC).item())
     indsort = cp.argsort(-cc[imax])
