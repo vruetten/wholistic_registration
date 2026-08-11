@@ -858,7 +858,13 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
         process_directional_chunks(
             direction="forward",  # Process frames in normal order
             frame_list=process_frames,
-            start_frame=mid_end,  # Starting from the end of the middle chunk
+            # mid_end + 1, not mid_end: `frames_mid` above is INCLUSIVE of mid_end
+            # (range(mid_start, mid_end + 1)) so the middle block already registered
+            # that frame against the high-quality middle reference, while
+            # build_chunks forward covers range(start_frame, end_frame). Starting at
+            # mid_end would re-register it against the rolling window and overwrite
+            # the better result.
+            start_frame=mid_end + 1,  # Starting just after the end of the middle chunk
             end_frame=total_process_frames,  # Ending at the last frame of the dataset
             init_mem_windows=tail_mem,  # Initial membrane reference windows
             init_ca_windows=tail_ca,  # Initial calcium reference windows
@@ -923,7 +929,7 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
             kwargs=dict(
                 direction="forward",
                 frame_list=process_frames,
-                start_frame=mid_end,
+                start_frame=mid_end + 1,  # see the serial branch: frames_mid includes mid_end
                 end_frame=total_process_frames,
                 init_mem_windows=tail_mem,
                 init_ca_windows=tail_ca,
