@@ -477,7 +477,7 @@ def generate_continuous_H_gpu(stack, zRatio):
 
     return H
 
-_PROJECT_TO_PLANES_NANMAX_KERNEL = cp.RawKernel(r'''
+_PROJECT_TO_PLANES_NANMAX_SRC = r'''
 extern "C" __global__
 void project_to_planes_nanmax_kernel(
     const float* values,          // (Nvox,), shifted values, should be non-negative
@@ -566,9 +566,9 @@ void project_to_planes_nanmax_kernel(
         }
     }
 }
-''', 'project_to_planes_nanmax_kernel')
+'''
 
-_PROJECT_TO_PLANES_WEIGHTED_AVG_KERNEL = cp.RawKernel(r'''
+_PROJECT_TO_PLANES_WEIGHTED_AVG_SRC = r'''
 extern "C" __global__
 void project_to_planes_weighted_avg_kernel(
     const float* values,          // (Nvox,)
@@ -667,7 +667,35 @@ void project_to_planes_weighted_avg_kernel(
         }
     }
 }
-''', 'project_to_planes_weighted_avg_kernel')
+'''
+
+# CUDA kernels are compiled on first use, not at import time: `cp` is the
+# shim from utils/__init__, which is plain numpy on machines without CuPy/CUDA
+# — and numpy has no RawKernel, so constructing these at module scope made the
+# whole module unimportable on CPU (taking every pure-CPU function with it).
+_KERNEL_CACHE = {}
+
+
+def _get_raw_kernel(name, source):
+    """Compile (once) and return a CUDA RawKernel; GPU-only by construction."""
+    if name not in _KERNEL_CACHE:
+        if not hasattr(cp, "RawKernel"):
+            raise RuntimeError(
+                f"CUDA kernel '{name}' requires CuPy with a CUDA device; "
+                "this process is running on the NumPy fallback."
+            )
+        _KERNEL_CACHE[name] = cp.RawKernel(source, name)
+    return _KERNEL_CACHE[name]
+
+
+def _nanmax_kernel():
+    return _get_raw_kernel("project_to_planes_nanmax_kernel", _PROJECT_TO_PLANES_NANMAX_SRC)
+
+
+def _weighted_avg_kernel():
+    return _get_raw_kernel(
+        "project_to_planes_weighted_avg_kernel", _PROJECT_TO_PLANES_WEIGHTED_AVG_SRC
+    )
 
 def project_coords_to_fixed_planes_weighted_gpu(
     coords_ref_xyk_xyz,
@@ -803,7 +831,7 @@ def project_coords_to_fixed_planes_weighted_gpu(
     threads = 256
     blocks = int((Nvox * Nplanes + threads - 1) // threads)
 
-    _PROJECT_TO_PLANES_WEIGHTED_AVG_KERNEL(
+    _weighted_avg_kernel()(
         (blocks,),
         (threads,),
         (
@@ -1058,7 +1086,7 @@ def project_coords_to_fixed_planes_gpu(
     threads = 256
     blocks = int((Nvox * Nplanes + threads - 1) // threads)
 
-    _PROJECT_TO_PLANES_NANMAX_KERNEL(
+    _nanmax_kernel()(
         (blocks,),
         (threads,),
         (
