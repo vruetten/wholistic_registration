@@ -1539,11 +1539,16 @@ def process_directional_chunks(
     import os
     from collections import deque
 
-    import cupy as cp
     import h5py
     import numpy as np
 
-    if device_id is not None:
+    # Route through the package shim (numpy fallback when CuPy/CUDA is absent)
+    # instead of importing cupy directly: this function runs in the SERIAL path
+    # too, where a hard cupy import aborted CPU-only runs right after the middle
+    # block had been written.
+    from ..utils import CUPY_AVAILABLE, cp
+
+    if device_id is not None and CUPY_AVAILABLE:
         cp.cuda.Device(device_id).use()
 
     # -------------------------------
@@ -1676,6 +1681,7 @@ def process_directional_chunks(
                 #     raise ValueError("direction must be 'forward' or 'backward'")
             # Free batch memory
             del mem_batch, ca_batch, mem_reg, ca_reg, motion
-            cp.get_default_memory_pool().free_all_blocks()
+            if CUPY_AVAILABLE:
+                cp.get_default_memory_pool().free_all_blocks()
 
     print(f"[{direction}] Processing complete.")
