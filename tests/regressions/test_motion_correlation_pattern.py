@@ -115,12 +115,51 @@ def test_b041_unfitted_episode_skipped_and_valueerror():
 
 
 def test_b043_tab20_colormap_lookup_works():
-    """The module's colormap lookup (plt.get_cmap, not the removed cm.get_cmap) works on the installed matplotlib. Regression for B-043 (fixed in 8bfd0e2)."""
+    """visualize_episode_regions runs end-to-end on a one-region episode (no AttributeError from the removed cm.get_cmap) and paints its scatter with tab20 colour 0 at the expected patch centres. Regression for B-043 (fixed in 8bfd0e2)."""
     source = inspect.getsource(mcp)
     assert "cm.get_cmap" not in source
 
     cmap = plt.get_cmap("tab20")  # the exact lookup used at visualize_episode_regions
     assert cmap.N == 20
+
+    # The checks above only exercise matplotlib and the source text.  Actually
+    # call the repo function that does the lookup.  Backend is forced to Agg in
+    # tests/regressions/conftest.py.
+    plt.close("all")
+    rng = np.random.default_rng(43)
+    region = _make_region(0, np.sin(np.linspace(0, np.pi, 10)).astype(np.float32), rng)
+    region.mean_response_vector = np.array([0.3, -0.2], dtype=np.float32)
+    region.center_xy = (9.0, 9.0)
+
+    mask = np.zeros((20, 20), dtype=np.uint8)
+    mask[5:15, 5:15] = 1
+    episode = mcp.MotionEpisode(time_range=(0, 9), region_mask=mask, episode_id=43)
+    episode.regions = [region]
+
+    fig = mcp.visualize_episode_regions(episode, patch_size=7, rel_thresh=0.10, show=False)
+
+    assert fig is not None  # None means it bailed out before the colormap lookup
+
+    # Independent recomputation of what the scatter must contain: the pixels of
+    # the region's response_strength above 10% of its own max, mapped to patch
+    # centres, all painted with tab20 entry 0.
+    A = np.asarray(region.response_strength, dtype=np.float32)
+    coords = np.argwhere(A > 0.10 * float(np.max(A)))
+    assert len(coords) > 0  # guard: the oracle below must not be empty
+    expected_xy = np.column_stack([coords[:, 1] * 7 + 3, coords[:, 0] * 7 + 3]).astype(float)
+
+    scatters = [c for c in fig.axes[0].collections if c.get_offsets().shape[0] == len(coords)]
+    assert len(scatters) == 1, f"expected exactly one scatter of {len(coords)} points"
+    assert np.array_equal(np.asarray(scatters[0].get_offsets()), expected_xy)
+
+    face = np.asarray(scatters[0].get_facecolor())
+    assert face.shape == (len(coords), 4)
+    assert np.allclose(face[:, :3], np.asarray(cmap(0))[:3]), (
+        f"scatter is not painted with tab20 colour 0: got {face[0, :3]}"
+    )
+    assert face[:, 3].min() >= 0.25 and face[:, 3].max() <= 0.90
+
+    plt.close("all")
 
 
 def _make_k0_episode():

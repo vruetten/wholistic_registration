@@ -2,27 +2,73 @@
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pytest
+from scipy import ndimage as ndi
 
 from wholistic_registration.utils import generate_demo_data, preprocess, simulation
 
 
 def test_b054_generate_motion_runs():
-    """generateMotion runs to completion (no cupy_ndimge NameError) and returns motion arrays of the input shape. Regression for B-054 (fixed in cbf274c)."""
+    """generateMotion runs to completion (no cupy_ndimge NameError) and the returned fields carry the requested amplitude (std over the seed points == amp_art), are Gaussian-smoothed, and use exactly round(N/(2R+1)^2) seed points. Regression for B-054 (fixed in cbf274c)."""
     np.random.seed(0)
-    raw = np.random.rand(8, 8, 2).astype(np.float32)
+    raw = np.random.rand(16, 16, 4).astype(np.float32)
+    art_R, amp_art = 2, 3.0
 
     motion_X, motion_Y, motion_Z, cp_art = simulation.generateMotion(
-        raw, art_R=2, amp_art=1.0, zRatio=1
+        raw, art_R=art_R, amp_art=amp_art, zRatio=1
     )
 
-    assert motion_X.shape == (8, 8, 2)
-    assert motion_Y.shape == (8, 8, 2)
-    assert motion_Z.shape == (8, 8, 2)
+    assert motion_X.shape == (16, 16, 4)
+    assert motion_Y.shape == (16, 16, 4)
+    assert motion_Z.shape == (16, 16, 4)
     assert len(cp_art) > 0
+
+    # Everything above is satisfied by three all-zero arrays plus any non-empty
+    # index list.  Below: derived invariants that pin the actual computation.
+
+    # 1. seed-point count is exactly N * 1/(2R+1)^2, and the indices are a
+    #    permutation sample (unique, in range) -- not a placeholder.
+    n_voxels = 16 * 16 * 4
+    assert len(cp_art) == round(n_voxels / (2 * art_R + 1) ** 2)
+    assert len(np.unique(cp_art)) == len(cp_art)
+    assert cp_art.min() >= 0 and cp_art.max() < n_voxels
+
+    # 2. amplitude normalisation: motion_Y is divided by std(motion_Y[cp_art])
+    #    and multiplied by amp_art, so that std must come back out as amp_art
+    #    exactly.  Independent of the RNG draw; false for any zero/stub field.
+    assert float(np.std(motion_Y.flat[cp_art])) == pytest.approx(amp_art, rel=1e-5)
+
+    # 3. the fields are non-degenerate and distinct
+    assert float(motion_X.std()) > 0.0
+    assert float(motion_Y.std()) > 0.0
+    assert not np.array_equal(motion_X, motion_Y)
+
+    # 4. motion_Z is left at zero on purpose (its randn/filter/scale lines are
+    #    commented out upstream) -- no-regression anchor for that choice.
+    assert np.count_nonzero(motion_Z) == 0
+
+    # 5. the Gaussian filter really ran: with sigma=art_R the field is smooth,
+    #    so neighbouring voxels along x are strongly correlated.  White noise
+    #    (an unfiltered field) gives ~0 here (measured: -0.027), so 0.75
+    #    separates the two cases by a mile.  Threshold chosen from a 60-seed
+    #    sweep: lag-1 ranges 0.892-0.969, so the tempting 0.9 would fail on
+    #    seeds 27 and 40 -- fine here only because seed 0 is pinned, but a trap
+    #    for anyone who reseeds.
+    lag1 = np.corrcoef(motion_Y[:-1].ravel(), motion_Y[1:].ravel())[0, 1]
+    assert lag1 > 0.75, f"motion_Y is not spatially smooth: lag-1 correlation {lag1:.3f}"
 
 
 def test_b055_yunfeng_edge_map_runs():
-    """Yunfeng_edge_map runs on a 48x48 array (all imports resolved) and returns a binary map of the same shape. Regression for B-055 (fixed in 8f9e3d3)."""
+    """Yunfeng_edge_map runs (no NameError) and, at sigma=0/outcoef=1.2, recovers the 1-px boundary of a synthetic disk EXACTLY (84/84 boundary pixels, 0 spurious), so a zeros/noise map fails. Regression for B-055 (fixed in 8f9e3d3).
+
+    NOT a test of the default parameters, which are separately broken: at
+    sigma=4/outcoef=3 this function returns an all-zero map for every smooth
+    input tried, because max finite |Norm| is 0.775 against a threshold of 3.
+    Its only non-empty output comes from dividing a float residue by std==0.
+    Filed as B-115; the all-zero assertion below PINS THAT KNOWN-SUSPECT
+    BEHAVIOUR so a fix has to come past this test, and is not evidence the
+    defaults work.
+    """
     yy, xx = np.mgrid[:48, :48]
     frame = ((yy - 24) ** 2 + (xx - 24) ** 2 < 15**2).astype(np.float64)
 
@@ -32,9 +78,53 @@ def test_b055_yunfeng_edge_map_runs():
     assert edges.shape == (48, 48)
     assert set(np.unique(edges)).issubset({0.0, 1.0})
 
+    # The two assertions above are the original smoke check and are satisfied by
+    # an all-zero map -- which is what the defaults return (B-115).  Pinned, not
+    # endorsed: when B-115 is fixed this line is expected to fail and should be
+    # updated to the corrected behaviour, not deleted.
+    assert float(edges.sum()) == 0.0, "B-115 default-parameter behaviour changed; re-derive"
 
-def test_b056_plot_publication_metric_reaches_past_plt(tmp_path):
-    """plot_publication_metric executes past its plt usage (no NameError) on empty inputs. Regression for B-056 (fixed in 283b255)."""
+    # Geometric oracle.  Input is the 1-px-wide boundary ring of a disk of
+    # radius R.  With the pre-smoothing disabled (sigma=0) the statistic is
+    # analytic: a ring pixel has 2 of its 8 neighbours on the ring, giving
+    # |Norm| = 0.75 / 0.433 = sqrt(3) = 1.732; a background pixel touching the
+    # ring reaches at most 0.775.  outcoef=1.2 sits in that gap, and the ring is
+    # a single 8-connected component of 84 px, so it survives min_size=40.
+    R = 15
+    disk = (yy - 24) ** 2 + (xx - 24) ** 2 <= R**2
+    ring = (disk & ~ndi.binary_erosion(disk)).astype(np.float64)
+    assert int(ring.sum()) == 84
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        edges_ring = preprocess.Yunfeng_edge_map(ring, sigma=0, outcoef=1.2)
+
+    assert float(edges_ring.sum()) > 0.0, "edge map is empty: nothing was detected"
+
+    on = np.argwhere(edges_ring > 0)
+    radius = np.hypot(on[:, 0] - 24, on[:, 1] - 24)
+    # every detected pixel lies on the known boundary of the disk, +/- 1 px
+    assert float(np.abs(radius - R).max()) <= 1.0, (
+        f"detected pixels off the disk boundary: max radial deviation "
+        f"{np.abs(radius - R).max():.2f} px"
+    )
+    # ...and the detection wraps the whole circle, not one arc
+    angle = np.arctan2(on[:, 0] - 24, on[:, 1] - 24)
+    octants = np.unique(np.floor((angle + np.pi) / (np.pi / 4)).astype(int) % 8)
+    assert len(octants) == 8, f"boundary only detected in octants {octants.tolist()}"
+    # strongest form: the map IS the boundary -- no misses, no spurious pixels
+    assert np.array_equal(edges_ring, ring.astype(np.float32))
+
+    # Repeat at a threshold that brackets the analytic value more tightly.
+    # sqrt(3)=1.732 clears 1.6, but dropping `average_kernel[r, r] = 0` (so the
+    # centre pixel enters its own neighbourhood mean) moves Norm to 1.291 --
+    # still above 1.2, so the assertion above alone does not notice.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        edges_tight = preprocess.Yunfeng_edge_map(ring, sigma=0, outcoef=1.6)
+    assert np.array_equal(edges_tight, ring.astype(np.float32))
+
+
+def test_b056_plot_publication_metric_reaches_past_plt(tmp_path, monkeypatch):
+    """plot_publication_metric executes past its plt usage (no NameError) and, given real data, draws both labelled curves with the supplied y-values and writes the pdf/png pair. Regression for B-056 (fixed in 283b255)."""
     saved_rc = dict(plt.rcParams)
     try:
         result = simulation.plot_publication_metric(
@@ -50,7 +140,69 @@ def test_b056_plot_publication_metric_reaches_past_plt(tmp_path):
             save_dir=str(tmp_path / "figures"),  # empty groups: nothing is written
         )
         assert result is None
+        # `result is None` is also true of a stub that does nothing at all, so
+        # run it again with a real group and check what it drew and wrote.
+
+        avg1 = [1.0, 2.0, 4.0]
+        avg2 = [0.5, 0.25, 0.125]
+        data = {
+            "labels": [1, 2, 3],
+            "avg1": avg1,
+            "std1": [0.1, 0.1, 0.1],
+            "avg2": avg2,
+            "std2": [0.05, 0.05, 0.05],
+        }
+        out_dir = tmp_path / "figures_real"
+        plt.close("all")
+        # keep the figure alive so its artists can be inspected after the call
+        drawn = []
+        real_subplots = plt.subplots
+
+        def recording_subplots(*args, **kwargs):
+            drawn.append(real_subplots(*args, **kwargs))
+            return drawn[-1]
+
+        # `simulation.plt` IS matplotlib.pyplot, so this patch is global for the
+        # duration of the test.  Stub `close` so the figure survives the call and
+        # its artists can be inspected -- but that also neuters this test's own
+        # `finally: plt.close("all")`, since monkeypatch teardown runs after the
+        # body.  Undo explicitly before the finally block.
+        monkeypatch.setattr(simulation.plt, "subplots", recording_subplots)
+        monkeypatch.setattr(simulation.plt, "close", lambda *a, **k: None)
+
+        simulation.plot_publication_metric(
+            processed_results={"grp": data},
+            experiment_groups=["grp"],
+            avg_key_1="avg1",
+            std_key_1="std1",
+            label_1="curve one",
+            avg_key_2="avg2",
+            std_key_2="std2",
+            label_2="curve two",
+            ylabel="metric",
+            save_dir=str(out_dir),
+            file_suffix="mtr",
+            dpi=50,
+        )
+
+        for name in ["grp_mtr.pdf", "grp_mtr.png"]:
+            path = out_dir / name
+            assert path.exists(), f"missing output: {name}"
+            assert path.stat().st_size > 0
+
+        # exactly one figure was drawn, carrying both curves with the y-values
+        # and legend labels that were passed in
+        assert len(drawn) == 1
+        ax = drawn[0][1]
+        assert len(ax.lines) == 2
+        assert [ln.get_label() for ln in ax.lines] == ["curve one", "curve two"]
+        assert np.array_equal(ax.lines[0].get_ydata(), np.array(avg1))
+        assert np.array_equal(ax.lines[1].get_ydata(), np.array(avg2))
+        assert np.array_equal(ax.lines[0].get_xdata(), np.array([1.0, 2.0, 3.0]))
+        assert ax.get_ylabel() == "metric"
+        assert ax.get_title() == "grp"
     finally:
+        monkeypatch.undo()  # restore the real plt.close before using it
         plt.rcParams.update(saved_rc)
         plt.close("all")
 
