@@ -184,6 +184,75 @@ mechanism proven but no in-repo caller currently triggers it.
 | B-063 | 🟨 | reliableAnalysis.py:447 | maximum-vs-minimum unresolved: commit b17778d's message says "set back to minimum" but the diff flips TO maximum; `# minimum?...` left in code | read |
 | B-064 | 🟨 | reliableAnalysis.py:229 | debug branch `.get()` on numpy fallback → AttributeError | run |
 | B-065 | 🟦 | visualization.py:57 | threshold param: identical if/else branches, dead parameter | read |
+| B-115 | 🟧 | preprocess.py:359-361 | Yunfeng_edge_map at DEFAULT params detects nothing real: unclamped variance + division by `std==0` means the only pixels that ever fire are float-residue/0 = `±inf` | run |
+
+#### B-115 — `Yunfeng_edge_map` defaults are inert, and its only detections are division-by-zero artifacts
+
+Found while hardening the B-055 regression test (which had only ever asserted
+that the function *runs*). Distinct from B-055: that was the `NameError`, this
+is what the function computes once it runs.
+
+`preprocess.py:359-361`:
+```python
+std  = np.sqrt(EX_square - EX**2)      # no clamp; no guard against std == 0
+Norm = (frame_smooth - EX) / std
+edges_result = cp.where((Norm > outcoef) | (Norm < -outcoef), 1.0, 0.0)
+```
+
+Two defects compound:
+
+1. **Unclamped variance** — `E[X²] − E[X]²` goes slightly negative under
+   floating-point cancellation, so `sqrt` yields `NaN`. This is the **third**
+   instance of exactly this pattern in the repo: `reliability_map` already
+   clamps with `var[var < 0] = 0`, and `local_zscore_difference` was fixed the
+   same way in B-061 (`e41224c`). `Yunfeng_edge_map` was missed.
+2. **No `std == 0` guard** — in flat regions `std` is exactly `0.0`. Where the
+   numerator is also exactly 0 the result is `NaN` (which never fires, since
+   `NaN > outcoef` is `False`); where the numerator is a non-zero float
+   *residue* the result is `±inf`, which **always** fires.
+
+Measured on a 256×256 disk of radius 80 (`sigma=4, outcoef=3`, the defaults):
+
+| quantity | value |
+|---|---|
+| `var < 0` (→ NaN after sqrt) | 10,458 px |
+| `var == 0` (→ ÷0) | 33,794 px |
+| `Norm` = `NaN` | 43,957 px |
+| `Norm` = `±inf` | 295 px |
+| **max finite `|Norm|` anywhere** | **0.7746** |
+| pixels detected | 171 (all from the `inf` set) |
+| radius of detections | **56.1 – 61.1** (true edge at **80**) |
+| numerator at those pixels | 1.4e-10 – 6.0e-9 (pure float residue) ÷ `0.0` |
+
+Because the max *finite* `|Norm|` is 0.775 and `outcoef` defaults to 3,
+**no legitimate edge can ever be detected at default parameters.** Every
+detection is a division-by-zero artifact, located ~20 px inside the true
+boundary — at the radius where the Gaussian-smoothed disk becomes numerically
+flat. Confirmed inert on 10 further inputs (sharp square, bar, checkerboard,
+Gaussian noise, impulse, ×1000 contrast, smooth blobs): all return an all-zero
+map.
+
+**Consequence:** any caller relying on the defaults gets an empty edge map, or
+worse, a handful of spurious edges in the wrong place. Not currently on a
+pipeline path (no in-repo caller uses the defaults), hence 🟧 not 🟥.
+
+**Proposed fix:** clamp as B-061 did and make flat regions explicitly
+edge-free, e.g.
+```python
+var = EX_square - EX**2
+var[var < 0] = 0
+std = np.sqrt(var)
+Norm = np.divide(frame_smooth - EX, std, out=np.zeros_like(std), where=std > 0)
+```
+`where=std > 0` is the load-bearing part: it turns "flat ⇒ ±inf ⇒ always an
+edge" into "flat ⇒ 0 ⇒ never an edge", which is the correct semantics for an
+outlier statistic. **Needs cyf's sign-off** (his function, and choosing
+`outcoef` is a semantics call — the clamp alone leaves the defaults inert).
+
+Pinned meanwhile by `test_b055_yunfeng_edge_map_runs`, which asserts the
+all-zero default as a **known-suspect** behaviour and builds its real oracle at
+`sigma=0, outcoef=1.2`, where the statistic is analytic and the ring is
+recovered exactly.
 
 ## Refuted (kept so they aren't re-found)
 
@@ -231,11 +300,37 @@ fail for their documented mechanism — but three defects were found and fixed:
 | `test_b067_gpu_only_calls_are_guarded` | **near-vacuous** — substring grep, no polarity | invert both guards → suite green | `3a0a097` |
 | *(none)* — GPU branch untested | delete the GPU-side closing call → suite green | AST structural test added | `f7e95ba` |
 
-Still weak (assertions that pass on degenerate output — tracked, not yet fixed):
-B-061 (NaN count only), B-062 (upper-bound only, B-086 pattern), B-055 / B-054 /
-B-056 (smoke-only), B-043 (source grep, never calls the function), B-034
-kernel-sources (string containment), B-090 cap (upper-bound only). Coverage gap:
-**`margin_z` in the B-090 fix has no test at all** — highest-value missing test.
+### Value-blind assertions — closed 2026-08-11
+
+The eight assertions listed here as "passes on degenerate output" have been
+strengthened, each verified by a mutant that beat the old version:
+
+| test | was | now pins | mutant now killed |
+|---|---|---|---|
+| B-061 | NaN count only | float64 reference map, `atol=1e-5` | `p_var`, mask combinator, `sigma`, `abs`→`sq` |
+| B-062 | upper-bound only (B-086 pattern) | 4 legs: `raw.max()>10`, oracle, clip identity, **rescale by width not ceiling** | `D/(clip[1]-clip[0])` → `D/clip[1]` |
+| B-055 | smoke-only | geometric ring oracle at `sigma=0`, exact equality at `outcoef` 1.2 **and 1.6** | dropping `average_kernel[r,r]=0` |
+| B-054 | smoke-only | `std==amp_art` exactly, seed count, lag-1 smoothness | filter skipped, `factor_Y`, seed-count ratio |
+| B-056 | smoke-only | both curves' y-data, labels, title, written pdf/png | curves swapped/dropped, x-axis fallback |
+| B-043 | source grep, never called the function | actually calls it; asserts scatter offsets + facecolors | 7/7 incl. transposed row/col, constant cmap |
+| B-034 | string containment | AST: no module-scope RawKernel (**`cp.RawKernel` *and* bare `RawKernel`**) + lazy wiring driven through a stand-in `cp` | bare-Name module-scope build |
+| B-090 cap | upper-bound only | absolute bounds (`ball.size < 1e6`, `cap <= 128`) before the cap check | raising `_MAX_BALL_RADIUS_Z` to 200,000 |
+
+Coverage gap **`margin_z` in the B-090 fix** — closed on `fix/b090-make-ball-zratio`
+(`9c9ed26`); with `margin_z` reverted, all 12 pre-existing tests stayed green,
+confirming the gap had been total.
+
+Two defects in the *implementation* were surfaced by this hardening rather than
+absorbed into the tests: **B-115** (`Yunfeng_edge_map` defaults inert +
+divide-by-zero, filed above) and a figure leak in the B-056 test itself (a
+stubbed `plt.close` silently neutered the test's own cleanup — fixed with an
+explicit `monkeypatch.undo()`).
+
+Two claims in the strengthening work were **corrected by the skeptic before
+commit**, both cases of confident-but-unchecked reasoning: a comment asserting
+the B-090 phantom's noise was load-bearing (it is not — `sigma=0.0` passes
+identically), and a docstring calling the B-061 float64 helper an "independent
+oracle" when it is a same-formula paraphrase in higher precision.
 
 Process changes to prevent recurrence: `CLAUDE.md` → "Test discipline"; the
 `/full-package-review` skill → `reference/regression-tests.md`.
