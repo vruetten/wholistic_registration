@@ -1404,7 +1404,8 @@ def filter_episodes_artifacts(
         # ------------------------------------------------------------
         if max_global_corr is not None:
             gm = ep.global_motion
-            md = ep.motion_delta
+            # units must match global_motion: both are cumulative displacement
+            md = ep.motion_abs
 
             if gm is not None and md is not None:
                 gm = np.asarray(gm, dtype=np.float32)  # (T, 2)
