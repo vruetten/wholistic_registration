@@ -18,6 +18,12 @@ import toml
 from . import calFlow3d_Wei_v1, mask, option, reference
 from . import preprocess as prep
 
+# Snapshot of the shim's z-anisotropy default, taken at import time — i.e. before
+# any registration run can mutate the shared module-level `option` dict. Used only
+# as the fallback for configs that carry no MetaData.zRatio; reading option["zRatio"]
+# there instead would leak the previous run's dataset-specific value into the next.
+_DEFAULT_ZRATIO = option["zRatio"]
+
 
 def transform(image, k=1, method="raw"):
     if method == "raw":
@@ -282,7 +288,7 @@ def wbi_registration_3d(
     # config carries the ratio measured from the acquisition (DefineParams writes it
     # from the ND2 metadata), so without this the solver silently used the module
     # default in utils/__init__.py for every dataset.
-    option["zRatio"] = config["MetaData"].get("zRatio", option["zRatio"])
+    option["zRatio"] = config.get("MetaData", {}).get("zRatio", _DEFAULT_ZRATIO)
     smoothPenalty_raw = pyramid["smoothPenalty"]
 
     # get smoothPenalty
