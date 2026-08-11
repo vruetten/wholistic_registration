@@ -123,6 +123,40 @@ def test_b043_tab20_colormap_lookup_works():
     assert cmap.N == 20
 
 
+def test_b049_mad_k_changes_events_on_sparse_trace():
+    """detect_activation_events_mad gives DIFFERENT events for mad_k=3 vs mad_k=1000 on a 1000-frame sparse trace, and leaves a dense (MAD>0) trace untouched. Regression for B-049 (fixed)."""
+    trace = np.zeros(1000, dtype=np.float32)
+    trace[100] = 5.0
+    trace[500] = 3.0
+    trace[900] = 1.0
+
+    events_lo = mcp.detect_activation_events_mad(trace, mad_k=3.0)
+    events_hi = mcp.detect_activation_events_mad(trace, mad_k=1000.0)
+
+    spans_lo = [(e["start"], e["end"]) for e in events_lo]
+    spans_hi = [(e["start"], e["end"]) for e in events_hi]
+
+    # a 333x larger threshold multiplier must change which frames are active
+    assert spans_lo != spans_hi
+    assert spans_hi == []  # nanstd fallback makes the high-k threshold unreachable
+
+    # a dense trace has MAD > 0, so the fallback must not engage
+    rng = np.random.default_rng(0)
+    dense = rng.standard_normal(1000).astype(np.float32) * 0.3 + 1.0
+    dense[200:210] += 5.0
+    med = float(np.nanmedian(dense))
+    mad = float(np.nanmedian(np.abs(dense - med)))
+    assert mad > 0
+
+    dense_events = mcp.detect_activation_events_mad(dense, mad_k=3.0)
+    assert dense_events
+    assert dense_events[0]["threshold"] == pytest.approx(med + 3.0 * 1.4826 * mad, rel=1e-6)
+
+    # degenerate traces stay sane: no crash, nothing flagged
+    assert mcp.detect_activation_events_mad(np.zeros(100, dtype=np.float32), mad_k=3.0) == []
+    assert mcp.detect_activation_events_mad(np.full(100, 2.5, dtype=np.float32), mad_k=3.0) == []
+
+
 def _make_k0_episode():
     mask = np.zeros((6, 6), dtype=np.uint8)
     mask[2:4, 2:4] = 1

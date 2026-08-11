@@ -5007,7 +5007,16 @@ def detect_activation_events_mad(
 
     med = np.nanmedian(x)
     mad = np.nanmedian(np.abs(x - med))
-    sigma = 1.4826 * mad + eps
+
+    sigma = 1.4826 * mad
+
+    # Fallback for majority-zero / nearly constant traces.
+    # Class activation traces are mostly zeros, so MAD collapses to 0 and every
+    # nonzero frame would clear the threshold regardless of mad_k.
+    if not (sigma > eps):
+        sigma = np.nanstd(x)
+
+    sigma = sigma + eps
     thresh = med + mad_k * sigma
 
     active = x > thresh

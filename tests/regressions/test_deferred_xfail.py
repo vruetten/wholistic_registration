@@ -56,28 +56,6 @@ def test_b018_artifact_filter_discards_pure_whole_body_motion():
     assert len(kept) == 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="B-049 deferred: MAD=0 on sparse traces makes the threshold ~1e-12, so "
-    "mad_k is inert across orders of magnitude (sibling has the nanstd guard)",
-)
-def test_b049_mad_k_changes_events_on_sparse_trace():
-    """detect_activation_events_mad gives DIFFERENT events for mad_k=3 vs mad_k=1000 on a 1000-frame sparse trace. Regression for B-049 (deferred)."""
-    trace = np.zeros(1000, dtype=np.float32)
-    trace[100] = 5.0
-    trace[500] = 3.0
-    trace[900] = 1.0
-
-    events_lo = mcp.detect_activation_events_mad(trace, mad_k=3.0)
-    events_hi = mcp.detect_activation_events_mad(trace, mad_k=1000.0)
-
-    spans_lo = [(e["start"], e["end"]) for e in events_lo]
-    spans_hi = [(e["start"], e["end"]) for e in events_hi]
-
-    # a 333x larger threshold multiplier must change which frames are active
-    assert spans_lo != spans_hi
-
-
 def _canny_edge_map_mod180(frame, sigma=1.0, low_threshold=0.05, high_threshold=0.15, eps=1e-6):
     """Reference canny with the CORRECT mod-180 angle fold (identical otherwise)."""
     smoothed = ndi.gaussian_filter(frame, sigma=sigma, mode="nearest")
