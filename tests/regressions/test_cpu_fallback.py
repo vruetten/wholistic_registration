@@ -34,16 +34,42 @@ def test_b067_directional_chunks_has_no_hard_cupy_import():
 
 
 def test_b067_gpu_only_calls_are_guarded():
-    """The device-selection and memory-pool calls only run when CuPy is actually available. Regression for B-067."""
+    """The device-selection and memory-pool calls run only when CuPy IS available.
+
+    Checks the guard semantically via AST, including polarity: a substring search
+    for "CUPY_AVAILABLE" near the call would also pass with the guard inverted
+    (`if not CUPY_AVAILABLE:`), which reintroduces B-067 in its worst form —
+    running GPU-only calls exclusively on CPU-only machines. Regression for B-067.
+    """
+    import textwrap
+
     from wholistic_registration.core import main_function
 
-    body = inspect.getsource(main_function.process_directional_chunks)
+    tree = ast.parse(textwrap.dedent(inspect.getsource(main_function.process_directional_chunks)))
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            child.parent = node
 
-    for call in ("cp.cuda.Device(device_id).use()", "cp.get_default_memory_pool()"):
-        line = next(line for line in body.splitlines() if call in line)
-        idx = body.splitlines().index(line)
-        guard = "\n".join(body.splitlines()[max(0, idx - 2) : idx])
-        assert "CUPY_AVAILABLE" in guard, f"{call} is no longer CUPY_AVAILABLE-guarded"
+    targets = {"cp.cuda.Device", "cp.get_default_memory_pool"}
+    found = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        src = ast.unparse(node)
+        if src not in targets:
+            continue
+        tests, parent = [], node
+        while getattr(parent, "parent", None) is not None:
+            parent = parent.parent
+            if isinstance(parent, ast.If):
+                tests.append(ast.unparse(parent.test))
+        found[src] = tests
+
+    assert set(found) == targets, f"GPU-only calls not found: {targets - set(found)}"
+    for call, tests in found.items():
+        assert tests, f"{call} is unguarded"
+        positive = [t for t in tests if "CUPY_AVAILABLE" in t and "not CUPY_AVAILABLE" not in t]
+        assert positive, f"{call} guard polarity is wrong or missing: {tests}"
 
 
 def test_b034_calflow_cross_resolution_imports_without_cupy():
