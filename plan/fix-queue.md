@@ -30,7 +30,30 @@ repro, and committed one bug per commit only on her word.
 | [#23](https://github.com/vruetten/wholistic_registration/pull/23) | B-071 zRatio | green CI — f2013 ran 9× off; cluster validation advised |
 | [#24](https://github.com/vruetten/wholistic_registration/pull/24) | B-058 canny fold | green CI — spawned follow-up [#25](https://github.com/vruetten/wholistic_registration/issues/25) |
 
-Issues with no PR yet: [#25](https://github.com/vruetten/wholistic_registration/issues/25) (canny diagonal pairs — merge after #24), [#26](https://github.com/vruetten/wholistic_registration/issues/26) (silent scale-basis switch).
+Issues with no PR yet: [#25](https://github.com/vruetten/wholistic_registration/issues/25) (canny diagonal pairs — merge after #24), [#26](https://github.com/vruetten/wholistic_registration/issues/26) (silent scale-basis switch), [#33](https://github.com/vruetten/wholistic_registration/issues/33) (B-117 edge-map defaults inert).
+
+### 📋 ISSUE-WORTHY · [#33](https://github.com/vruetten/wholistic_registration/issues/33) — B-117: `Yunfeng_edge_map` defaults detect only division-by-zero artifacts (preprocess.py:359) — *needs cyf sign-off*
+
+**What's wrong.** At the default `sigma=4, outcoef=3` the function returns an
+all-zero map for every smooth input tested. The one case where it fires
+(256×256 disk, r=80) produces 171 detections that are *all* `±inf` from
+dividing a float residue (~1e-10) by `std == 0`, located at radius 56–61 when
+the true edge is at 80. Max *finite* `|Norm|` anywhere is 0.775 against a
+threshold of 3, so nothing legitimate can ever fire.
+
+**Why it matters.** A caller gets either nothing, or a few spurious edges ~20 px
+off the real boundary — which reads as a weak detection rather than a failure.
+Not on a pipeline path today (no in-repo caller uses the defaults), hence 🟧.
+
+**Fix.** Clamp the variance (as `reliability_map` and B-061's
+`local_zscore_difference` already do — this is the third site with the same
+pattern) and add `where=std > 0` to the division, so a flat region yields 0
+rather than `inf`. The clamp alone leaves the defaults inert, so **picking a
+workable `outcoef` is cyf's call** and is deliberately not guessed at.
+
+**Found by** hardening the B-055 regression test, which had only asserted that
+the function runs. Pinned meanwhile as known-suspect behaviour in
+`test_b055_yunfeng_edge_map_runs`.
 
 ---
 
