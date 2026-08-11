@@ -263,7 +263,14 @@ def wbi_registration_3d(
     if motion_init is None:
         option["motion"] = np.zeros([Lx, Ly, Lz, 3])
     else:
-        option["motion"] = motion_init
+        # motion_init arrives in this function's OUTPUT layout (z, y, x, 3) —
+        # every in-pipeline caller feeds back a field from `motions.append(
+        # motion_current.transpose(2, 1, 0, 3))` below — but getMotion consumes
+        # option["motion"] in its internal (x, y, z, 3) layout. Transpose back;
+        # the component axis stays as-is (component c displaces axis c).
+        # Without this, getMotion silently imresize-stretched the transposed
+        # field into shape AND divided components by wrong SZ/dim factors.
+        option["motion"] = np.asarray(motion_init).transpose(2, 1, 0, 3)
     # initial the pyramid parameters
     pyramid = config["pyramid"]
     option["r"] = pyramid["r"]
