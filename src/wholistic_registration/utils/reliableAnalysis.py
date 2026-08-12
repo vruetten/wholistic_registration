@@ -1,4 +1,7 @@
 # reliablemask.py
+import json
+import logging
+logger = logging.getLogger(__name__)
 import os
 import re
 
@@ -425,6 +428,138 @@ def photometric_align_hist(I_ref, I_mov):
     return match_histograms(I_mov, I_ref).astype(np.float32)
 
 
+def _estimate_structural_difference_scale(
+    diff,
+    reliability,
+    r_threshold=0.2,
+    percentile=99.0,
+    min_reliable_pixels=100,
+    eps=1e-6,
+):
+    """
+    Estimate the normalization scale from structurally reliable pixels.
+
+    Normally, all finite pixels with reliability > r_threshold are used.
+    If too few pixels satisfy that threshold, lower the effective reliability
+    threshold just enough to include approximately min_reliable_pixels of the
+    most reliable positive-R pixels.
+
+    The whole-volume distribution is used only when there are no pixels with
+    positive reliability.
+    """
+    diff_flat = np.asarray(diff, dtype=np.float64).ravel()
+    r_flat = np.asarray(reliability, dtype=np.float64).ravel()
+
+    if diff_flat.shape != r_flat.shape:
+        raise ValueError(
+            "diff and reliability must have the same number of elements, "
+            f"got {diff_flat.size} and {r_flat.size}"
+        )
+
+    if not 0.0 <= float(percentile) <= 100.0:
+        raise ValueError(f"percentile must be in [0, 100], got {percentile}")
+
+    if not np.isfinite(r_threshold):
+        raise ValueError(f"r_threshold must be finite, got {r_threshold}")
+
+    if eps <= 0:
+        raise ValueError(f"eps must be positive, got {eps}")
+
+    min_reliable_pixels = max(1, int(min_reliable_pixels))
+
+    finite = np.isfinite(diff_flat) & np.isfinite(r_flat)
+    if not np.any(finite):
+        raise ValueError("diff and reliability contain no finite pixels")
+
+    requested_mask = finite & (r_flat > float(r_threshold))
+    n_above_threshold = int(np.count_nonzero(requested_mask))
+
+    if n_above_threshold >= min_reliable_pixels:
+        # Normal path: preserve the existing reliable-region definition.
+        selected_mask = requested_mask
+        effective_threshold = float(r_threshold)
+        source = "fixed_threshold"
+
+    else:
+        # Do not switch to the entire volume. Select the most reliable
+        # positive-R pixels by adaptively lowering the reliability cutoff.
+        positive_idx = np.flatnonzero(finite & (r_flat > 0))
+
+        if positive_idx.size > 0:
+            k = min(min_reliable_pixels, int(positive_idx.size))
+            positive_reliability = r_flat[positive_idx]
+
+            # Reliability value of the kth-largest positive-R pixel.
+            kth_position = positive_reliability.size - k
+            effective_threshold = float(
+                np.partition(
+                    positive_reliability,
+                    kth_position,
+                )[kth_position]
+            )
+
+            # >= is deliberate: include ties at the adaptive threshold.
+            selected_mask = (
+                finite
+                & (r_flat > 0)
+                & (r_flat >= effective_threshold)
+            )
+            source = "adaptive_reliability"
+
+        else:
+            # R contains no positive reliability information. Only in this
+            # degenerate case is the whole finite volume used.
+            selected_mask = finite
+            effective_threshold = None
+            source = "global_no_positive_reliability"
+
+    selected_values = diff_flat[selected_mask]
+
+    raw_scale = float(np.percentile(selected_values, percentile))
+    global_scale = float(np.percentile(diff_flat[finite], percentile))
+
+    scale_was_floored = (not np.isfinite(raw_scale)) or raw_scale <= eps
+    scale = float(eps if scale_was_floored else raw_scale)
+
+    info = {
+        "source": source,
+        "requested_r_threshold": float(r_threshold),
+        "effective_r_threshold": effective_threshold,
+        "n_total_finite": int(np.count_nonzero(finite)),
+        "n_above_requested_threshold": n_above_threshold,
+        "n_scale_pixels": int(np.count_nonzero(selected_mask)),
+        "min_reliable_pixels": min_reliable_pixels,
+        "percentile": float(percentile),
+        "raw_scale": raw_scale,
+        "global_scale": global_scale,
+        "scale": scale,
+        "scale_was_floored": bool(scale_was_floored),
+    }
+
+    if source != "fixed_threshold":
+        logger.warning(
+            "structural_difference_map: only %d pixels satisfy R > %.4g; "
+            "scale estimated using source=%s, effective_threshold=%s, "
+            "n_scale_pixels=%d, reliable_scale=%.6g, global_scale=%.6g",
+            n_above_threshold,
+            r_threshold,
+            source,
+            effective_threshold,
+            info["n_scale_pixels"],
+            raw_scale,
+            global_scale,
+        )
+
+    if scale_was_floored:
+        logger.warning(
+            "structural_difference_map: estimated scale %.6g is non-positive "
+            "or non-finite; using eps=%.6g",
+            raw_scale,
+            eps,
+        )
+
+    return scale, info
+
 def structural_difference_map(
     I_ref,
     I_mov,
@@ -432,6 +567,10 @@ def structural_difference_map(
     sigma_reliability=1.5,
     r_threshold=0.2,
     debug_dir=None,
+    scale_percentile=99.0,
+    min_reliable_pixels=100,
+    scale_eps=1e-6,
+    return_scale_info=False,
 ):
     """
     Compute a structure-weighted difference map between reference and moving images.
@@ -440,6 +579,16 @@ def structural_difference_map(
     ----------
     debug_dir : str or None
         If set, save intermediate results (R, diff, D) as TIFF files in this directory.
+    scale_percentile : float
+        Percentile used to estimate the difference normalization scale.
+    min_reliable_pixels : int
+        Minimum target number of high-reliability pixels used for scale
+        estimation. If R > r_threshold selects fewer pixels, the effective
+        threshold is lowered to include the most reliable positive-R pixels.
+    scale_eps : float
+        Positive lower bound for scale, preventing division by zero.
+    return_scale_info : bool
+        If True, return a fourth output containing scale diagnostics.
     """
     I_ref = I_ref.astype(np.float32)
     I_mov = I_mov.astype(np.float32)
@@ -465,12 +614,14 @@ def structural_difference_map(
 
     diff = np.abs(mu_ref - mu_mov)
 
-    valid_vals = diff[r_threshold < R]
-
-    if len(valid_vals) > 100:
-        scale = np.percentile(valid_vals, 99)
-    else:
-        scale = np.percentile(diff, 99)
+    scale, scale_info = _estimate_structural_difference_scale(
+        diff=diff,
+        reliability=R,
+        r_threshold=r_threshold,
+        percentile=scale_percentile,
+        min_reliable_pixels=min_reliable_pixels,
+        eps=scale_eps,
+    )
 
     Z = diff / scale
     D = 1.0 - np.exp(-(Z**2))
@@ -482,8 +633,20 @@ def structural_difference_map(
         tifffile.imwrite(os.path.join(debug_dir, "R_reliability.tif"), R)
         tifffile.imwrite(os.path.join(debug_dir, "diff_raw.tif"), diff)
         tifffile.imwrite(os.path.join(debug_dir, "D_difference.tif"), D)
+        with open(
+            os.path.join(debug_dir, "scale_info.json"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(scale_info, f, indent=2)
+    D_final = D_final.astype(np.float32)
+    D = D.astype(np.float32)
+    R = R.astype(np.float32)
 
-    return D_final.astype(np.float32), D.astype(np.float32), R.astype(np.float32)
+    if return_scale_info:
+        return D_final, D, R, scale_info
+
+    return D_final, D, R
 
 
 def build_reference_index(ref_dir):

@@ -46,7 +46,7 @@ except Exception:
     nx = None
 try:
     import cupy as cp
-    from cupyx.scipy import ndimage as cupy_ndi
+    from cupyx.scipy import ndi as cupy_ndi
     HAS_CUPY = True
 except Exception:
     cp = None
@@ -264,6 +264,12 @@ class MotionPattern:
         self.center_xy = None
         self.spatial_cov = None
         self.total_strength = 0.0
+
+        # Unified mode (set by compute_unified_mode)
+        self.unified_activation = None       # np.ndarray (T,)
+        self.unified_response_field = None   # np.ndarray (H, W, 2)
+        self.unified_mask = None             # np.ndarray (H, W) bool
+        self.unified_info = None             # dict with per-member details
 
         self._summarize()
 
@@ -500,8 +506,54 @@ class MotionPattern:
             self.center_xy = None
             self.spatial_cov = None
 
+    def compute_unified_mode(
+        self,
+        episodes,
+        use_velocity=True,
+        mask_mode="best_cc",
+        sign_method="correlation",
+        h_resample_len=None,
+        verbose=True,
+    ):
+        """Compute a unified common mode for this MotionPattern.
+
+        Calls :func:`compute_pattern_unified_mode` and stores results in::
+
+            self.unified_activation   (T,)
+            self.unified_response_field  (H, W, 2)
+            self.unified_mask         (H, W) bool
+            self.unified_info         dict
+
+        Parameters
+        ----------
+        episodes : list of MotionEpisode or dict
+        use_velocity : bool
+        mask_mode : str — ``"best_cc"`` (default), ``"union"``, or ``"largest"``
+        sign_method : str — ``"correlation"`` or ``"dtw"``
+        h_resample_len : int or None
+        verbose : bool
+
+        Returns
+        -------
+        self
+        """
+        uh, uB, umask, uinfo = compute_pattern_unified_mode(
+            self,
+            episodes,
+            use_velocity=use_velocity,
+            mask_mode=mask_mode,
+            sign_method=sign_method,
+            h_resample_len=h_resample_len,
+            verbose=verbose,
+        )
+        self.unified_activation = uh
+        self.unified_response_field = uB
+        self.unified_mask = umask
+        self.unified_info = uinfo
+        return self
+
     def summary_dict(self):
-        return {
+        d = {
             "pattern_id": self.pattern_id,
             "n_members": self.n_members,
             "episode_ids": self.episode_ids,
@@ -509,6 +561,17 @@ class MotionPattern:
             "center_xy": None if self.center_xy is None else self.center_xy.tolist(),
             "total_strength": self.total_strength,
         }
+        if self.unified_mask is not None:
+            d["unified_area"] = int(np.sum(self.unified_mask))
+            d["unified_h_len"] = (
+                len(self.unified_activation)
+                if self.unified_activation is not None
+                else None
+            )
+            if self.unified_info is not None:
+                d["unified_n_flipped"] = self.unified_info.get("n_flipped", 0)
+                d["unified_n_valid"] = self.unified_info.get("n_valid", 0)
+        return d
 
 
 # =============================================================================
@@ -611,14 +674,14 @@ def _safe_corr(a, b, eps=1e-12):
         L = min(a.size, b.size)
         a = a[:L]
         b = b[:L]
-    a0 = a
-    b0 = b
     a = a - np.mean(a)
     b = b - np.mean(b)
     na = np.linalg.norm(a)
     nb = np.linalg.norm(b)
     if na < eps or nb < eps:
-        # fall back to cosine without demeaning (on the original inputs)
+        # fall back to cosine without demeaning
+        a0 = np.asarray(a, dtype=np.float32).reshape(-1)
+        b0 = np.asarray(b, dtype=np.float32).reshape(-1)
         return float(np.dot(a0, b0) / (np.linalg.norm(a0) * np.linalg.norm(b0) + eps))
     return float(np.dot(a, b) / (na * nb + eps))
 
@@ -761,68 +824,6 @@ def motions_obtain(motion, mask, patch_size, return_abs=False):
     return patch_delta.astype(np.float32), mask_patched.astype(bool)
 
 
-def _resolve_use_gpu(use_gpu, func_name):
-    """
-    Resolve a ``use_gpu`` argument to a bool.
-
-    ``"auto"`` follows CuPy availability. An explicit ``True`` on a machine
-    without a working CuPy import is an error here rather than an opaque
-    ``AttributeError: 'NoneType' object has no attribute 'asarray'`` further down.
-    """
-    if isinstance(use_gpu, str):
-        if use_gpu != "auto":
-            raise ValueError(
-                f"{func_name}: use_gpu must be True, False or 'auto', got {use_gpu!r}."
-            )
-        return HAS_CUPY
-
-    if bool(use_gpu) and not HAS_CUPY:
-        raise RuntimeError(
-            f"{func_name}: use_gpu=True was requested but CuPy is unavailable "
-            "(import of `cupy` / `cupyx.scipy.ndimage` failed). Install the GPU "
-            'extra (`pip install -e ".[gpu]"`) or pass use_gpu=False / use_gpu="auto".'
-        )
-    return bool(use_gpu)
-
-
-def _close_temporal_gaps(active, close_gap_frames, use_gpu):
-    """
-    Merge active runs separated by temporal gaps of at most ``close_gap_frames``.
-
-    Shared by the GPU and CPU paths of :func:`getMotionUnit` so both backends
-    produce identical active masks.
-
-    Two non-obvious details:
-
-    - a 1-D closing structure of length ``s`` bridges gaps of at most ``s - 1``
-      frames, so the structure has to be ``close_gap_frames + 1`` long;
-    - ``binary_closing`` treats outside-the-array as inactive, so runs touching
-      t=0 / t=T-1 get eroded. Replicating the edge frames before closing and
-      cropping afterwards leaves those runs intact.
-
-    Parameters
-    ----------
-    active : (T, X, Y) bool array (numpy or cupy, matching ``use_gpu``)
-    close_gap_frames : int or None
-        Gaps strictly wider than this are left open. <= 0 (or None) is a no-op.
-    """
-    if close_gap_frames is None:
-        return active
-    n = int(close_gap_frames)
-    if n <= 0:
-        return active
-
-    xp, xndi = (cp, cupy_ndi) if use_gpu else (np, ndi)
-
-    struct_len = n + 1
-    pad = struct_len
-    T = active.shape[0]
-    padded = xp.pad(active, ((pad, pad), (0, 0), (0, 0)), mode="edge")
-    structure = xp.ones((struct_len, 1, 1), dtype=bool)
-    closed = xndi.binary_closing(padded, structure=structure)
-    return closed[pad:pad + T]
-
-
 def estimate_rest_state_motion(
     motionMag_patched,
     window_size_t=21,
@@ -851,7 +852,7 @@ def estimate_rest_state_motion(
         when use_abs_dev=True, so abs_dev = |motionMag - median_local| can be
         compared against restMotion instead of raw motionMag).
     """
-    use_gpu = _resolve_use_gpu(use_gpu, "estimate_rest_state_motion")
+    use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
 
     motionMag_np = np.asarray(motionMag_patched, dtype=np.float32)
     T, X, Y = motionMag_np.shape
@@ -930,18 +931,9 @@ def getMotionUnit(
     ----------
     close_gap_frames : int
         If > 0, apply temporal binary closing to the active mask before
-        start/end detection, bridging gaps of at most close_gap_frames
-        frames. Dramatically reduces CPU loop time on noisy signals like
-        cumulative displacement. Applied identically on the GPU and CPU
-        paths, and activity touching t=0 / t=T-1 is preserved rather than
-        eroded. 0 (the default) is a strict no-op.
-
-        NOTE: this is the closing step's contract, not the function's.
-        The interval-extension step below independently merges intervals
-        separated by gaps of at most 2 * extend_radius, so the EFFECTIVE
-        end-to-end merge width is max(close_gap_frames, 2 * extend_radius).
-        At the default extend_radius=1, close_gap_frames of 1 or 2 therefore
-        make no difference to the emitted units.
+        start/end detection. This merges nearby active intervals separated
+        by gaps <= close_gap_frames, dramatically reducing CPU loop time
+        when using noisy signals like cumulative displacement.
     use_abs_dev : bool
         If True (default), the active condition is:
             |motionMag - median_local| > restMotion
@@ -959,7 +951,7 @@ def getMotionUnit(
         Spatial window for median_local computation (only used when
         use_abs_dev=True and median_local is not provided).
     """
-    use_gpu = _resolve_use_gpu(use_gpu, "getMotionUnit")
+    use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
 
     motion_np = np.asarray(motion_patched, dtype=np.float32)
     motionMag_np = np.asarray(motionMag_patched, dtype=np.float32)
@@ -988,7 +980,10 @@ def getMotionUnit(
             active = motionMag_gpu > rest_gpu  # (T, X, Y)
 
         # Merge nearby active gaps on GPU to reduce CPU loop iterations
-        active = _close_temporal_gaps(active, close_gap_frames, use_gpu=True)
+        if close_gap_frames is not None and close_gap_frames > 0:
+            import cupy as _cp
+            structure = _cp.ones((int(close_gap_frames) + 2, 1, 1), dtype=bool)
+            active = cupy_ndi.binary_closing(active, structure=structure)
 
         prev_active = cp.zeros_like(active)
         prev_active[1:] = active[:-1]
@@ -1094,8 +1089,6 @@ def getMotionUnit(
     else:
         active = motionMag_np > rest_np
 
-    active = _close_temporal_gaps(active, close_gap_frames, use_gpu=False)
-
     units_map = [[[] for _ in range(Y)] for _ in range(X)]
     active_mask = np.zeros((T, X, Y), dtype=bool)
 
@@ -1149,7 +1142,7 @@ def filterMotionUnits(
     """
     Remove isolated MotionUnits using local spatiotemporal active support.
     """
-    use_gpu = _resolve_use_gpu(use_gpu, "filterMotionUnits")
+    use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
 
     active_np = np.asarray(active_mask, dtype=np.float32)
 
@@ -1474,8 +1467,7 @@ def filter_episodes_artifacts(
         # ------------------------------------------------------------
         if max_global_corr is not None:
             gm = ep.global_motion
-            # units must match global_motion: both are cumulative displacement
-            md = ep.motion_abs
+            md = ep.motion_delta
 
             if gm is not None and md is not None:
                 gm = np.asarray(gm, dtype=np.float32)  # (T, 2)
@@ -2545,11 +2537,10 @@ def split_mode_to_regions(
     if B.ndim != 3 or B.shape[-1] != 2:
         raise ValueError(f"mode.response_field should be (X,Y,2), got {B.shape}")
 
-    vmax = float(np.nanmax(A)) if A.size else 0.0
-    if not np.isfinite(vmax) or vmax <= 0:
+    vmax = float(np.max(A))
+    if vmax <= 0:
         return []
 
-    # NaN pixels compare False and are excluded from the support automatically
     raw_support = A > (support_rel_thresh * vmax)
 
     if not np.any(raw_support):
@@ -3179,6 +3170,8 @@ def compute_region_distance_matrix_simple(
     omega=1.0,
     mu=1.0,
     b_distance="l2",         # "l2" or "correlation"
+    spatial_rule="iou",       # "iou", "centroid", "iou_or_centroid", "iou_and_centroid"
+    centroid_dist_thresh=3.0,
     incompatible_dist=1e6,
     verbose=True,
 ):
@@ -3231,14 +3224,20 @@ def compute_region_distance_matrix_simple(
                         "sign": 1.0,
                     }
                 else:
-                    iou = _mask_iou(mask_i, mask_j)
+                    spatial_ok, spatial_info = _regions_spatially_compatible(
+                        regions[i], regions[j],
+                        spatial_rule=spatial_rule,
+                        iou_thresh=min_iou,
+                        centroid_dist_thresh=centroid_dist_thresh,
+                    )
 
-                    if iou < min_iou:
+                    if not spatial_ok:
                         dist = incompatible_dist
                         info = {
                             "compatible": False,
-                            "reason": "low_iou",
-                            "iou": float(iou),
+                            "reason": f"spatial_gate_{spatial_rule}",
+                            "iou": spatial_info["iou"],
+                            "centroid_distance": spatial_info["centroid_distance"],
                             "D_h": np.inf,
                             "D_b": np.inf,
                             "distance": dist,
@@ -3253,7 +3252,8 @@ def compute_region_distance_matrix_simple(
                             info = {
                                 "compatible": False,
                                 "reason": "invalid_activation",
-                                "iou": float(iou),
+                                "iou": float(spatial_info["iou"]),
+                                "centroid_distance": float(spatial_info["centroid_distance"]),
                                 "D_h": np.inf,
                                 "D_b": np.inf,
                                 "distance": dist,
@@ -3268,24 +3268,25 @@ def compute_region_distance_matrix_simple(
                                 D_b = _response_field_distance_on_overlap(
                                     regions[i], regions[j], sign2=sign_j)
 
-                            if not np.isfinite(D_h) or not np.isfinite(D_b):
-                                dist = incompatible_dist
-                                compatible = False
-                                reason = "invalid_distance"
-                            else:
-                                dist = omega * D_h + mu * D_b
-                                compatible = True
-                                reason = "ok"
+                        if not np.isfinite(D_h) or not np.isfinite(D_b):
+                            dist = incompatible_dist
+                            compatible = False
+                            reason = "invalid_distance"
+                        else:
+                            dist = omega * D_h + mu * D_b
+                            compatible = True
+                            reason = "ok"
 
-                            info = {
-                                "compatible": bool(compatible),
-                                "reason": reason,
-                                "iou": float(iou),
-                                "D_h": float(D_h),
-                                "D_b": float(D_b),
-                                "distance": float(dist),
-                                "sign": float(sign_j),
-                            }
+                        info = {
+                            "compatible": bool(compatible),
+                            "reason": reason,
+                            "iou": float(spatial_info["iou"]),
+                            "centroid_distance": float(spatial_info["centroid_distance"]),
+                            "D_h": float(D_h),
+                            "D_b": float(D_b),
+                            "distance": float(dist),
+                            "sign": float(sign_j),
+                        }
 
             D[i, j] = dist
             D[j, i] = dist
@@ -3580,20 +3581,73 @@ def getMotionPattern(
     omega=1.0,
     mu=1.0,
     b_distance="l2",           # "l2" or "correlation"
+    spatial_rule="iou",         # "iou", "centroid", "iou_or_centroid", "iou_and_centroid"
+    centroid_dist_thresh=3.0,
 
     cluster_dist_thresh=0.8,
     linkage_method="complete",
     incompatible_dist=1e6,
 
+    # Unified mode computation
+    compute_unified=True,
+    unified_use_velocity=True,
+    unified_mask_mode="best_cc",
+    unified_sign_method="correlation",
+    unified_h_resample_len=None,
+
+    # Post-hoc quality filtering (applied after unified mode computation)
+    min_pattern_members=2,
+    min_unified_area=0,
+    min_h_snr=0.0,
+    max_h_cv=float("inf"),
+
     verbose=True,
 ):
     """Build MotionPatterns from MotionRegions or MotionModes.
 
+    After hierarchical clustering, each pattern optionally gets a **unified
+    common mode** computed via :meth:`MotionPattern.compute_unified_mode`,
+    and patterns can be filtered by spatial/temporal quality metrics.
+
     Parameters
     ----------
     unit_type : str
-        "region" - cluster MotionRegions (default).
-        "mode"   - cluster MotionModes directly, skipping spatial splitting.
+        ``"region"`` — cluster MotionRegions (default).
+        ``"mode"``   — cluster MotionModes directly, skipping spatial splitting.
+    spatial_rule : str
+        ``"iou"`` — IoU >= min_iou.
+        ``"centroid"`` — centroid distance <= centroid_dist_thresh.
+        ``"iou_or_centroid"`` — either condition.
+        ``"iou_and_centroid"`` — both conditions.
+    compute_unified : bool
+        If True (default), compute unified mode for every pattern.
+    unified_use_velocity : bool
+        Passed to ``compute_unified_mode``.
+    unified_mask_mode : str
+        ``"best_cc"`` (default) — largest connected component of the
+        highest-energy member's support mask.
+        ``"union"`` — union of all member support masks.
+        ``"largest"`` — mask from the member with the largest area.
+    unified_sign_method : str
+        ``"correlation"`` or ``"dtw"``.
+    min_pattern_members : int
+        Drop patterns with fewer members.
+    min_unified_area : int
+        Drop patterns whose unified mask has fewer than this many patches.
+    min_h_snr : float
+        Drop patterns whose unified activation has signal-to-noise ratio
+        below this value.  SNR ≈ (peak - baseline) / noise_std.
+    max_h_cv : float
+        Drop patterns whose member activation lengths have coefficient of
+        variation above this value (large CV = inconsistent durations).
+
+    Returns
+    -------
+    patterns : list of MotionPattern
+    kept_units : list
+    groups : list of list[int]
+    labels : np.ndarray
+    info : dict
     """
     # Collect units
     all_units = collect_units_from_episodes(motion_episodes, unit_type=unit_type)
@@ -3620,6 +3674,8 @@ def getMotionPattern(
         omega=omega,
         mu=mu,
         b_distance=b_distance,
+        spatial_rule=spatial_rule,
+        centroid_dist_thresh=centroid_dist_thresh,
         incompatible_dist=incompatible_dist,
         verbose=verbose,
     )
@@ -3637,6 +3693,90 @@ def getMotionPattern(
         groups,
     )
 
+    # ---- Pre-filter: drop tiny patterns ----
+    if min_pattern_members > 1:
+        patterns = [p for p in patterns if p.n_members >= min_pattern_members]
+
+    # ---- Compute unified mode for each pattern ----
+    if compute_unified and len(patterns) > 0:
+        if verbose:
+            print(
+                f"[getMotionPattern] computing unified modes for "
+                f"{len(patterns)} patterns..."
+            )
+
+        for p in patterns:
+            try:
+                p.compute_unified_mode(
+                    episodes=motion_episodes,
+                    use_velocity=unified_use_velocity,
+                    mask_mode=unified_mask_mode,
+                    sign_method=unified_sign_method,
+                    h_resample_len=unified_h_resample_len,
+                    verbose=False,
+                )
+            except Exception as exc:
+                if verbose:
+                    print(
+                        f"  [getMotionPattern] WARNING — pattern {p.pattern_id} "
+                        f"unified mode failed: {exc}"
+                    )
+                p.unified_activation = None
+                p.unified_response_field = None
+                p.unified_mask = None
+                p.unified_info = {"error": str(exc)}
+
+        # ---- Post-hoc quality filtering ----
+        n_before = len(patterns)
+        filtered = []
+        for p in patterns:
+            # Spatial: unified mask area
+            if min_unified_area > 0:
+                um = p.unified_mask
+                if um is None or int(np.sum(um)) < min_unified_area:
+                    continue
+
+            # Temporal: h SNR
+            if min_h_snr > 0:
+                uh = p.unified_activation
+                if uh is not None and len(uh) > 3:
+                    uh_arr = np.asarray(uh, dtype=np.float64)
+                    noise_std = float(
+                        np.median(np.abs(uh_arr - np.median(uh_arr))) / 0.6745
+                    )
+                    peak = float(np.max(np.abs(uh_arr)))
+                    snr = peak / max(noise_std, 1e-12)
+                    if snr < min_h_snr:
+                        continue
+
+            # Temporal: h length consistency across members
+            if max_h_cv < float("inf"):
+                ui = p.unified_info
+                if ui is not None:
+                    h_lens = [
+                        mi.get("h_len", 0)
+                        for mi in ui.get("member_info", [])
+                        if "error" not in mi
+                    ]
+                    if len(h_lens) >= 2:
+                        mean_len = np.mean(h_lens)
+                        std_len = np.std(h_lens)
+                        cv = std_len / max(mean_len, 1e-12)
+                        if cv > max_h_cv:
+                            continue
+
+            filtered.append(p)
+
+        if verbose:
+            n_dropped = n_before - len(filtered)
+            if n_dropped > 0:
+                print(
+                    f"[getMotionPattern] quality filter: "
+                    f"{n_dropped}/{n_before} dropped, {len(filtered)} kept"
+                )
+
+        patterns = filtered
+
     info = {
         "distance_matrix": dist_mat,
         "pair_info": pair_info,
@@ -3653,6 +3793,12 @@ def getMotionPattern(
             "cluster_dist_thresh": cluster_dist_thresh,
             "linkage_method": linkage_method,
             "incompatible_dist": incompatible_dist,
+            "compute_unified": compute_unified,
+            "unified_mask_mode": unified_mask_mode,
+            "min_pattern_members": min_pattern_members,
+            "min_unified_area": min_unified_area,
+            "min_h_snr": min_h_snr,
+            "max_h_cv": max_h_cv,
         },
     }
 
@@ -3890,9 +4036,8 @@ def _auto_contrast(img):
 
 
 def _get_BH_from_episode(ep):
-    model = getattr(ep, "mode_model", None)
-    if not model or "B" not in model:
-        raise ValueError("episode.mode_model is missing or empty (episode not fitted).")
+    if not hasattr(ep, "mode_model") or ep.mode_model is None:
+        raise ValueError("episode.mode_model is missing.")
     B = np.asarray(ep.mode_model["B"], dtype=np.float32)  # (2N, K)
     H = np.asarray(ep.mode_model["H"], dtype=np.float32)  # (K, T)
     return B, H
@@ -4016,9 +4161,6 @@ def visualize_episode_sources_overview(
     order = order[:min(max_modes, K)]
 
     n = len(order)
-    if n == 0:
-        print("[visualize_episode_sources_overview] no modes to visualize (K=0)")
-        return diag
     ncols = 4
     nrows = int(np.ceil(n / ncols))
 
@@ -4297,7 +4439,7 @@ def visualize_episode_regions(
         ax.imshow(_auto_contrast(ref_img), cmap="gray", origin="upper")
     else:
         ax.imshow(np.asarray(episode.spatial_region).T, cmap="gray", origin="upper")
-    cmap = plt.get_cmap("tab20")
+    cmap = cm.get_cmap("tab20")
     for i, r in enumerate(regions[:max_regions]):
         A = np.asarray(r.response_strength, dtype=np.float32)
         vmax = float(np.max(A))
@@ -4367,9 +4509,6 @@ def compare_sources_to_observed_frames(
     order = order[:min(max_modes, K)]
 
     n = len(order)
-    if n == 0:
-        print("[compare_sources_to_observed_frames] no modes to visualize (K=0)")
-        return None
     fig, axes = plt.subplots(n, 3, figsize=(figsize_per_row[0], figsize_per_row[1] * n))
     if n == 1:
         axes = axes[None, :]
@@ -4425,8 +4564,7 @@ def summarize_temporal_basis_likeness(episodes):
     rows = []
 
     for ei, ep in enumerate(episodes):
-        model = getattr(ep, "mode_model", None)
-        if not model or "B" not in model:
+        if not hasattr(ep, "mode_model") or ep.mode_model is None:
             continue
 
         B, H = _get_BH_from_episode(ep)
@@ -5109,225 +5247,6 @@ def detect_activation_events_mad(
         })
 
     return events
-
-# Ca lag correlation
-def compute_lagged_ca_correlation_map(
-    activation_trace,
-    ca_patch_stack,
-    max_lag=10,
-    lag_mode="positive",
-    use_dff=True,
-    ca_smooth_win=None,
-    min_std=1e-6,
-):
-    """
-    Compute lagged correlation between one activation trace A(t)
-    and Ca at each spatial location C(t, ...).
-
-    Supports:
-        ca_patch_stack: (T, X, Y)
-        ca_patch_stack: (T, Z, X, Y)
-        or generally: (T, *spatial_shape)
-
-    lag definition:
-        corr(A(t), C(t + lag, ...))
-
-    Therefore:
-        lag < 0: Ca precedes motion activation
-        lag = 0: Ca is synchronous with motion activation
-        lag > 0: Ca follows motion activation
-
-    lag_mode:
-        "positive": choose lag with maximum correlation
-        "absolute": choose lag with maximum absolute correlation
-
-    Returns
-    -------
-    dict:
-        corr_by_lag: (n_lags, *spatial_shape)
-        lags: (n_lags,)
-        best_corr: (*spatial_shape,)
-        best_lag: (*spatial_shape,)
-        spatial_shape: tuple
-    """
-    A = np.asarray(activation_trace, dtype=np.float32).reshape(-1)
-    ca = np.asarray(ca_patch_stack, dtype=np.float32)
-
-    if ca.ndim < 3:
-        raise ValueError(
-            "ca_patch_stack should be at least 3D: "
-            "(T, X, Y) or (T, Z, X, Y). "
-            f"Got shape {ca.shape}"
-        )
-
-    T = ca.shape[0]
-    spatial_shape = ca.shape[1:]
-
-    if len(A) != T:
-        raise ValueError(
-            f"activation_trace length {len(A)} != ca_patch_stack time length {T}"
-        )
-
-    if use_dff:
-        ca = _compute_dff_stack(ca)
-
-    # Optional temporal smoothing for each spatial trace.
-    # Works for both 2D and 3D Ca, because we flatten space.
-    ca_flat = ca.reshape(T, -1).astype(np.float32)
-
-    if ca_smooth_win is not None and ca_smooth_win > 1:
-        ca_smooth = np.zeros_like(ca_flat, dtype=np.float32)
-        for j in range(ca_flat.shape[1]):
-            ca_smooth[:, j] = _smooth_1d(ca_flat[:, j], win=ca_smooth_win)
-        ca_flat = ca_smooth
-
-    lags = np.arange(-int(max_lag), int(max_lag) + 1, dtype=int)
-
-    n_lags = len(lags)
-    n_sites = ca_flat.shape[1]
-
-    corr_by_lag_flat = np.full(
-        (n_lags, n_sites),
-        np.nan,
-        dtype=np.float32,
-    )
-
-    for li, lag in enumerate(lags):
-        if lag >= 0:
-            a_seg = A[:T - lag]
-            c_seg = ca_flat[lag:T, :]
-        else:
-            a_seg = A[-lag:T]
-            c_seg = ca_flat[:T + lag, :]
-
-        if len(a_seg) < 3:
-            continue
-
-        a_z = _zscore_1d(a_seg)
-
-        if np.nanstd(a_z) < min_std:
-            continue
-
-        C_z = _zscore_time_matrix(c_seg)
-
-        corr = np.nanmean(C_z * a_z[:, None], axis=0)
-        corr_by_lag_flat[li, :] = corr.astype(np.float32)
-
-    corr_by_lag = corr_by_lag_flat.reshape(
-        (n_lags,) + tuple(spatial_shape)
-    )
-
-    # ------------------------------------------------------------
-    # Choose best lag for each spatial location
-    # ------------------------------------------------------------
-    if lag_mode == "positive":
-        score_flat = corr_by_lag_flat.copy()
-    elif lag_mode == "absolute":
-        score_flat = np.abs(corr_by_lag_flat)
-    else:
-        raise ValueError(f"Unknown lag_mode: {lag_mode}")
-
-    finite_any = np.any(np.isfinite(score_flat), axis=0)
-
-    score_safe = np.where(np.isfinite(score_flat), score_flat, -np.inf)
-
-    best_idx_flat = np.zeros(n_sites, dtype=np.int32)
-    best_idx_flat[finite_any] = np.argmax(score_safe[:, finite_any], axis=0)
-
-    best_corr_flat = np.full(n_sites, np.nan, dtype=np.float32)
-    best_lag_flat = np.full(n_sites, 0, dtype=np.int32)
-
-    idx_sites = np.arange(n_sites)
-
-    best_corr_flat[finite_any] = corr_by_lag_flat[
-        best_idx_flat[finite_any],
-        idx_sites[finite_any],
-    ]
-
-    best_lag_flat[finite_any] = lags[best_idx_flat[finite_any]]
-
-    best_corr = best_corr_flat.reshape(spatial_shape).astype(np.float32)
-    best_lag = best_lag_flat.reshape(spatial_shape).astype(np.int32)
-
-    return {
-        "corr_by_lag": corr_by_lag.astype(np.float32),
-        "lags": lags,
-        "best_corr": best_corr,
-        "best_lag": best_lag,
-        "spatial_shape": tuple(spatial_shape),
-        "ca_ndim": ca.ndim,
-    }
-
-
-def get_top_ca_sites_from_corr_map(
-    corr_map,
-    lag_map=None,
-    top_n=20,
-    min_corr=None,
-):
-    """
-    Get top Ca sites from 2D or 3D correlation map.
-
-    Supports:
-        corr_map: (X, Y)
-        corr_map: (Z, X, Y)
-        or generally: (*spatial_shape,)
-
-    Returns
-    -------
-    rows:
-        list of dicts with:
-            coord: tuple
-            corr: float
-            lag: int, optional
-            plus convenience keys for 2D/3D
-    """
-    corr = np.asarray(corr_map, dtype=np.float32)
-    flat = corr.reshape(-1)
-
-    valid = np.isfinite(flat)
-
-    if min_corr is not None:
-        valid &= flat >= float(min_corr)
-
-    idx_all = np.where(valid)[0]
-
-    if len(idx_all) == 0:
-        return []
-
-    order = idx_all[np.argsort(flat[idx_all])[::-1]]
-    order = order[:int(top_n)]
-
-    rows = []
-
-    for idx in order:
-        coord = np.unravel_index(int(idx), corr.shape)
-        coord = tuple(int(c) for c in coord)
-
-        row = {
-            "coord": coord,
-            "corr": float(corr[coord]),
-        }
-
-        # Backward-compatible convenience fields
-        if corr.ndim == 2:
-            row["x"] = coord[0]
-            row["y"] = coord[1]
-        elif corr.ndim == 3:
-            row["z"] = coord[0]
-            row["x"] = coord[1]
-            row["y"] = coord[2]
-
-        if lag_map is not None:
-            lag = np.asarray(lag_map)
-            row["lag"] = int(lag[coord])
-
-        rows.append(row)
-
-    return rows
-
-import numpy as np
-
 
 # ============================================================
 # Basic helpers
@@ -8019,3 +7938,438 @@ def visualize_top_dependency_components_with_lag_and_p(
                 )
 
     return components
+
+
+# ============================================================
+# Pattern Unified Mode Computation
+# ============================================================
+
+def compute_pattern_unified_mode(
+    pattern,
+    episodes,
+    use_velocity=True,
+    mask_mode="best_cc",
+    sign_method="correlation",
+    h_resample_len=None,
+    verbose=True,
+):
+    """Compute a unified common mode (H, B) for a MotionPattern.
+
+    For each member mode in the pattern, this function:
+
+    1. Determines a **unified spatial mask** covering all members
+       (best_cc by default: largest connected component of the highest-energy
+       member's support mask).
+    2. **Fills in missing B** for patches in the unified mask that a mode
+       does not cover, using the original episode motion data M and the
+       mode's fixed activation h::
+
+           b_new = M[patch]^T @ h / (h^T @ h)
+
+       where M[patch] is the (T, 2) motion trace at that patch.
+    3. **Sign-aligns** all member (h, B) pairs so that modes whose h and B
+       happen to be flipped (i.e., -h, -B) are corrected before averaging.
+    4. **Averages** the sign-aligned h's (resampled to a common length)
+       and B's (over the unified mask) to produce a single prototype.
+
+    Parameters
+    ----------
+    pattern : MotionPattern
+        A pattern produced by ``getMotionPattern``.
+    episodes : list of MotionEpisode
+        All episodes (needed to look up original motion data by episode_id).
+        A dict ``{episode_id: episode}`` is also accepted.
+    use_velocity : bool
+        If True, use ``episode.motion_delta`` (velocity).
+        If False, use ``episode.motion_abs`` (cumulative displacement).
+    mask_mode : str
+        ``"union"`` — union of all member support masks.
+        ``"largest"`` — take the mask from the mode with the largest area.
+        ``"best_cc"`` — take the largest connected component of the support
+        mask from the member with the highest total response energy.
+    sign_method : str
+        ``"correlation"`` — sign-align by Pearson r between h vectors.
+        ``"dtw"`` — sign-align by DTW distance (slower but handles
+        variable-length h's better).
+    h_resample_len : int or None
+        Target length for resampling all h's. If None, uses the median
+        length across members.
+    verbose : bool
+
+    Returns
+    -------
+    unified_h : np.ndarray, shape (T_unified,)
+        Averaged, sign-aligned activation curve.
+    unified_B : np.ndarray, shape (H, W, 2)
+        Averaged response field over the unified spatial mask (zero outside).
+    unified_mask : np.ndarray, shape (H, W), bool
+        The unified spatial mask.
+    info : dict
+        Per-member details: sign flips, fill counts, individual unified B's.
+    """
+    import numpy as np
+    from scipy.interpolate import interp1d
+
+    members = getattr(pattern, "regions", None) or getattr(pattern, "members", [])
+    if len(members) == 0:
+        raise ValueError("Pattern has no members.")
+
+    # ---- build episode lookup ----
+    if isinstance(episodes, dict):
+        ep_lookup = episodes
+    else:
+        ep_lookup = {getattr(ep, "episode_id", -1): ep for ep in episodes}
+
+    # ---- Step 1: determine unified spatial mask ----
+    masks = []
+    areas = []
+    for m in members:
+        sm = _get_region_mask_simple(m)
+        if sm is not None:
+            masks.append(sm)
+            areas.append(int(np.sum(sm)))
+        else:
+            masks.append(None)
+            areas.append(0)
+
+    if all(m is None for m in masks):
+        raise ValueError("No member has a valid support mask.")
+
+    # Determine mask shape (use the largest mask shape to be safe)
+    mask_shape = max(
+        (m.shape for m in masks if m is not None), key=lambda s: s[0] * s[1]
+    )
+
+    # Pad all masks to the same shape
+    masks_padded = []
+    for m in masks:
+        if m is None:
+            masks_padded.append(np.zeros(mask_shape, dtype=bool))
+        elif m.shape == mask_shape:
+            masks_padded.append(m.astype(bool))
+        else:
+            padded = np.zeros(mask_shape, dtype=bool)
+            h, w = min(m.shape[0], mask_shape[0]), min(m.shape[1], mask_shape[1])
+            padded[:h, :w] = m[:h, :w].astype(bool)
+            masks_padded.append(padded)
+
+    if mask_mode == "largest":
+        best_idx = int(np.argmax(areas))
+        unified_mask = masks_padded[best_idx].copy()
+    elif mask_mode == "best_cc":
+        # Select the member with the largest total response energy
+        # (sum of ||B||_2 over its support mask), then take the largest
+        # connected component of its support mask.
+        energies = []
+        for m in members:
+            A = getattr(m, "response_strength", None)
+            sm = _get_region_mask_simple(m)
+            if A is not None and sm is not None:
+                # Energy = sum of response strength within the support mask
+                A_arr = np.asarray(A, dtype=np.float64)
+                sm_arr = np.asarray(sm, dtype=bool)
+                if A_arr.shape == sm_arr.shape:
+                    energies.append(float(np.sum(A_arr[sm_arr])))
+                else:
+                    energies.append(0.0)
+            else:
+                energies.append(0.0)
+
+        if max(energies) <= 0:
+            # Fallback to union if no energy info available
+            unified_mask = np.any(np.stack(masks_padded, axis=0), axis=0)
+        else:
+            best_idx = int(np.argmax(energies))
+            best_mask = masks_padded[best_idx].copy()
+            # Find largest connected component
+            labeled, n_cc = ndi.label(best_mask)
+            if n_cc <= 1:
+                unified_mask = best_mask
+            else:
+                # Keep only the largest component
+                cc_sizes = ndi.sum(best_mask.astype(np.int32), labeled,
+                                   index=np.arange(1, n_cc + 1))
+                largest_label = int(np.argmax(cc_sizes)) + 1
+                unified_mask = (labeled == largest_label)
+
+            if verbose:
+                print(
+                    f"[compute_pattern_unified_mode] best_cc: "
+                    f"selected member[{best_idx}] energy={energies[best_idx]:.2f}, "
+                    f"n_cc={n_cc}, unified_area={int(np.sum(unified_mask))}"
+                )
+    else:  # "union"
+        unified_mask = np.any(np.stack(masks_padded, axis=0), axis=0)
+
+    n_unified = int(np.sum(unified_mask))
+    if verbose:
+        print(
+            f"[compute_pattern_unified_mode] mask_mode={mask_mode}, "
+            f"unified_mask area={n_unified} patches"
+        )
+
+    # ---- Step 2: for each member, compute complete B over unified mask ----
+    H_pad, W_pad = mask_shape
+    member_h = []        # sign-aligned h's
+    member_B_full = []   # complete B over unified mask: dict (r,c) -> (2,)
+    member_signs = []    # +1 or -1
+    member_fill_counts = []  # how many patches were filled per member
+    member_info = []
+
+    for idx, m in enumerate(members):
+        eid = getattr(m, "episode_id", -1)
+        ep = ep_lookup.get(eid)
+        h_raw = _get_region_activation(m)
+        B_raw = _get_region_response_field(m)
+        sm = masks_padded[idx]
+
+        if h_raw is None or ep is None:
+            member_h.append(None)
+            member_B_full.append(None)
+            member_signs.append(1.0)
+            member_fill_counts.append(0)
+            member_info.append({
+                "idx": idx, "episode_id": eid, "error": "missing h or episode"
+            })
+            continue
+
+        h = np.asarray(h_raw, dtype=np.float64).reshape(-1)
+        T_h = len(h)
+
+        # Get motion data
+        motion_raw = None
+        if use_velocity:
+            motion_raw = getattr(ep, "motion_delta", None)
+            if motion_raw is None:
+                motion_raw = getattr(ep, "motion_abs", None)
+        else:
+            motion_raw = getattr(ep, "motion_abs", None)
+            if motion_raw is None:
+                motion_raw = getattr(ep, "motion_delta", None)
+
+        if motion_raw is None:
+            member_h.append(None)
+            member_B_full.append(None)
+            member_signs.append(1.0)
+            member_fill_counts.append(0)
+            member_info.append({
+                "idx": idx, "episode_id": eid, "error": "no motion data"
+            })
+            continue
+
+        motion = np.asarray(motion_raw, dtype=np.float64)
+        if motion.ndim != 3:
+            member_h.append(None)
+            member_B_full.append(None)
+            member_signs.append(1.0)
+            member_fill_counts.append(0)
+            member_info.append({
+                "idx": idx, "episode_id": eid, "error": "no motion data"
+            })
+            continue
+
+        # motion: (T, N, 2) — trim T to match h if needed
+        T_motion = motion.shape[0]
+        if T_h < T_motion:
+            motion = motion[:T_h]
+        elif T_h > T_motion:
+            h = h[:T_motion]
+            T_h = T_motion
+
+        # valid_coords: (N, 2) mapping compact index → (r, c)
+        vc = getattr(m, "valid_coords", None)
+        if vc is None:
+            vc = np.argwhere(sm)
+        vc = np.asarray(vc)
+        N_ep = vc.shape[0]
+
+        # Build reverse mapping: (r, c) → compact index
+        coord_to_compact = {}
+        for ci in range(N_ep):
+            r, c = int(vc[ci, 0]), int(vc[ci, 1])
+            if 0 <= r < H_pad and 0 <= c < W_pad:
+                coord_to_compact[(r, c)] = ci
+
+        # Compute h_norm_sq = h @ h (should be ≈1 for V2, but compute anyway)
+        h_norm_sq = float(np.dot(h, h))
+        if h_norm_sq < 1e-12:
+            member_h.append(None)
+            member_B_full.append(None)
+            member_signs.append(1.0)
+            member_fill_counts.append(0)
+            member_info.append({
+                "idx": idx, "episode_id": eid, "error": "h is zero"
+            })
+            continue
+
+        # Build complete B over unified mask
+        B_complete = {}  # (r, c) → (b_x, b_y)
+        n_filled = 0
+        unified_coords = np.argwhere(unified_mask)
+
+        for r, c in unified_coords:
+            r_i, c_i = int(r), int(c)
+
+            # Check if this mode already covers this patch
+            if r_i < sm.shape[0] and c_i < sm.shape[1] and sm[r_i, c_i]:
+                # Use existing B
+                if B_raw is not None and r_i < B_raw.shape[0] and c_i < B_raw.shape[1]:
+                    B_complete[(r_i, c_i)] = np.asarray(
+                        B_raw[r_i, c_i], dtype=np.float64
+                    )
+                else:
+                    B_complete[(r_i, c_i)] = np.zeros(2, dtype=np.float64)
+            else:
+                # Fill: compute B = M[patch]^T @ h / (h @ h)
+                compact_idx = coord_to_compact.get((r_i, c_i))
+                if compact_idx is not None and compact_idx < motion.shape[1]:
+                    m_patch = motion[:, compact_idx, :]  # (T, 2)
+                    b_new = (m_patch.T @ h) / h_norm_sq  # (2,)
+                    B_complete[(r_i, c_i)] = b_new
+                    n_filled += 1
+                else:
+                    # Patch not in episode's valid region — leave as zero
+                    B_complete[(r_i, c_i)] = np.zeros(2, dtype=np.float64)
+
+        member_h.append(h)
+        member_B_full.append(B_complete)
+        member_signs.append(1.0)
+        member_fill_counts.append(n_filled)
+        member_info.append({
+            "idx": idx,
+            "episode_id": eid,
+            "mode_id": getattr(m, "mode_id", -1),
+            "h_len": T_h,
+            "n_filled": n_filled,
+            "n_existing": int(np.sum(sm)),
+        })
+
+    if verbose:
+        n_valid = sum(1 for h in member_h if h is not None)
+        total_filled = sum(member_fill_counts)
+        print(
+            f"[compute_pattern_unified_mode] {n_valid}/{len(members)} valid members, "
+            f"total filled patches: {total_filled}"
+        )
+
+    # ---- Step 3: sign alignment ----
+    valid_indices = [i for i, h in enumerate(member_h) if h is not None]
+    if len(valid_indices) == 0:
+        raise ValueError("No valid members to build unified mode.")
+
+    # Pick reference: the member with the largest support area among valid ones
+    ref_idx = max(valid_indices, key=lambda i: areas[i])
+
+    for i in valid_indices:
+        if i == ref_idx:
+            continue
+        h_ref = member_h[ref_idx]
+        h_i = member_h[i]
+
+        # Use common length for comparison
+        if len(h_ref) != len(h_i):
+            common_len = min(len(h_ref), len(h_i))
+            hr = h_ref[:common_len]
+            hi = h_i[:common_len]
+        else:
+            hr, hi = h_ref, h_i
+
+        if sign_method == "correlation":
+            corr_pos = np.corrcoef(hr, hi)[0, 1] if len(hr) > 2 else 1.0
+            corr_neg = np.corrcoef(hr, -hi)[0, 1] if len(hr) > 2 else -1.0
+            if not np.isfinite(corr_pos):
+                corr_pos = 0.0
+            if not np.isfinite(corr_neg):
+                corr_neg = 0.0
+
+            if corr_neg > corr_pos:
+                member_signs[i] = -1.0
+                member_h[i] = -member_h[i]
+                B_i = member_B_full[i]
+                if B_i is not None:
+                    for k in B_i:
+                        B_i[k] = -B_i[k]
+        else:  # "dtw"
+            d_pos = _dtw_distance_1d(hr, hi)
+            d_neg = _dtw_distance_1d(hr, -hi)
+            if d_neg < d_pos:
+                member_signs[i] = -1.0
+                member_h[i] = -member_h[i]
+                B_i = member_B_full[i]
+                if B_i is not None:
+                    for k in B_i:
+                        B_i[k] = -B_i[k]
+
+    n_flipped = sum(1 for s in member_signs if s < 0)
+    if verbose:
+        print(
+            f"[compute_pattern_unified_mode] sign alignment: "
+            f"ref=member[{ref_idx}], {n_flipped} flipped"
+        )
+
+    # ---- Step 4: average H and B ----
+    valid_h = [member_h[i] for i in valid_indices]
+    h_lengths = [len(h) for h in valid_h]
+
+    if h_resample_len is None:
+        target_len = int(np.median(h_lengths))
+    else:
+        target_len = int(h_resample_len)
+
+    h_resampled = []
+    for h in valid_h:
+        if len(h) == target_len:
+            h_resampled.append(h)
+        else:
+            t_orig = np.linspace(0, 1, len(h))
+            t_new = np.linspace(0, 1, target_len)
+            h_resampled.append(interp1d(t_orig, h, kind="linear")(t_new))
+
+    h_stack = np.stack(h_resampled, axis=0)  # (M, target_len)
+    unified_h = np.mean(h_stack, axis=0).astype(np.float32)
+
+    # Renormalize to unit norm (V2 convention)
+    h_norm = np.linalg.norm(unified_h)
+    if h_norm > 1e-12:
+        unified_h = unified_h / h_norm
+
+    # B: average over unified mask
+    unified_B = np.zeros((H_pad, W_pad, 2), dtype=np.float32)
+    count_map = np.zeros((H_pad, W_pad), dtype=np.int32)
+
+    for i in valid_indices:
+        B_i = member_B_full[i]
+        if B_i is None:
+            continue
+        for (r, c), b_vec in B_i.items():
+            if 0 <= r < H_pad and 0 <= c < W_pad:
+                unified_B[r, c, 0] += b_vec[0]
+                unified_B[r, c, 1] += b_vec[1]
+                count_map[r, c] += 1
+
+    mask_valid = count_map > 0
+    unified_B[mask_valid, 0] /= count_map[mask_valid].astype(np.float32)
+    unified_B[mask_valid, 1] /= count_map[mask_valid].astype(np.float32)
+
+    info = {
+        "unified_h": unified_h,
+        "unified_B": unified_B,
+        "unified_mask": unified_mask,
+        "h_resample_len": target_len,
+        "ref_member_idx": ref_idx,
+        "n_members": len(members),
+        "n_valid": len(valid_indices),
+        "n_flipped": n_flipped,
+        "member_signs": member_signs,
+        "member_fill_counts": member_fill_counts,
+        "member_info": member_info,
+    }
+
+    if verbose:
+        print(
+            f"[compute_pattern_unified_mode] unified mode: "
+            f"h_len={target_len}, B_shape={unified_B.shape}, "
+            f"patches with >=1 member: {int(np.sum(mask_valid))}"
+        )
+
+    return unified_h, unified_B, unified_mask, info
