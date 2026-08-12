@@ -229,3 +229,125 @@ def test_b044_k0_episode_source_viz_returns_cleanly():
     assert result is None
 
     assert plt.get_fignums() == []
+
+
+# ---------------------------------------------------------------------------
+# B-017 / B-019 / B-020 — temporal gap-closing semantics
+# ---------------------------------------------------------------------------
+
+
+def _active_trace(pattern):
+    """(T,1,1) motionMag where 1 -> active under restMotion=0.5, use_abs_dev=False."""
+    a = np.asarray(pattern, dtype=np.float32).reshape(-1, 1, 1)
+    return a, np.zeros_like(a) + 0.5
+
+
+def _run_units(pattern, close_gap_frames, extend_radius=0):
+    """Return the MotionUnits of the single patch (getMotionUnit yields (units_map, mask))."""
+    mag, rest = _active_trace(pattern)
+    motion = np.zeros((mag.shape[0], 1, 1, 2), dtype=np.float32)
+    units_map, _mask = mcp.getMotionUnit(
+        motion, mag, rest, extend_radius=extend_radius,
+        use_gpu=False, close_gap_frames=close_gap_frames, use_abs_dev=False,
+    )
+    return units_map[0][0]
+
+
+def _spans(units):
+    return sorted((int(u.time_range[0]), int(u.time_range[1])) for u in units)
+
+
+def test_b019_closes_exactly_gaps_up_to_close_gap_frames():
+    """A gap of exactly n closes; a gap of n+1 stays open — for even and odd structure sizes. Regression for B-019."""
+    for n in (1, 2, 3, 4):
+        closed = [1, 1] + [0] * n + [1, 1]
+        assert len(_run_units(closed, n)) == 1, f"gap {n} should close at n={n}"
+        open_ = [1, 1] + [0] * (n + 1) + [1, 1]
+        assert len(_run_units(open_, n)) == 2, f"gap {n + 1} should stay open at n={n}"
+
+
+def test_b019_border_runs_are_not_eroded():
+    """Border-touching activity survives AND a closeable gap still closes.
+
+    Both halves are needed: asserting only that t=0/t=T-1 survive would also pass
+    on code that does no closing at all (the pre-fix CPU path), so the trace also
+    contains a gap of exactly n that MUST close. Regression for B-019 (erosion)
+    and B-017 (CPU path did not close).
+    """
+    for n in (1, 2, 3, 5):
+        # run at t=0 | closeable gap of n | run | wide gap (stays open) | run at t=T-1
+        pattern = [1, 1, 1, 1] + [0] * n + [1, 1] + [0] * 12 + [1, 1, 1, 1]
+        T = len(pattern)
+        units = _run_units(pattern, n)
+        spans = _spans(units)
+        assert spans == [(0, 5 + n), (18 + n, T - 1)], f"n={n}: {spans}"
+        assert spans[0][0] == 0, f"n={n}: activity at t=0 was eroded"
+        assert spans[-1][1] == T - 1, f"n={n}: activity at t=T-1 was eroded"
+
+
+def _raw_runs(pattern):
+    """Independent oracle: the runs of a thresholded trace, with NO gap closing."""
+    spans, t = [], 0
+    pattern = list(pattern)
+    while t < len(pattern):
+        if pattern[t]:
+            s = t
+            while t + 1 < len(pattern) and pattern[t + 1]:
+                t += 1
+            spans.append((s, t))
+        t += 1
+    return spans
+
+
+def test_b017_close_gap_frames_zero_is_a_strict_noop():
+    """close_gap_frames=0 (the default) leaves the mask untouched — protects every existing config.
+
+    Asserted against an INDEPENDENT oracle (the raw thresholded runs), not against
+    a sibling call with a different argument: comparing 0 against None would be
+    satisfied by code that closes gaps in *both* cases. Regression for B-017.
+    """
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        pattern = (rng.random(30) > 0.5).astype(np.float32)
+        expected = _raw_runs(pattern)
+        assert _spans(_run_units(pattern, 0)) == expected
+        assert _spans(_run_units(pattern, None)) == expected
+
+
+def test_b017_gpu_branch_also_closes_gaps():
+    """Both backends route through the shared closing helper — the GPU call site is not silently dropped.
+
+    No test can execute the GPU branch on a CPU host, so removing its
+    `_close_temporal_gaps(...)` call would otherwise leave the whole suite green
+    while reintroducing B-017 on the path that actually runs in production.
+    This pins the structure instead. Regression for B-017.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(mcp.getMotionUnit)))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_close_temporal_gaps"
+    ]
+    use_gpu_args = sorted(
+        ast.unparse(kw.value) for c in calls for kw in c.keywords if kw.arg == "use_gpu"
+    )
+    assert use_gpu_args == ["False", "True"], (
+        f"expected one closing call per backend, got {use_gpu_args}"
+    )
+
+
+def test_b020_explicit_use_gpu_without_cupy_raises_clearly():
+    """use_gpu=True without CuPy raises an actionable error, not an opaque NoneType AttributeError. Regression for B-020."""
+    if mcp.HAS_CUPY:
+        pytest.skip("CuPy present: the GPU path is real here")
+    mag, rest = _active_trace([1, 0, 1])
+    motion = np.zeros((3, 1, 1, 2), dtype=np.float32)
+    with pytest.raises(RuntimeError, match="CuPy is unavailable"):
+        mcp.getMotionUnit(motion, mag, rest, use_gpu=True, use_abs_dev=False)
+    # and an unrecognised string is rejected rather than silently selecting GPU
+    with pytest.raises(ValueError, match="must be True, False or 'auto'"):
+        mcp.getMotionUnit(motion, mag, rest, use_gpu="cpu", use_abs_dev=False)
