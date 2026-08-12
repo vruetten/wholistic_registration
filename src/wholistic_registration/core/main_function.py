@@ -781,12 +781,16 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
                     hf.create_dataset("motion", data=motion[k], compression="gzip")
 
         # ---------- maintain reference windows ----------
-        if i == 0:
-            for k in range(len(mem_reg)):
-                if len(head_mem) < reference_chunk:
-                    head_mem.append(mem_reg[k])
-                    if dual_channel:
-                        head_ca.append(ca_reg[k])
+        # Top up on every batch (mirrors tail_mem below): batch 0 alone only ever
+        # holds batch_size frames, so the backward seed stayed short of the
+        # configured reference_chunk whenever reference_chunk > batch_size. The
+        # length guard keeps the FIRST reference_chunk frames -- letting the deque
+        # evict instead would leave the head window holding the block's tail.
+        for k in range(len(mem_reg)):
+            if len(head_mem) < reference_chunk:
+                head_mem.append(mem_reg[k])
+                if dual_channel:
+                    head_ca.append(ca_reg[k])
 
         for k in range(len(mem_reg)):
             tail_mem.append(mem_reg[k])
