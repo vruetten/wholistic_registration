@@ -102,6 +102,41 @@ def test_b012_activationless_pair_gets_invalid_activation_not_stale_distance():
         assert D2[pair] >= 1e6
 
 
+def test_b018_artifact_filter_discards_pure_whole_body_motion():
+    """filter_episodes_artifacts discards a pure whole-body-motion episode (identical cumulative sinusoid on every patch) at default max_global_corr. Regression for B-018 (fixed in fix/b018-artifact-filter)."""
+    T = 40
+    valid_mask = np.zeros((24, 24), dtype=bool)
+    valid_mask[2:22, 2:22] = True
+
+    region = np.zeros((24, 24), dtype=np.uint8)
+    region[10:13, 10:13] = 1  # 9 interior patches, away from the edge zone
+    N = int(region.sum())
+
+    # motions_obtain-style cumulative sinusoid, identical across patches
+    t = np.arange(T, dtype=np.float32)
+    s = 5.0 * np.sin(2.0 * np.pi * t / T)  # cumulative displacement
+    motion_abs = np.repeat(s[:, None, None], N, axis=1)
+    motion_abs = np.concatenate([motion_abs, motion_abs], axis=2)  # (T, N, 2)
+    delta = np.diff(s, prepend=0.0).astype(np.float32)
+    motion_delta = np.repeat(delta[:, None, None], N, axis=1)
+    motion_delta = np.concatenate([motion_delta, motion_delta], axis=2)  # (T, N, 2)
+    global_motion = np.stack([s, s], axis=1)  # (T, 2) cumulative
+
+    ep = mcp.MotionEpisode(
+        time_range=(0, T - 1),
+        region_mask=region,
+        episode_id=0,
+        motion_delta=motion_delta,
+        motion_abs=motion_abs,
+        global_motion=global_motion,
+    )
+
+    kept = mcp.filter_episodes_artifacts([ep], valid_mask, verbose=False)
+
+    # the episode IS the whole sample moving together -> must be discarded
+    assert len(kept) == 0
+
+
 def test_b041_unfitted_episode_skipped_and_valueerror():
     """summarize_temporal_basis_likeness skips a default (mode_model={}) episode and _get_BH_from_episode raises ValueError on it. Regression for B-041 (fixed in 867e82c)."""
     ep = mcp.MotionEpisode()
