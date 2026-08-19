@@ -4440,7 +4440,7 @@ def visualize_episode_regions(
         ax.imshow(_auto_contrast(ref_img), cmap="gray", origin="upper")
     else:
         ax.imshow(np.asarray(episode.spatial_region).T, cmap="gray", origin="upper")
-    cmap = cm.get_cmap("tab20")
+    cmap = plt.get_cmap("tab20")
     for i, r in enumerate(regions[:max_regions]):
         A = np.asarray(r.response_strength, dtype=np.float32)
         vmax = float(np.max(A))
