@@ -29,7 +29,10 @@ from skimage.measure import regionprops
 # ---------------------------------------------------------------------------
 # GPU + paths
 # ---------------------------------------------------------------------------
-cp.cuda.Device(1).use()
+# Device index is configurable so the script runs on single-GPU nodes, where
+# device 1 does not exist. Default 1 keeps the original behaviour.
+GPU_DEVICE = int(os.environ.get("GPU_DEVICE", "1"))
+cp.cuda.Device(GPU_DEVICE).use()
 
 HERE = Path(__file__).resolve().parent
 PKG_DIR = HERE.parent
@@ -45,10 +48,25 @@ import f260517_helpers as fh
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-F260517_mov_path = "/home/cyf/wbi/Virginia/raw_data/f260517/260517_exp_00001_TZCYX.ome.tiff"
-F260517_ref_path = "/home/cyf/wbi/Virginia/raw_data/f260517/260517_anat_00003_TZCYX.ome.tiff"
+# Original paths on the collaborator's machine, kept for reference:
+# F260517_mov_path = "/home/cyf/wbi/Virginia/raw_data/f260517/260517_exp_00001_TZCYX.ome.tiff"
+# F260517_ref_path = "/home/cyf/wbi/Virginia/raw_data/f260517/260517_anat_00003_TZCYX.ome.tiff"
+# BASE_OUT = Path("/home/cyf/wbi/Virginia/registrated_data/f260517/f260517_0625")
 
-BASE_OUT = Path("/home/cyf/wbi/Virginia/registrated_data/f260517/f260517_0625")
+# Janelia paths.
+F260517_DATA_DIR = "/nrs/ahrens/Virginia_nrs/wVT/mesoscope/260517_ubbr_mkate_phox2b"
+
+# IO.readTiff calls tifffile.asarray() on the whole file, so the full 15.1 GB
+# moving stack is read entirely into RAM before any slicing. The 8-timepoint
+# truncation (605 MB) is the default; uncomment the full file for a full run.
+F260517_mov_path = F260517_DATA_DIR + "/260517_exp_00001_TZCYX_first8.ome.tiff"
+# F260517_mov_path = F260517_DATA_DIR + "/260517_exp_00001_TZCYX.ome.tiff"
+F260517_ref_path = F260517_DATA_DIR + "/260517_anat_00003_TZCYX.ome.tiff"
+
+BASE_OUT = Path(os.environ.get(
+    "F260517_OUT_DIR",
+    F260517_DATA_DIR + "/repro_3frame_out",
+))
 DIRS = {
     "raw_moving_mem":        BASE_OUT / "raw_moving_mem",
     "raw_moving_sparseCell": BASE_OUT / "raw_moving_sparseCell",
@@ -79,6 +97,12 @@ Z_WINDOW = 3.0
 FILL_VALUE = -200.0
 WARMUP_FRAMES = [0, 1, 2, 3, 4]
 
+# Number of frames the forward loop registers. 0 or unset means every frame in
+# the moving file. The warmup phase is not limited by N_FRAMES: it always uses
+# WARMUP_FRAMES, because fixed_target_z is the median over those frames and a
+# shorter warmup would change the target planes the projection writes onto.
+N_FRAMES = int(os.environ.get("N_FRAMES", "0")) or None
+
 percentiles = [0.1, 0.5, 1, 2, 5, 10, 25, 50, 75, 90, 95, 99, 99.5, 99.8]
 
 # ===========================================================================
@@ -101,6 +125,9 @@ mov_mem_all    = F260517_mov[:, :, 1, :, :].astype(np.float32)
 mov_sparse_all = F260517_mov[:, :, 0, :, :].astype(np.float32)
 
 print(f"  loaded in {time.time()-t0:.1f}s")
+print(f"  mov file: {F260517_mov_path}")
+print(f"  mov raw shape (T,Z,C,Y,X) = {F260517_mov.shape}  dtype={F260517_mov.dtype}")
+print(f"  ref raw shape            = {F260517_ref.shape}  dtype={F260517_ref.dtype}")
 
 # ===========================================================================
 # 2. z_init + coords
@@ -116,6 +143,22 @@ z_idx = np.rint(z_init).astype(np.int32)
 z_idx = np.clip(z_idx, 0, ref_mem_raw.shape[0] - 1)
 
 K, T = int(z_init.shape[0]), int(mov_mem_all.shape[0])
+T_FILE = T
+
+# The warmup indexes mov_mem_all directly, so a moving file with fewer frames
+# than max(WARMUP_FRAMES)+1 would raise IndexError at the calibration step.
+# Drop the frames that are not in the file rather than let the index fail.
+if max(WARMUP_FRAMES) >= T_FILE:
+    WARMUP_FRAMES = [w for w in WARMUP_FRAMES if w < T_FILE]
+    if not WARMUP_FRAMES:
+        raise ValueError(f"moving file has {T_FILE} frames; warmup needs >= 1")
+    print(f"  WARMUP_FRAMES clamped to {WARMUP_FRAMES} "
+          f"(moving file has {T_FILE} frames)")
+
+# N_FRAMES limits only the forward loop, not the warmup.
+if N_FRAMES is not None:
+    T = min(T, N_FRAMES)
+print(f"  frames in file={T_FILE}  forward-loop frames={T}  warmup={WARMUP_FRAMES}")
 
 x_coord = np.arange(mov_mem_all[0].shape[2], dtype=np.float32)
 y_coord = np.arange(mov_mem_all[0].shape[1], dtype=np.float32)

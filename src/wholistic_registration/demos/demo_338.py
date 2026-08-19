@@ -27,6 +27,7 @@ T=100
 
 filePath='/home/cyf/wbi/Virginia/221124_f338_ubi_gCaMP7f_bactin_mCherry_CAAX_7dpf002.nd2'
 
+
 with nd2.ND2File(filePath) as f:
     metadata=f.metadata
     channels=metadata.channels[0]
@@ -77,6 +78,13 @@ with nd2.ND2File(filePath) as f:
                 # Compute median along time axis (axis=3 for 4D array)
                 dat_ref = np.median(dat_channel2[:, :, :, ref_range], axis=3).astype(np.float32)
             
+            if tCnt > refLength: # ginny's version
+                current_jump = np.min((tCnt - refLength) // refJump, 1)
+                print(f"current_jump: {current_jump}")
+
+                ref_range = np.arange(tCnt - refLength * current_jump, tCnt, refJump)
+                # Compute median along time axis (axis=3 for 4D array)
+                dat_ref = np.median(dat_channel2[:, :, :, ref_range], axis=3).astype(np.float32)
             # Generate and filter mask
             # option['mask_ref'] = mask.getMask(dat_ref, thresFactor)
             # option['mask_ref'] = mask.bwareafilt3_wei(option['mask_ref'], maskRange)
