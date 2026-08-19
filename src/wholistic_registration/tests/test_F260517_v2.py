@@ -341,18 +341,19 @@ F260517_ref_mem_adj, src_q, tgt_q, used_percentiles = (
 print("[Init] Updated reference intensity mapping using mean of raw frames", init_calibration_frames)
 print("src_q:", src_q)
 print("tgt_q:", tgt_q)
-#%%
+#%% # check color mapping
 
 F260517_ref_mem_adj.shape
 vmin, vmax = np.percentile(F260517_ref_mem[0,:,:], [5, 99])
 pl.figure()
-pl.imshow(F260517_ref_mem[0,:,:], vmin=vmin, vmax=vmax)
+pl.imshow(F260517_ref_mem[20,:,:], vmin=vmin, vmax=vmax)
 pl.colorbar()
 pl.figure()
-pl.imshow(F260517_ref_mem_adj[:,:,0] , vmin=vmin, vmax=vmax)
+pl.imshow(F260517_ref_mem_adj[:,:,20].T , vmin=vmin, vmax=vmax)
 pl.colorbar()
-
-pl.
+pl.figure()
+pl.imshow(F260517_mov_mem[0,0], vmin=vmin, vmax=vmax)
+pl.colorbar()
 
 # %%
 # ============================================================================
@@ -365,7 +366,7 @@ pl.
 # How many time frames to actually process (smoke-test cap from CONFIG).
 T_run = T if N_FRAMES_LIMIT is None else min(T, int(N_FRAMES_LIMIT))
 print(f"Processing {T_run} of {T} frames (N_FRAMES_LIMIT={N_FRAMES_LIMIT}).")
-
+#%%
 # --- Global state -----------------------------------------------------------
 registered_mem_mapped = {}   # frame_idx -> mem_mapped_zyx (K, Y, X)
 processed_count = 0
@@ -446,10 +447,11 @@ def process_single_frame(i, ref_mem_adj):
     mem_mapped = mem_mapped.astype(np.float32, copy=False)
 
     # Registration residual (large by construction: mem_mapped is ref-derived).
-    mem_err = float(np.mean(np.abs(mov_mem_i - mem_mapped)))
+    mem_err = float(np.mean(np.abs(mov_mem_i - mem_mapped))) # actual pixels recorded in low res space, and the sampled points are in high res space
 
     mem_mapped_zyx = mem_mapped.transpose(2, 1, 0).astype(np.float32, copy=False)
 
+    # ONLY FOR VISUALIZATION: estimate the target z plane for each moving slice
     target_z_pred_i, df_z_i = fh.estimate_projection_z_from_phase_simple(
         phase_new=phase_new,
         z_init=z_init,
