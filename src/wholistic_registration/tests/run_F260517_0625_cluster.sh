@@ -10,7 +10,7 @@ source /groups/ahrens/home/ruttenv/miniforge3/etc/profile.d/conda.sh
 conda activate wholistic-registration
 
 # Resolve the repo root from this script's own location, so the payload runs
-against whichever checkout it was copied into.
+# against whichever checkout it was copied into.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 echo "repo root: $REPO_ROOT"
