@@ -26,6 +26,15 @@ Output (under f260517_0625_qc/ by default, see BASE_OUT below):
   refspace_sparseCell/     per-frame moving sparse-cell scattered into the
                             full reference grid, no z-window gate
                             [SAVE_REF_SPACE_VOLUME]
+  refspace_movie_mem.ome.tif        the same scatter as refspace_mem/, on every
+  refspace_movie_sparseCell.ome.tif  forward-loop frame rather than on
+                            REF_SPACE_SAVE_STRIDE, cropped to z
+                            [MOVIE_Z0, MOVIE_Z1) and reduced 2x in Y and X by
+                            2x2 block nanmean, as one (T,Z,Y,X) float32
+                            OME-TIFF per channel        [SAVE_REFSPACE_MOVIE]
+  refspace_movie_frames_mem/         the per-frame tiles the two movie files
+  refspace_movie_frames_sparseCell/   above are concatenated from
+                                                        [SAVE_REFSPACE_MOVIE]
   ref_surface_mem/         the membrane reference sampled onto the same K
                             fixed target planes as projected_mem/, one volume
                             per run, not per frame                    [SAVE_REF_SURFACE]
@@ -44,18 +53,20 @@ Output (under f260517_0625_qc/ by default, see BASE_OUT below):
     mov_mem_f{i}.npy                                      [SAVE_COMPARE_INPUTS, default off]
     coverage/                no_coverage_{i:06d}.npz       [SAVE_COVERAGE_MAP]
     refspace_summary.csv                                  [SAVE_REF_SPACE_VOLUME]
+    refspace_movie_summary.csv                            [SAVE_REFSPACE_MOVIE]
   Each array above (phase_new, motion_current, mov_mem, per frame) is
   written exactly once, flat under diagnostics/; no motion_field/
   subdirectory and no duplicate copy exist.
 """
 
-import json, os, sys, time
+import json, os, sys, time, warnings
 from pathlib import Path
 
 import cupy as cp
 import cupyx
 import numpy as np
 import pandas as pd
+import tifffile
 from scipy.ndimage import distance_transform_edt, label as label_ndi, sobel
 from skimage.measure import regionprops
 
@@ -117,6 +128,11 @@ DIRS = {
     "alignment_qc":          BASE_OUT / "diagnostics" / "alignment_qc",
     "masks_mov":              BASE_OUT / "diagnostics" / "masks_mov",
     "coverage":                BASE_OUT / "diagnostics" / "coverage",
+    # Per-timepoint cropped/downsampled tiles the two assembled movie files are
+    # built from. Created unconditionally, like coverage/ above, so the DIRS
+    # table stays a single list of every directory this script can write.
+    "refspace_movie_frames_mem":        BASE_OUT / "refspace_movie_frames_mem",
+    "refspace_movie_frames_sparseCell": BASE_OUT / "refspace_movie_frames_sparseCell",
 }
 for d in DIRS.values():
     os.makedirs(str(d), exist_ok=True)
@@ -258,6 +274,126 @@ SAVE_COVERAGE_MAP     = os.environ.get("SAVE_COVERAGE_MAP", "1") == "1"
 SAVE_REF_SPACE_VOLUME = os.environ.get("SAVE_REF_SPACE_VOLUME", "1") == "1"
 REF_SPACE_SAVE_STRIDE = int(os.environ.get("REF_SPACE_SAVE_STRIDE", "1"))
 SAVE_REF_SURFACE      = os.environ.get("SAVE_REF_SURFACE", "1") == "1"
+
+#   9. SAVE_REFSPACE_MOVIE   -- refspace_movie_mem.ome.tif and
+#                                refspace_movie_sparseCell.ome.tif at the output
+#                                tree root: the same scatter SAVE_REF_SPACE_VOLUME
+#                                writes (_scatter_trilinear_to_refspace, one call
+#                                per channel per frame, shared between the two
+#                                outputs), computed for EVERY forward-loop frame
+#                                rather than on REF_SPACE_SAVE_STRIDE, then
+#                                cropped in z to [MOVIE_Z0, MOVIE_Z1) of the
+#                                cropped reference frame and reduced 2x in Y and
+#                                X by a 2x2 block nanmean. Per-frame tiles are
+#                                written into refspace_movie_frames_{mem,
+#                                sparseCell}/ during the loop and concatenated
+#                                into one (T, MOVIE_Z1-MOVIE_Z0, Y/2, X/2)
+#                                float32 OME-TIFF per channel after the loop.
+SAVE_REFSPACE_MOVIE   = os.environ.get("SAVE_REFSPACE_MOVIE", "1") == "1"
+# Half-open z crop [MOVIE_Z0, MOVIE_Z1) applied to the scattered volume, in the
+# same cropped [REF_Z0, REF_Z1) reference frame every other z index in this
+# script uses. The default 10..65 comes from the occupied-plane range measured
+# on the 11 frames job 153471853 saved (refspace_summary.csv reported
+# mem_z_min drifting from 17 at frame 0 to 10 at frame 99 and mem_z_max <= 64),
+# so the default already covers that run's drift; it is not a claim about any
+# other run, which is why both bounds are env-readable.
+MOVIE_Z0 = int(os.environ.get("MOVIE_Z0", "10"))
+MOVIE_Z1 = int(os.environ.get("MOVIE_Z1", "65"))
+# Lateral reduction factor of the block nanmean. Fixed at 2 because
+# _block_nanmean_2x2 implements the 2x2 block reshape literally; changing this
+# number alone would not change the reduction.
+MOVIE_DOWNSAMPLE_XY = 2
+if SAVE_REFSPACE_MOVIE and not (0 <= MOVIE_Z0 < MOVIE_Z1 <= REF_Z1 - REF_Z0):
+    raise ValueError(
+        f"MOVIE_Z0={MOVIE_Z0}, MOVIE_Z1={MOVIE_Z1} is not a non-empty half-open "
+        f"range inside the cropped reference z range [0, {REF_Z1 - REF_Z0}]")
+
+
+def _block_nanmean_2x2(vol_zyx):
+    """Reduce a (Z, Y, X) float32 array by 2 in Y and in X: each output voxel is
+    the mean over the finite entries of its 2x2 input block, and NaN where all
+    four inputs are NaN.
+
+    np.nanmean, not stride subsampling: the scattered volume is mostly NaN
+    (measured on job 153471853's saved frames: 10.5% of the 78x1500x630 grid
+    non-NaN at frame 0), so taking every second sample would discard three
+    quarters of the samples that exist, whereas a block mean over the available
+    samples keeps them and marks a block occupied when any one of its four
+    inputs is.
+
+    np.nanmean over an all-NaN block returns NaN and raises
+    "RuntimeWarning: Mean of empty slice"; the warning is filtered here because
+    the volume contains millions of such blocks and each one would print.
+    The NaN return value is asserted at import (see _MOVIE_BLOCK_SELFTEST
+    below), so the suppression cannot hide a change to 0.0.
+
+    Raises rather than reshaping if Y or X is odd: the (Z, Y//2, 2, X//2, 2)
+    reshape would silently pair rows from different output blocks."""
+    vol = np.ascontiguousarray(vol_zyx, dtype=np.float32)
+    z, y, x = vol.shape
+    if y % MOVIE_DOWNSAMPLE_XY or x % MOVIE_DOWNSAMPLE_XY:
+        raise ValueError(
+            f"block nanmean needs Y and X divisible by {MOVIE_DOWNSAMPLE_XY}; "
+            f"got Y={y}, X={x}")
+    blocks = vol.reshape(z, y // 2, 2, x // 2, 2)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Mean of empty slice",
+                                 category=RuntimeWarning)
+        out = np.nanmean(blocks, axis=(2, 4))
+    return np.asarray(out, dtype=np.float32)
+
+
+def _movie_tile_from_refspace(vol_zyx):
+    """Crop one scattered (Zref, Yref, Xref) volume to the movie's z range and
+    reduce it laterally. Returns (MOVIE_Z1-MOVIE_Z0, Yref/2, Xref/2) float32."""
+    return _block_nanmean_2x2(vol_zyx[MOVIE_Z0:MOVIE_Z1])
+
+
+# Import-time check that the two properties the movie depends on hold on this
+# numpy: an all-NaN block stays NaN (it must not become 0.0, which would read as
+# a real zero-intensity voxel), and a block with one finite entry returns that
+# entry rather than averaging the NaNs in as zeros.
+_MOVIE_BLOCK_SELFTEST = _block_nanmean_2x2(
+    np.array([[[np.nan, np.nan, 4.0, np.nan],
+               [np.nan, np.nan, np.nan, np.nan]]], dtype=np.float32))
+if not np.isnan(_MOVIE_BLOCK_SELFTEST[0, 0, 0]):
+    raise RuntimeError(
+        f"np.nanmean over an all-NaN 2x2 block returned "
+        f"{_MOVIE_BLOCK_SELFTEST[0, 0, 0]!r}, not NaN; the movie's NaN mask "
+        f"would be wrong")
+if float(_MOVIE_BLOCK_SELFTEST[0, 0, 1]) != 4.0:
+    raise RuntimeError(
+        f"np.nanmean over a 2x2 block holding one finite value 4.0 returned "
+        f"{_MOVIE_BLOCK_SELFTEST[0, 0, 1]!r}, not 4.0")
+
+
+def _movie_ome_metadata(axes, channel_name):
+    """OME metadata dict for the movie tiles and the assembled movies.
+
+    Carries only quantities this script holds: the axis order of the array
+    being written, a channel name, and a Description recording the z crop (in
+    both the cropped reference frame and the source reference file's plane
+    numbering) and the lateral reduction. No PhysicalSizeX/Y/Z is written: the
+    only spacing this pipeline has is IO.write_multichannel_volume_as_ome_tiff's
+    spacing_x=spacing_y=1.0 default, which is a placeholder rather than a
+    measured voxel size, and the reference file's own physical sizes are never
+    read into this script."""
+    return {
+        "axes": axes,
+        "Channel": {"Name": channel_name},
+        "Description": (
+            f"F260517 reference-space scatter, channel {channel_name}. "
+            f"Trilinear scatter of the upsampled moving intensity into the "
+            f"reference grid cropped to source z [{REF_Z0},{REF_Z1}), no "
+            f"z-window gate; NaN where no sample landed. Movie z crop "
+            f"[{MOVIE_Z0},{MOVIE_Z1}) in that cropped frame = source z planes "
+            f"[{REF_Z0 + MOVIE_Z0},{REF_Z0 + MOVIE_Z1}) "
+            f"({REF_Z0 + MOVIE_Z0}-{REF_Z0 + MOVIE_Z1 - 1} inclusive). "
+            f"Y and X reduced {MOVIE_DOWNSAMPLE_XY}x by "
+            f"{MOVIE_DOWNSAMPLE_XY}x{MOVIE_DOWNSAMPLE_XY} block nanmean. "
+            f"Pixel size not recorded: this pipeline does not read one."
+        ),
+    }
 
 # Bytes for one frame's phase_new and one frame's motion_current, each of shape
 # (Xmov, Ymov, K, 3) float32 plus a 128-byte .npy header. The formula below
@@ -486,42 +622,78 @@ def _save_ref_surface(i, coords_xyk_xyz, ref_mem_volume_xyz, ref_sparse_volume_x
 
 
 def _save_refspace_volume(i, coords_xyz, mem_vals, sparse_vals, ref_shape_zyx):
-    """For frame i, scatter both channels' already-upsampled moving samples
-    into the full reference grid (_scatter_trilinear_to_refspace), write one
-    OME-TIFF per channel, and return the per-frame occupancy row for
-    diagnostics/refspace_summary.csv. Frees each channel's GPU accumulators
-    before starting the next channel, so both channels' accumulators are
-    never resident at once."""
-    if not SAVE_REF_SPACE_VOLUME or i in _refspace_saved_frames:
-        return None
-    if not _frame_selected_for_stride(i, REF_SPACE_SAVE_STRIDE, T - 1):
-        return None
+    """For frame i, scatter both channels' already-upsampled moving samples into
+    the full reference grid (_scatter_trilinear_to_refspace) and feed that one
+    scatter to both consumers:
+
+      SAVE_REF_SPACE_VOLUME -- on REF_SPACE_SAVE_STRIDE, the full
+        (Zref, Yref, Xref) float32 volume as one OME-TIFF per channel under
+        refspace_mem/ and refspace_sparseCell/, plus the occupancy row this
+        function returns for diagnostics/refspace_summary.csv.
+      SAVE_REFSPACE_MOVIE -- on every frame, the same volume cropped to
+        [MOVIE_Z0, MOVIE_Z1) in z and reduced 2x in Y and X by 2x2 block
+        nanmean, written as one per-frame OME-TIFF tile per channel under
+        refspace_movie_frames_{mem,sparseCell}/. The tiles are concatenated
+        into the two movie files after the forward loop.
+
+    The scatter is called once per channel per frame regardless of how many of
+    the two consumers are active, so turning the movie on does not add a second
+    scatter pass. Returns (row_or_None, movie_row_or_None): row is the
+    refspace_summary.csv row and is None on frames the stride did not select,
+    keeping that CSV's contents identical to a run with the movie off;
+    movie_row is the movie tile's occupancy row and is None when the movie is
+    off. Frees each channel's arrays before starting the next channel, so both
+    channels' accumulators are never resident at once."""
+    want_full = (SAVE_REF_SPACE_VOLUME
+                 and _frame_selected_for_stride(i, REF_SPACE_SAVE_STRIDE, T - 1))
+    want_movie = SAVE_REFSPACE_MOVIE
+    if i in _refspace_saved_frames or not (want_full or want_movie):
+        return None, None
     _refspace_saved_frames.add(i)
 
     Zref = ref_shape_zyx[0]
-    row = {"frame": i}
-    for label, vals, out_dir in (
-        ("mem", mem_vals, DIRS["refspace_mem"]),
-        ("sparse", sparse_vals, DIRS["refspace_sparseCell"]),
+    row = {"frame": i} if want_full else None
+    movie_row = {"frame": i} if want_movie else None
+    for label, movie_label, vals, out_dir, movie_dir in (
+        ("mem", "mem", mem_vals, DIRS["refspace_mem"],
+         DIRS["refspace_movie_frames_mem"]),
+        ("sparse", "sparseCell", sparse_vals, DIRS["refspace_sparseCell"],
+         DIRS["refspace_movie_frames_sparseCell"]),
     ):
         vol, occ = _scatter_trilinear_to_refspace(coords_xyz, vals, ref_shape_zyx)
-        fh.save_single_channel_ome_tiff(vol, str(out_dir), frame_idx=i,
-                                         label=f"F260517_refspace_{label}")
-        z_occupied = np.flatnonzero(occ.any(axis=(1, 2)))
-        row[f"{label}_nonnan_frac"] = float(np.mean(occ))
-        row[f"{label}_n_planes_occupied"] = int(z_occupied.size)
-        row[f"{label}_z_min"] = int(z_occupied.min()) if z_occupied.size else -1
-        row[f"{label}_z_max"] = int(z_occupied.max()) if z_occupied.size else -1
+        if want_full:
+            fh.save_single_channel_ome_tiff(vol, str(out_dir), frame_idx=i,
+                                             label=f"F260517_refspace_{label}")
+            z_occupied = np.flatnonzero(occ.any(axis=(1, 2)))
+            row[f"{label}_nonnan_frac"] = float(np.mean(occ))
+            row[f"{label}_n_planes_occupied"] = int(z_occupied.size)
+            row[f"{label}_z_min"] = int(z_occupied.min()) if z_occupied.size else -1
+            row[f"{label}_z_max"] = int(z_occupied.max()) if z_occupied.size else -1
+        if want_movie:
+            tile = _movie_tile_from_refspace(vol)
+            tifffile.imwrite(
+                str(movie_dir / f"movie_{movie_label}_{i:06d}.ome.tif"),
+                tile, ome=True, metadata=_movie_ome_metadata("ZYX", movie_label))
+            movie_row[f"{movie_label}_nonnan_frac"] = float(
+                np.mean(np.isfinite(tile)))
+            del tile
         del vol, occ
 
-    print(f"[QC] refspace frame {i}: "
-          f"mem {row['mem_nonnan_frac']*100:.2f}% non-NaN, "
-          f"{row['mem_n_planes_occupied']}/{Zref} planes occupied "
-          f"(z={row['mem_z_min']}..{row['mem_z_max']}) | "
-          f"sparse {row['sparse_nonnan_frac']*100:.2f}% non-NaN, "
-          f"{row['sparse_n_planes_occupied']}/{Zref} planes occupied "
-          f"(z={row['sparse_z_min']}..{row['sparse_z_max']})")
-    return row
+    if want_full:
+        print(f"[QC] refspace frame {i}: "
+              f"mem {row['mem_nonnan_frac']*100:.2f}% non-NaN, "
+              f"{row['mem_n_planes_occupied']}/{Zref} planes occupied "
+              f"(z={row['mem_z_min']}..{row['mem_z_max']}) | "
+              f"sparse {row['sparse_nonnan_frac']*100:.2f}% non-NaN, "
+              f"{row['sparse_n_planes_occupied']}/{Zref} planes occupied "
+              f"(z={row['sparse_z_min']}..{row['sparse_z_max']})")
+    if want_movie:
+        print(f"[QC] refspace movie frame {i}: "
+              f"mem {movie_row['mem_nonnan_frac']*100:.2f}% non-NaN, "
+              f"sparseCell {movie_row['sparseCell_nonnan_frac']*100:.2f}% non-NaN "
+              f"(z[{MOVIE_Z0},{MOVIE_Z1}) of {Zref}, "
+              f"{MOVIE_DOWNSAMPLE_XY}x{MOVIE_DOWNSAMPLE_XY} block nanmean in Y and X)")
+    return row, movie_row
 
 
 # ===========================================================================
@@ -569,6 +741,31 @@ if SAVE_PROJECTION_STATE:
         "ref_shape_axis_order": "zyx",
         "save_ref_space_volume": SAVE_REF_SPACE_VOLUME,
         "ref_space_save_stride": REF_SPACE_SAVE_STRIDE,
+        "save_refspace_movie": SAVE_REFSPACE_MOVIE,
+        # z crop applied to the scattered volume before it becomes a movie
+        # frame, given twice: in the cropped reference frame every other z
+        # index in this script uses, and in the source reference file's own
+        # plane numbering (crop base REF_Z0). Both are half-open; the
+        # inclusive source range is spelled out so a reader never has to
+        # decide whether the upper bound is included.
+        "movie_z_crop": {
+            "z0_cropped_frame": MOVIE_Z0,
+            "z1_cropped_frame": MOVIE_Z1,
+            "n_planes": MOVIE_Z1 - MOVIE_Z0,
+            "z0_source_file": REF_Z0 + MOVIE_Z0,
+            "z1_source_file": REF_Z0 + MOVIE_Z1,
+            "source_planes_inclusive": [REF_Z0 + MOVIE_Z0, REF_Z0 + MOVIE_Z1 - 1],
+            "crop_base": REF_Z0,
+        },
+        "movie_downsample_xy": MOVIE_DOWNSAMPLE_XY,
+        "movie_downsample_mode": (
+            f"{MOVIE_DOWNSAMPLE_XY}x{MOVIE_DOWNSAMPLE_XY} block np.nanmean "
+            f"over Y and X (not stride subsampling)"),
+        "movie_files": [
+            "refspace_movie_mem.ome.tif",
+            "refspace_movie_sparseCell.ome.tif",
+        ],
+        "movie_axes": "TZYX",
         # The cropped reference volume is not copied into the output tree; the
         # path and crop that reproduce it are recorded instead. reference_crop
         # is the half-open z range [z0, z1) applied to axis 0 of the (Z,C,Y,X)
@@ -902,6 +1099,7 @@ error_mem = []
 error_sparse = []
 hole_records = []
 refspace_records = []
+refspace_movie_records = []
 
 frames_since_ref_update = 0
 ref_update_id = 0
@@ -947,9 +1145,12 @@ for i in range(0, T):
     # Reuses phase_for_proj/mem_vals/sparse_vals computed just above (same
     # arrays the z-window-gated projection below consumes), so this output
     # never re-upsamples or resamples anything the projection already did.
-    refspace_row = _save_refspace_volume(i, phase_for_proj, mem_vals, sparse_vals, ref_mem_raw.shape)
+    refspace_row, refspace_movie_row = _save_refspace_volume(
+        i, phase_for_proj, mem_vals, sparse_vals, ref_mem_raw.shape)
     if refspace_row is not None:
         refspace_records.append(refspace_row)
+    if refspace_movie_row is not None:
+        refspace_movie_records.append(refspace_movie_row)
 
     # ---- Reference sampled onto the same fixed target planes (frame 0 only) ----
     # Placed here so it sees the same phase_for_proj the two projection calls
@@ -1078,6 +1279,51 @@ df_holes.to_csv(str(DIRS["diagnostics"] / "hole_summary.csv"), index=False)
 
 df_refspace = pd.DataFrame(refspace_records)
 df_refspace.to_csv(str(DIRS["diagnostics"] / "refspace_summary.csv"), index=False)
+
+if SAVE_REFSPACE_MOVIE:
+    pd.DataFrame(refspace_movie_records).to_csv(
+        str(DIRS["diagnostics"] / "refspace_movie_summary.csv"), index=False)
+
+# ===========================================================================
+# 6b. Assemble the per-frame movie tiles into one OME-TIFF per channel
+# ===========================================================================
+# Reads back the tiles written during the forward loop rather than holding
+# every frame in RAM through the loop; one channel's movie array
+# (T, MOVIE_Z1-MOVIE_Z0, Yref/2, Xref/2) float32 is resident at a time.
+# bigtiff=True because a 100-frame movie at this size exceeds the 4 GB
+# classic-TIFF offset limit.
+if SAVE_REFSPACE_MOVIE:
+    print("\n[6b/7] Assembling reference-space movies ...")
+    for movie_label, frames_dir in (
+        ("mem", DIRS["refspace_movie_frames_mem"]),
+        ("sparseCell", DIRS["refspace_movie_frames_sparseCell"]),
+    ):
+        tile_files = sorted(frames_dir.glob(f"movie_{movie_label}_*.ome.tif"))
+        if len(tile_files) == 0:
+            print(f"  {movie_label}: no tiles in {frames_dir}; movie not written")
+            continue
+        if len(tile_files) != T:
+            print(f"  [WARN] {movie_label}: {len(tile_files)} tiles found but the "
+                  f"forward loop ran {T} frames; the movie is assembled from the "
+                  f"tiles that exist, so its T axis is {len(tile_files)} long")
+        first_tile = np.asarray(tifffile.imread(str(tile_files[0])), dtype=np.float32)
+        movie = np.empty((len(tile_files),) + first_tile.shape, dtype=np.float32)
+        movie[0] = first_tile
+        del first_tile
+        for j, tile_path in enumerate(tile_files[1:], start=1):
+            tile_j = np.asarray(tifffile.imread(str(tile_path)), dtype=np.float32)
+            if tile_j.shape != movie.shape[1:]:
+                raise ValueError(
+                    f"tile {tile_path} has shape {tile_j.shape}, expected "
+                    f"{movie.shape[1:]}")
+            movie[j] = tile_j
+        movie_path = BASE_OUT / f"refspace_movie_{movie_label}.ome.tif"
+        tifffile.imwrite(str(movie_path), movie, ome=True, bigtiff=True,
+                          metadata=_movie_ome_metadata("TZYX", movie_label))
+        print(f"  {movie_label}: {movie.shape} {movie.dtype} -> {movie_path} "
+              f"({os.path.getsize(str(movie_path))/1e9:.2f} GB on disk, "
+              f"{float(np.mean(np.isfinite(movie)))*100:.2f}% non-NaN)")
+        del movie
 
 # ===========================================================================
 # 7. Summary
