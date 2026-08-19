@@ -46,7 +46,7 @@ except Exception:
     nx = None
 try:
     import cupy as cp
-    from cupyx.scipy import ndi as cupy_ndi
+    from cupyx.scipy import ndimage as cupy_ndi
     HAS_CUPY = True
 except Exception:
     cp = None
