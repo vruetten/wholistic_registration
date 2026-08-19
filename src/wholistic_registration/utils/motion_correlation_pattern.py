@@ -3776,10 +3776,22 @@ def getMotionPattern(
     Returns
     -------
     patterns : list of MotionPattern
+        Patterns that survived every filter.  ``patterns[i].pattern_id`` equals
+        ``i``.
     kept_units : list
+        The units that survived ``filter_regions_for_patterns``.  This list is
+        the index space that ``groups`` and ``labels`` refer to and is never
+        shortened by the pattern filters.
     groups : list of list[int]
+        ``groups[i]`` holds the ``kept_units`` indices of ``patterns[i]``'s
+        members.  Filtered in step with ``patterns``.
     labels : np.ndarray
+        One entry per element of ``kept_units``.  ``labels[u]`` indexes
+        ``patterns`` and ``groups``; it is ``-1`` when unit ``u`` belongs to a
+        pattern that a filter dropped.
     info : dict
+        ``info["kept_pattern_indices"][i]`` is the pre-filter cluster index of
+        ``patterns[i]``, and ``info["labels"]`` is the same array as ``labels``.
     """
     # Collect units
     all_units = collect_units_from_episodes(motion_episodes, unit_type=unit_type)
@@ -3825,9 +3837,22 @@ def getMotionPattern(
         groups,
     )
 
+    # `groups[i]` lists the `kept_units` indices that `patterns[i]` was built
+    # from, and `labels[u]` names the group of unit `u`.  Each filter below
+    # therefore records which cluster indices survive, so that `groups` and
+    # `labels` can be rewritten at the end and position `i` keeps denoting the
+    # same pattern in all three returned objects.
+    kept_pattern_indices = list(range(len(patterns)))
+
     # ---- Pre-filter: drop tiny patterns ----
     if min_pattern_members > 1:
-        patterns = [p for p in patterns if p.n_members >= min_pattern_members]
+        surviving = [
+            (k, p)
+            for k, p in zip(kept_pattern_indices, patterns)
+            if p.n_members >= min_pattern_members
+        ]
+        kept_pattern_indices = [k for k, _ in surviving]
+        patterns = [p for _, p in surviving]
 
     # ---- Compute unified mode for each pattern ----
     if compute_unified and len(patterns) > 0:
@@ -3861,7 +3886,7 @@ def getMotionPattern(
         # ---- Post-hoc quality filtering ----
         n_before = len(patterns)
         filtered = []
-        for p in patterns:
+        for k, p in zip(kept_pattern_indices, patterns):
             # Spatial: unified mask area
             if min_unified_area > 0:
                 um = p.unified_mask
@@ -3897,7 +3922,7 @@ def getMotionPattern(
                         if cv > max_h_cv:
                             continue
 
-            filtered.append(p)
+            filtered.append((k, p))
 
         if verbose:
             n_dropped = n_before - len(filtered)
@@ -3907,12 +3932,24 @@ def getMotionPattern(
                     f"{n_dropped}/{n_before} dropped, {len(filtered)} kept"
                 )
 
-        patterns = filtered
+        kept_pattern_indices = [k for k, _ in filtered]
+        patterns = [p for _, p in filtered]
+
+    # Re-key the per-cluster and per-unit outputs onto the surviving patterns.
+    new_index_of_cluster = {k: i for i, k in enumerate(kept_pattern_indices)}
+    labels = np.array(
+        [new_index_of_cluster.get(int(g), -1) for g in labels],
+        dtype=np.int32,
+    )
+    groups = [groups[k] for k in kept_pattern_indices]
+    for i, p in enumerate(patterns):
+        p.pattern_id = i
 
     info = {
         "distance_matrix": dist_mat,
         "pair_info": pair_info,
         "labels": labels,
+        "kept_pattern_indices": kept_pattern_indices,
         "unit_type": unit_type,
         "params": {
             "unit_type": unit_type,
