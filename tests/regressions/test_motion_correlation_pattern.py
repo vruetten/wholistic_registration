@@ -351,3 +351,153 @@ def test_b020_explicit_use_gpu_without_cupy_raises_clearly():
     # and an unrecognised string is rejected rather than silently selecting GPU
     with pytest.raises(ValueError, match="must be True, False or 'auto'"):
         mcp.getMotionUnit(motion, mag, rest, use_gpu="cpu", use_abs_dev=False)
+
+
+# ---------------------------------------------------------------------------
+# B-118 — getMotionPattern index correspondence across the pattern filters
+# ---------------------------------------------------------------------------
+
+
+def _b118_region(region_id, activation, angle):
+    """A MotionRegion on a fixed 10x10 support, distinguished only by its activation and field angle."""
+    mask = np.zeros((20, 20), dtype=np.uint8)
+    mask[4:14, 4:14] = 1
+    field = np.zeros((20, 20, 2), dtype=np.float32)
+    field[4:14, 4:14, 0] = np.cos(angle)
+    field[4:14, 4:14, 1] = np.sin(angle)
+    return mcp.MotionRegion(
+        episode_id=region_id,  # distinct per region: same-episode pairs never cluster
+        mode_id=0,
+        region_id=region_id,
+        time_range=(0, len(activation) - 1),
+        activation=np.asarray(activation, dtype=np.float32),
+        response_field=field,
+        response_strength=np.linalg.norm(field, axis=-1).astype(np.float32),
+        region_mask=mask,
+        # MotionRegion stores these verbatim; split_mode_to_regions is what
+        # normally fills them, and filter_regions_for_patterns reads them.
+        strength=1.0,
+        area_effective=100.0,
+    )
+
+
+def _b118_episodes():
+    """One episode of 8 regions drawn from a fixed seed, clustering into groups of size 2, 1, 2, 3.
+
+    Every region shares one support mask, so the spatial gate admits every pair
+    and the pairwise distances vary instead of all collapsing onto
+    ``incompatible_dist``.  Tied distances make ``fcluster`` number the clusters
+    in descending size, which would place every singleton last and leave the
+    member filter shifting nothing; the guard in the test re-checks that.
+    """
+    rng = np.random.default_rng(4)
+    cluster_sizes = (2, 1, 2, 1, 2)
+    angles = (0.0, 1.0, 2.0, 2.6, 0.5)
+    waves = [rng.standard_normal(24).astype(np.float32) for _ in cluster_sizes]
+
+    regions = []
+    region_id = 0
+    for size, wave, angle in zip(cluster_sizes, waves, angles):
+        for _ in range(size):
+            regions.append(_b118_region(region_id, wave, angle))
+            region_id += 1
+
+    episode = mcp.MotionEpisode(time_range=(0, 23), episode_id=118)
+    episode.regions = regions
+    return [episode]
+
+
+def _check_b118_correspondence(patterns, kept_units, groups, labels, where):
+    """Assert groups[i] lists the kept_units indices of patterns[i]'s members, and labels agrees."""
+    index_of_unit = {id(u): j for j, u in enumerate(kept_units)}
+
+    for i, pattern in enumerate(patterns):
+        assert i < len(groups), (
+            f"{where}: patterns has {len(patterns)} entries but groups has "
+            f"{len(groups)}, so patterns[{i}] has no group"
+        )
+        members = sorted(index_of_unit[id(r)] for r in pattern.regions)
+        assert sorted(int(g) for g in groups[i]) == members, (
+            f"{where}: groups[{i}] = {sorted(int(g) for g in groups[i])} does not "
+            f"list the kept_units indices {members} of patterns[{i}]'s members"
+        )
+
+    assert len(groups) == len(patterns), (
+        f"{where}: groups has {len(groups)} entries against {len(patterns)} patterns"
+    )
+    assert len(labels) == len(kept_units), (
+        f"{where}: labels has {len(labels)} entries against "
+        f"{len(kept_units)} kept_units"
+    )
+
+    grouped = {u for g in groups for u in map(int, g)}
+    for unit_index, label in enumerate(map(int, labels)):
+        assert label < len(groups), (
+            f"{where}: labels[{unit_index}] = {label} is out of range for "
+            f"{len(groups)} returned groups"
+        )
+        if label >= 0:
+            assert unit_index in set(map(int, groups[label])), (
+                f"{where}: labels[{unit_index}] = {label} but groups[{label}] = "
+                f"{sorted(int(g) for g in groups[label])} does not contain unit "
+                f"{unit_index}"
+            )
+        else:
+            assert unit_index not in grouped, (
+                f"{where}: labels[{unit_index}] = -1 but unit {unit_index} is "
+                f"still listed in a returned group"
+            )
+
+
+def test_b118_groups_and_labels_track_the_filtered_patterns(monkeypatch):
+    """getMotionPattern returns groups[i] holding patterns[i]'s member indices, and labels indexing the returned patterns, after the member pre-filter and after the unified-mode quality filter. Regression for B-118."""
+    episodes = _b118_episodes()
+
+    # Guard: the clustering must place a singleton BEFORE the last multi-member
+    # cluster, otherwise dropping singletons shifts nothing and the assertions
+    # below would hold for the unfixed code too.
+    _, _, groups_all, _, _ = mcp.getMotionPattern(
+        episodes, min_pattern_members=1, compute_unified=False, verbose=False
+    )
+    sizes = [len(g) for g in groups_all]
+    singletons = [i for i, s in enumerate(sizes) if s < 2]
+    multis = [i for i, s in enumerate(sizes) if s >= 2]
+    assert singletons and multis, f"cluster sizes {sizes} exercise no filtering"
+    assert min(singletons) < max(multis), (
+        f"cluster order {sizes} does not shift any surviving pattern"
+    )
+    n_surviving = len(multis)
+
+    # Site 1: the min_pattern_members pre-filter (default 2) drops the singletons.
+    patterns, kept_units, groups, labels, info = mcp.getMotionPattern(
+        episodes, compute_unified=False, verbose=False
+    )
+    assert len(patterns) == n_surviving, (
+        f"pre-filter kept {len(patterns)} patterns, expected {n_surviving}"
+    )
+    _check_b118_correspondence(patterns, kept_units, groups, labels, "pre-filter")
+
+    # Site 2: the post-hoc quality filter.  compute_pattern_unified_mode is
+    # replaced by a stub whose mask area depends only on member count, so
+    # min_unified_area drops exactly the two singletons and nothing else.
+    def _stub_unified_mode(pattern, episodes_arg, **kwargs):
+        area = 10 if pattern.n_members >= 2 else 1
+        mask = np.zeros((20, 20), dtype=bool)
+        mask.reshape(-1)[:area] = True
+        h = np.ones(24, dtype=np.float32)
+        B = np.zeros((20, 20, 2), dtype=np.float32)
+        return h, B, mask, {"member_info": []}
+
+    monkeypatch.setattr(mcp, "compute_pattern_unified_mode", _stub_unified_mode)
+
+    patterns2, kept_units2, groups2, labels2, info2 = mcp.getMotionPattern(
+        episodes,
+        min_pattern_members=1,
+        compute_unified=True,
+        min_unified_area=5,
+        verbose=False,
+    )
+    assert len(patterns2) == n_surviving, (
+        f"quality filter kept {len(patterns2)} patterns, expected {n_surviving}"
+    )
+    _check_b118_correspondence(patterns2, kept_units2, groups2, labels2, "quality-filter")
