@@ -4162,6 +4162,9 @@ def visualize_episode_sources_overview(
     order = order[:min(max_modes, K)]
 
     n = len(order)
+    if n == 0:
+        print("[visualize_episode_sources_overview] no modes to visualize (K=0)")
+        return diag
     ncols = 4
     nrows = int(np.ceil(n / ncols))
 
@@ -4510,6 +4513,9 @@ def compare_sources_to_observed_frames(
     order = order[:min(max_modes, K)]
 
     n = len(order)
+    if n == 0:
+        print("[compare_sources_to_observed_frames] no modes to visualize (K=0)")
+        return None
     fig, axes = plt.subplots(n, 3, figsize=(figsize_per_row[0], figsize_per_row[1] * n))
     if n == 1:
         axes = axes[None, :]
