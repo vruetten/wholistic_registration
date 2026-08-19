@@ -56,11 +56,11 @@ import f260517_helpers as fh
 # Janelia paths.
 F260517_DATA_DIR = "/nrs/ahrens/Virginia_nrs/wVT/mesoscope/260517_ubbr_mkate_phox2b"
 
-# IO.readTiff calls tifffile.asarray() on the whole file, so the full 15.1 GB
-# moving stack is read entirely into RAM before any slicing. The 8-timepoint
-# truncation (605 MB) is the default; uncomment the full file for a full run.
-F260517_mov_path = F260517_DATA_DIR + "/260517_exp_00001_TZCYX_first8.ome.tiff"
-# F260517_mov_path = F260517_DATA_DIR + "/260517_exp_00001_TZCYX.ome.tiff"
+# The full moving stack (15.1 GB on disk); only N_LOAD timepoints are read from
+# it, so RAM does not scale with file size. test_F260517_v2.py uses this file.
+F260517_mov_path = F260517_DATA_DIR + "/260517_exp_00001_TZCYX.ome.tiff"
+# 8-timepoint truncation (605 MB), if the full file is ever unavailable:
+# F260517_mov_path = F260517_DATA_DIR + "/260517_exp_00001_TZCYX_first8.ome.tiff"
 F260517_ref_path = F260517_DATA_DIR + "/260517_anat_00003_TZCYX.ome.tiff"
 
 BASE_OUT = Path(os.environ.get(
@@ -98,10 +98,14 @@ FILL_VALUE = -200.0
 WARMUP_FRAMES = [0, 1, 2, 3, 4]
 
 # Number of frames the forward loop registers. 0 or unset means every frame in
-# the moving file. The warmup phase is not limited by N_FRAMES: it always uses
-# WARMUP_FRAMES, because fixed_target_z is the median over those frames and a
-# shorter warmup would change the target planes the projection writes onto.
-N_FRAMES = int(os.environ.get("N_FRAMES", "0")) or None
+# the moving file. Named to match N_FRAMES_LIMIT in test_F260517_v2.py.
+# The warmup is not limited by N_FRAMES_LIMIT: it always uses WARMUP_FRAMES,
+# because fixed_target_z is the median over those frames, so a shorter warmup
+# would change the target planes the projection writes onto.
+N_FRAMES_LIMIT = int(os.environ.get("N_FRAMES_LIMIT", "0")) or None
+
+# Timepoints to read off disk: enough for the warmup and the forward loop.
+N_LOAD = None if N_FRAMES_LIMIT is None else max(N_FRAMES_LIMIT, max(WARMUP_FRAMES) + 1)
 
 percentiles = [0.1, 0.5, 1, 2, 5, 10, 25, 50, 75, 90, 95, 99, 99.5, 99.8]
 
@@ -116,7 +120,11 @@ print("=" * 80)
 
 print("\n[1/7] Loading data ...")
 t0 = time.time()
-F260517_mov, _ = IO.readTiff(F260517_mov_path)
+# IO.readTiff calls tifffile.asarray() on the whole file, which for the 15.1 GB
+# moving stack reads every timepoint before any slicing. read_ome_tiff_timepoints
+# slices a lazy zarr view instead, so only N_LOAD timepoints leave the disk.
+# test_F260517_v2.py loads the same file the same way.
+F260517_mov, _ = fh.read_ome_tiff_timepoints(F260517_mov_path, n_timepoints=N_LOAD)
 F260517_ref, _ = IO.readTiff(F260517_ref_path)
 
 ref_mem_raw    = F260517_ref[90:310, 1, :, :].astype(np.float32)
@@ -156,8 +164,8 @@ if max(WARMUP_FRAMES) >= T_FILE:
           f"(moving file has {T_FILE} frames)")
 
 # N_FRAMES limits only the forward loop, not the warmup.
-if N_FRAMES is not None:
-    T = min(T, N_FRAMES)
+if N_FRAMES_LIMIT is not None:
+    T = min(T, N_FRAMES_LIMIT)
 print(f"  frames in file={T_FILE}  forward-loop frames={T}  warmup={WARMUP_FRAMES}")
 
 x_coord = np.arange(mov_mem_all[0].shape[2], dtype=np.float32)

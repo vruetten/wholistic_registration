@@ -1,6 +1,6 @@
 #!/bin/bash
 # Job payload for the F260517 0625 pipeline reproduction on a Janelia GPU node.
-# Registers N_FRAMES forward-loop frames after the fixed 5-frame warmup.
+# Registers N_FRAMES_LIMIT forward-loop frames after the fixed 5-frame warmup.
 # Follows the conventions of run_F260517_cluster.sh.
 set -euo pipefail
 
@@ -14,13 +14,13 @@ cd /groups/ahrens/home/ruttenv/python_packages/wholistic_registration
 # LSF exposes one GPU per job as device 0, so the script's default of device 1
 # would raise on the allocated node.
 export GPU_DEVICE="${GPU_DEVICE:-0}"
-export N_FRAMES="${N_FRAMES:-3}"
+export N_FRAMES_LIMIT="${N_FRAMES_LIMIT:-3}"
 export F260517_OUT_DIR="${F260517_OUT_DIR:-/nrs/ahrens/Virginia_nrs/wVT/mesoscope/260517_ubbr_mkate_phox2b/repro_3frame_out}"
 
 echo "host: $(hostname)"
 echo "date: $(date)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
-echo "GPU_DEVICE=$GPU_DEVICE  N_FRAMES=$N_FRAMES"
+echo "GPU_DEVICE=$GPU_DEVICE  N_FRAMES_LIMIT=$N_FRAMES_LIMIT"
 echo "F260517_OUT_DIR=$F260517_OUT_DIR"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv || true
 echo "--- /nrs visibility from this compute node ---"
