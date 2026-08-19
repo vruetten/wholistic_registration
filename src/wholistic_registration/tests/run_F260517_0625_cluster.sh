@@ -9,7 +9,11 @@ unset XDG_RUNTIME_DIR || true
 source /groups/ahrens/home/ruttenv/miniforge3/etc/profile.d/conda.sh
 conda activate wholistic-registration
 
-cd /groups/ahrens/home/ruttenv/python_packages/wholistic_registration
+# Resolve the repo root from this script's own location, so the payload runs
+against whichever checkout it was copied into.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+cd "$REPO_ROOT"
+echo "repo root: $REPO_ROOT"
 
 # LSF exposes one GPU per job as device 0, so the script's default of device 1
 # would raise on the allocated node.
