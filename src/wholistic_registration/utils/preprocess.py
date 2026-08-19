@@ -291,3 +291,37 @@ def normalize_std(mean, std, image: np.ndarray):
     image_normalized = (image - mean_prev) / std_prev
     image_corrected = image_normalized * std + mean
     return image_corrected
+
+
+def Yunfeng_edge_map(frame, r=1, sigma=4, outcoef=3, min_size=40):
+    from skimage.measure import label, regionprops
+
+    from . import calculate, cp
+
+    frame_smooth = cp.asarray(ndi.gaussian_filter(frame, sigma=sigma, mode="nearest"))
+    # initialize
+    average_kernel = cp.ones((2 * r + 1, 2 * r + 1), dtype=np.float64)
+    average_kernel = average_kernel / ((2 * r + 1) ** 2 - 1)
+    average_kernel[r, r] = 0
+    # calculate average
+    EX = calculate.imfilter(
+        frame_smooth, average_kernel, boundary="replicate", output="same", functionality="corr"
+    )
+    EX_square = calculate.imfilter(
+        frame_smooth**2, average_kernel, boundary="replicate", output="same", functionality="corr"
+    )
+    std = np.sqrt(EX_square - EX**2)
+    Norm = (frame_smooth - EX) / std
+    edges_result = cp.where((Norm > outcoef) | (Norm < -outcoef), 1.0, 0.0)
+    edges_init = edges_result.get() if hasattr(edges_result, "get") else edges_result
+    # edges_smooth=ndi.gaussian_filter(edges_init, sigma=3, mode="nearest")>0.3
+    labeled_img = label(edges_init, connectivity=2)
+    regions = regionprops(labeled_img)
+    for region in regions:
+        if region.area < min_size:
+            coords = region.coords
+            labeled_img[coords[:, 0], coords[:, 1]] = 0
+
+    edges_filtered = np.asarray((labeled_img > 0).astype(np.float32))
+
+    return edges_filtered
