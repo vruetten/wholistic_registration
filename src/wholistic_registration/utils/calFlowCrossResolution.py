@@ -1130,6 +1130,189 @@ def project_coords_to_fixed_planes_gpu(
     return out
 
 
+def project_coords_inverse_gather_gpu(
+    coords_ref_xyk_xyz,
+    ref_volume,
+    target_z_planes,
+    values_xyk,
+    ref_volume_order="xyz",
+    z_window=1.5,
+    z_sigma=None,
+    z_weight_mode="gaussian",
+    downsample_xy=1,
+    fill_value=0.0,
+    fold_check=True,
+    return_numpy=False,
+    output_order="zyx",
+    eps=1e-6,
+):
+    """
+    Inverse-gather ("backward warp") projection onto fixed reference z planes.
+
+    This is the option (C) projector. Unlike the forward-scatter projectors
+    (``project_coords_to_fixed_planes_gpu`` = max splat,
+    ``project_coords_to_fixed_planes_weighted_gpu`` = weighted-average splat),
+    which push moving intensities into the reference grid, this routine builds
+    the *inverse* coordinate field and then samples the moving image once:
+
+        1. Invert the forward map by scattering the moving *indices*
+           (x, y, k), not the intensities, into reference planes. Because the
+           index field is smooth and slowly varying, the weighted-average
+           scatter densifies it cleanly; the accumulated weight doubles as the
+           coverage map.
+        2. Gather: bilinearly sample the moving volume at the recovered
+           continuous moving coordinates. The intensity therefore comes from a
+           single backward sample of real data, not an average of pushed
+           values, so it is sharper and intensity-faithful.
+        3. Mask: a reference pixel is valid only where step 1 accumulated
+           weight (i.e. some moving voxel maps there). Everything else is
+           genuine non-coverage and is set to ``fill_value``.
+
+    In smooth regions this matches the weighted-average splat closely (a
+    weighted mean of coordinates followed by one sample ~ a weighted mean of
+    samples). It differs where the moving image has high spatial frequency or
+    where the warp stretches: there the gather stays sharp and the scatter
+    blurs.
+
+    Parameters
+    ----------
+    coords_ref_xyk_xyz:
+        shape (Xmov, Ymov, K, 3), ``phase_new`` (moving grid -> reference xyz).
+    ref_volume:
+        Reference volume, used only to infer reference XY shape (and z-slab
+        target frame). Order set by ``ref_volume_order``.
+    target_z_planes:
+        Fixed reference z planes to observe.
+    values_xyk:
+        shape (Xmov, Ymov, K). The moving signal to gather. Required: unlike
+        the scatter projectors there is no "sample the reference" mode here,
+        because the whole point of (C) is to read the moving data.
+    z_window, z_sigma, z_weight_mode, downsample_xy:
+        Forwarded to the index-scatter step; identical semantics to
+        ``project_coords_to_fixed_planes_weighted_gpu``.
+    fold_check:
+        If True, moving voxels where the in-plane Jacobian determinant is
+        non-positive (the warp folds / is non-invertible) are excluded from the
+        inverse so they cannot corrupt the gather.
+    fill_value:
+        Value for reference pixels with no coverage.
+    output_order:
+        "zyx" -> (Nplanes, Yout, Xout); "zxy" -> (Nplanes, Xout, Yout).
+
+    Returns
+    -------
+    out:
+        Projected moving signal, shape per ``output_order``.
+    valid_mask:
+        Boolean array (same shape as ``out``). True where a moving voxel maps
+        to that reference pixel; False marks genuine non-coverage / folds.
+    """
+    if values_xyk is None:
+        raise ValueError(
+            "project_coords_inverse_gather_gpu requires values_xyk "
+            "(the moving signal to gather)."
+        )
+
+    coords = cp.asarray(coords_ref_xyk_xyz, dtype=cp.float32)
+    if coords.ndim != 4 or coords.shape[-1] != 3:
+        raise ValueError(
+            f"coords_ref_xyk_xyz should have shape (X,Y,K,3), got {coords.shape}"
+        )
+
+    values = cp.asarray(values_xyk, dtype=cp.float32)
+    if values.shape != coords.shape[:-1]:
+        raise ValueError(
+            f"values_xyk shape {values.shape} does not match coords shape "
+            f"{coords.shape[:-1]}"
+        )
+
+    Xmov, Ymov, K = values.shape
+
+    # ------------------------------------------------------------
+    # Moving index fields (the "addresses" we will invert).
+    # ------------------------------------------------------------
+    i_idx = cp.arange(Xmov, dtype=cp.float32)[:, None, None]
+    j_idx = cp.arange(Ymov, dtype=cp.float32)[None, :, None]
+    k_idx = cp.arange(K, dtype=cp.float32)[None, None, :]
+
+    idx_x = cp.broadcast_to(i_idx, values.shape).astype(cp.float32, copy=True)
+    idx_y = cp.broadcast_to(j_idx, values.shape).astype(cp.float32, copy=True)
+    idx_k = cp.broadcast_to(k_idx, values.shape).astype(cp.float32, copy=True)
+
+    # ------------------------------------------------------------
+    # Optional fold guard: drop source voxels whose in-plane map is
+    # non-invertible (Jacobian det <= 0) by marking them non-finite so the
+    # scatter kernel skips them.
+    # ------------------------------------------------------------
+    if fold_check:
+        for k in range(K):
+            xr = coords[:, :, k, 0]
+            yr = coords[:, :, k, 1]
+            dxr_di, dxr_dj = cp.gradient(xr)
+            dyr_di, dyr_dj = cp.gradient(yr)
+            det = dxr_di * dyr_dj - dxr_dj * dyr_di
+            folded = det <= 0
+            if bool(cp.any(folded)):
+                idx_x[:, :, k] = cp.where(folded, cp.nan, idx_x[:, :, k])
+                idx_y[:, :, k] = cp.where(folded, cp.nan, idx_y[:, :, k])
+                idx_k[:, :, k] = cp.where(folded, cp.nan, idx_k[:, :, k])
+
+    # ------------------------------------------------------------
+    # Step 1: invert the forward map by scattering the indices.
+    # The accumulated weight (from the x-index pass) is the coverage map.
+    # ------------------------------------------------------------
+    common = dict(
+        coords_ref_xyk_xyz=coords,
+        ref_volume=ref_volume,
+        target_z_planes=target_z_planes,
+        ref_volume_order=ref_volume_order,
+        z_window=z_window,
+        z_sigma=z_sigma,
+        z_weight_mode=z_weight_mode,
+        downsample_xy=downsample_xy,
+        fill_value=0.0,
+        return_numpy=False,
+        output_order="zxy",
+        eps=eps,
+    )
+
+    imap, weight = project_coords_to_fixed_planes_weighted_gpu(values_xyk=idx_x, **common)
+    jmap, _ = project_coords_to_fixed_planes_weighted_gpu(values_xyk=idx_y, **common)
+    kmap, _ = project_coords_to_fixed_planes_weighted_gpu(values_xyk=idx_k, **common)
+
+    valid = weight > eps
+
+    # ------------------------------------------------------------
+    # Step 2: gather the moving signal at the recovered coordinates.
+    # One bilinear backward sample of the real moving volume.
+    # ------------------------------------------------------------
+    gather_coords = cp.stack(
+        [imap.reshape(-1), jmap.reshape(-1), kmap.reshape(-1)], axis=0
+    )
+    sampled = cupy_ndimage.map_coordinates(
+        values, gather_coords, order=1, mode="nearest"
+    )
+    out = sampled.reshape(imap.shape)
+
+    # ------------------------------------------------------------
+    # Step 3: mask genuine non-coverage.
+    # ------------------------------------------------------------
+    out = cp.where(valid, out, cp.asarray(fill_value, dtype=cp.float32))
+
+    if output_order == "zyx":
+        out = out.transpose(0, 2, 1)
+        valid = valid.transpose(0, 2, 1)
+    elif output_order == "zxy":
+        pass
+    else:
+        raise ValueError("output_order should be 'zyx' or 'zxy'.")
+
+    if return_numpy:
+        return cp.asnumpy(out), cp.asnumpy(valid)
+
+    return out, valid
+
+
 def apply_H_to_matrix_gpu(A, H):
     """
     A: cp.ndarray, shape (X,Y,Z,3)
