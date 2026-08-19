@@ -25,12 +25,14 @@ Output (under f260517_0625_qc/ by default, see BASE_OUT below):
                             zinit_zncc_heatmap.png       [SAVE_ALIGNMENT_QC]
     masks_mov/              mask_mov_{i:06d}.npz          [SAVE_MASKS]
     mask_ref.npz                                          [SAVE_MASKS]
-    motion_field/            phase_new_{i:06d}.npy,
-                            motion_current_{i:06d}.npy    [SAVE_MOTION_FIELD]
     ref_shape.npy, fixed_target_z.npy,
     projection_params.json                                [SAVE_PROJECTION_STATE]
-    phase_new_f{i}.npy, mov_mem_f{i}.npy                  [SAVE_COMPARE_INPUTS]
+    phase_new_f{i}.npy, motion_current_f{i}.npy           [SAVE_MOTION_FIELD]
+    mov_mem_f{i}.npy                                      [SAVE_COMPARE_INPUTS]
     coverage/                no_coverage_{i:06d}.npz       [SAVE_COVERAGE_MAP]
+  Each array above (phase_new, motion_current, mov_mem, per frame) is
+  written exactly once, flat under diagnostics/; no motion_field/
+  subdirectory and no duplicate copy exist.
 """
 
 import json, os, sys, time
@@ -95,7 +97,6 @@ DIRS = {
     # QC additions only (new keys; existing keys/names above are untouched).
     "alignment_qc":          BASE_OUT / "diagnostics" / "alignment_qc",
     "masks_mov":              BASE_OUT / "diagnostics" / "masks_mov",
-    "motion_field":            BASE_OUT / "diagnostics" / "motion_field",
     "coverage":                BASE_OUT / "diagnostics" / "coverage",
 }
 for d in DIRS.values():
@@ -119,6 +120,10 @@ smoothPenalty_raw = 0.03
 ref_update_every = 40
 Z_WINDOW = 3.0
 FILL_VALUE = -200.0
+# Fill value the COVERAGE projection call (Section 5, cov=...) passes, distinct
+# from FILL_VALUE above which the two DATA projection calls pass. The hole
+# statistic np.mean(cov == 0) depends on this value being 0.0, not FILL_VALUE.
+COVERAGE_FILL_VALUE = 0.0
 WARMUP_FRAMES = [0, 1, 2, 3, 4]
 
 # Number of frames the forward loop registers. 0 or unset means every frame in
@@ -140,7 +145,11 @@ percentiles = [0.1, 0.5, 1, 2, 5, 10, 25, 50, 75, 90, 95, 99, 99.5, 99.8]
 #   1. SAVE_ALIGNMENT_QC     -- target_z_offset_per_plane.npy +
 #                                zinit_match_curve.png + zinit_zncc_heatmap.png
 #   2. SAVE_MASKS             -- mask_mov (per frame) and mask_ref (once)
-#   3. SAVE_MOTION_FIELD      -- phase_new / motion_current per frame, stride
+#   3. SAVE_MOTION_FIELD      -- phase_new_f{i}.npy, motion_current_f{i}.npy,
+#                                written once each into the flat diagnostics/
+#                                directory (unpadded frame index, matching the
+#                                filenames make_phase_new.py / compare_projectors.py
+#                                expect on feat/inverse-gather-projector), stride
 #                                via PHASE_SAVE_STRIDE, frame 0 and the final
 #                                processed frame always included
 #   4. SAVE_PROJECTION_STATE  -- ref_shape.npy, fixed_target_z.npy,
@@ -148,12 +157,12 @@ percentiles = [0.1, 0.5, 1, 2, 5, 10, 25, 50, 75, 90, 95, 99, 99.5, 99.8]
 #                                the projection call later). This script's own
 #                                choice of name; no env var for this addition
 #                                is specified elsewhere.
-#   5. SAVE_COMPARE_INPUTS    -- phase_new_f{i}.npy, mov_mem_f{i}.npy in the
-#                                flat diagnostics/ directory, matching the
-#                                filenames and shapes make_phase_new.py /
-#                                compare_projectors.py expect on
-#                                feat/inverse-gather-projector. Same frame
-#                                selection as SAVE_MOTION_FIELD.
+#   5. SAVE_COMPARE_INPUTS    -- mov_mem_f{i}.npy in the flat diagnostics/
+#                                directory: the one array compare_projectors.py
+#                                needs that SAVE_MOTION_FIELD does not already
+#                                write (phase_new_f{i}.npy comes from
+#                                SAVE_MOTION_FIELD). Same frame selection as
+#                                SAVE_MOTION_FIELD.
 #   6. SAVE_COVERAGE_MAP      -- diagnostics/coverage/no_coverage_{i:06d}.npz,
 #                                a packed boolean map of where the per-frame
 #                                projection coverage array cov is zero.
@@ -228,10 +237,14 @@ def _save_mask_mov(i, mask_arr):
 def _save_motion_field(i, phase_new_arr, motion_current_arr):
     """Save phase_new/motion_current for frame i, already pulled off the GPU
     by the caller (this reuses those numpy arrays, it does not recompute
-    anything). Also writes the same phase_new plus the raw moving membrane
-    frame mov_mem_all[i] to the flat diagnostics/ directory, in the
-    filenames and shapes compare_projectors.py expects (phase_new (Xmov,
-    Ymov,K,3), moving (K,Ymov,Xmov)), when SAVE_COMPARE_INPUTS is on."""
+    anything), flat into diagnostics/ as phase_new_f{i}.npy and
+    motion_current_f{i}.npy (unpadded frame index, the form
+    compare_projectors.py's phase_new_f{i}.npy expects). Each array is
+    written exactly once here; no separate motion_field/ copy exists. Also
+    writes the raw moving membrane frame mov_mem_all[i] to
+    diagnostics/mov_mem_f{i}.npy, in the shape compare_projectors.py expects
+    (K,Ymov,Xmov), when SAVE_COMPARE_INPUTS is on -- the one array
+    SAVE_MOTION_FIELD does not already produce."""
     if not (SAVE_MOTION_FIELD or SAVE_COMPARE_INPUTS) or i in _motion_saved_frames:
         return
     if not _frame_selected_for_stride(i, PHASE_SAVE_STRIDE, T - 1):
@@ -240,17 +253,19 @@ def _save_motion_field(i, phase_new_arr, motion_current_arr):
     phase_f32 = np.asarray(phase_new_arr, dtype=np.float32)
     motion_f32 = np.asarray(motion_current_arr, dtype=np.float32)
     if SAVE_MOTION_FIELD:
-        np.save(str(DIRS["motion_field"] / f"phase_new_{i:06d}.npy"), phase_f32)
-        np.save(str(DIRS["motion_field"] / f"motion_current_{i:06d}.npy"), motion_f32)
-    if SAVE_COMPARE_INPUTS:
         np.save(str(DIRS["diagnostics"] / f"phase_new_f{i}.npy"), phase_f32)
+        np.save(str(DIRS["diagnostics"] / f"motion_current_f{i}.npy"), motion_f32)
+    if SAVE_COMPARE_INPUTS:
         np.save(str(DIRS["diagnostics"] / f"mov_mem_f{i}.npy"),
                 mov_mem_all[i].astype(np.float32))
 
 
-def _save_coverage_map(i, cov_arr):
+def _save_coverage_map(i, cov_arr, axis_order):
     """Save where the per-frame projection coverage array cov_arr is zero,
-    packed to one bit per voxel via np.packbits, into diagnostics/coverage/."""
+    packed to one bit per voxel via np.packbits, into diagnostics/coverage/.
+    axis_order must be the same output_order string passed to the
+    project_coords_to_fixed_planes_gpu call that produced cov_arr, so the
+    saved axis order can never drift from the call that made the array."""
     if not SAVE_COVERAGE_MAP or i in _coverage_saved_frames:
         return
     _coverage_saved_frames.add(i)
@@ -259,6 +274,7 @@ def _save_coverage_map(i, cov_arr):
         str(DIRS["coverage"] / f"no_coverage_{i:06d}.npz"),
         packed=np.packbits(no_cov.reshape(-1)),
         shape=np.array(no_cov.shape, dtype=np.int64),
+        axis_order=axis_order,
     )
 
 # ===========================================================================
@@ -294,6 +310,7 @@ if SAVE_PROJECTION_STATE:
     projection_params = {
         "z_window": Z_WINDOW,
         "fill_value": FILL_VALUE,
+        "coverage_fill_value": COVERAGE_FILL_VALUE,
         "downsample_xy": 1,
         "xy_splat_mode": "subpixel_footprint",
         "xy_extra_radius": 0,
@@ -362,12 +379,13 @@ if SAVE_MOTION_FIELD:
         1 for i in range(T) if _frame_selected_for_stride(i, PHASE_SAVE_STRIDE, T - 1)
     )
     per_frame_bytes = 2 * _PHASE_OR_MOTION_BYTES
-    print(f"[QC] motion_field: {per_frame_bytes/1e6:.1f}MB/frame "
-          f"(phase_new + motion_current) x {n_frames_saved}/{T} frames "
+    print(f"[QC] SAVE_MOTION_FIELD: {per_frame_bytes/1e6:.1f}MB/frame "
+          f"(phase_new_f{{i}}.npy + motion_current_f{{i}}.npy) x {n_frames_saved}/{T} frames "
           f"(stride={PHASE_SAVE_STRIDE}, frame 0 and frame {T-1} always saved) "
           f"= ~{per_frame_bytes*n_frames_saved/1e9:.2f}GB projected for this run. "
-          f"SAVE_COMPARE_INPUTS/SAVE_COVERAGE_MAP add further per-frame bytes "
-          f"not included in this total (not measured on this dataset).")
+          f"SAVE_COMPARE_INPUTS (mov_mem_f{{i}}.npy) / SAVE_COVERAGE_MAP add "
+          f"further per-frame bytes not included in this total "
+          f"(not measured on this dataset).")
 
 x_coord = np.arange(mov_mem_all[0].shape[2], dtype=np.float32)
 y_coord = np.arange(mov_mem_all[0].shape[1], dtype=np.float32)
@@ -638,16 +656,17 @@ for i in range(0, T):
         xy_splat_mode="subpixel_footprint", xy_extra_radius=0)
 
     # Coverage map
+    cov_output_order = "zyx"
     cov = project_coords_to_fixed_planes_gpu(
         coords_ref_xyk_xyz=phase_for_proj, ref_volume=ref_mem_adj,
         target_z_planes=fixed_target_z,
         values_xyk=np.ones(phase_for_proj.shape[:-1], dtype=np.float32),
         ref_volume_order="xyz", z_window=Z_WINDOW, downsample_xy=1,
-        fill_value=0.0, return_numpy=True, output_order="zyx",
+        fill_value=COVERAGE_FILL_VALUE, return_numpy=True, output_order=cov_output_order,
         xy_splat_mode="subpixel_footprint", xy_extra_radius=0)
     if hasattr(cov, "get"): cov = cov.get()
     cov = np.asarray(cov, dtype=np.float32)
-    _save_coverage_map(i, cov)
+    _save_coverage_map(i, cov, axis_order=cov_output_order)
     hole_frac = float(np.mean(cov == 0))
     hole_per_k = [float(np.mean(cov[kk] == 0)) for kk in range(cov.shape[0])]
 
