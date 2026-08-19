@@ -2537,10 +2537,11 @@ def split_mode_to_regions(
     if B.ndim != 3 or B.shape[-1] != 2:
         raise ValueError(f"mode.response_field should be (X,Y,2), got {B.shape}")
 
-    vmax = float(np.max(A))
-    if vmax <= 0:
+    vmax = float(np.nanmax(A)) if A.size else 0.0
+    if not np.isfinite(vmax) or vmax <= 0:
         return []
 
+    # NaN pixels compare False and are excluded from the support automatically
     raw_support = A > (support_rel_thresh * vmax)
 
     if not np.any(raw_support):
