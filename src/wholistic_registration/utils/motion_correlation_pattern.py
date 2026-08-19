@@ -674,14 +674,14 @@ def _safe_corr(a, b, eps=1e-12):
         L = min(a.size, b.size)
         a = a[:L]
         b = b[:L]
+    a0 = a
+    b0 = b
     a = a - np.mean(a)
     b = b - np.mean(b)
     na = np.linalg.norm(a)
     nb = np.linalg.norm(b)
     if na < eps or nb < eps:
-        # fall back to cosine without demeaning
-        a0 = np.asarray(a, dtype=np.float32).reshape(-1)
-        b0 = np.asarray(b, dtype=np.float32).reshape(-1)
+        # fall back to cosine without demeaning (on the original inputs)
         return float(np.dot(a0, b0) / (np.linalg.norm(a0) * np.linalg.norm(b0) + eps))
     return float(np.dot(a, b) / (na * nb + eps))
 
