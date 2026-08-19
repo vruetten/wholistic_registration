@@ -21,13 +21,17 @@ Output (under f260517_0625_qc/ by default, see BASE_OUT below):
   projected_mem/           z-plane-projected membrane
   projected_sparseCell/    z-plane-projected sparse-cell
   refspace_mem/            per-frame moving membrane scattered into the full
-                            (220,1500,630) reference grid, no z-window gate
-                            [SAVE_REF_SPACE_VOLUME]
+                            (REF_Z1-REF_Z0, 1500, 630) reference grid, no
+                            z-window gate                      [SAVE_REF_SPACE_VOLUME]
   refspace_sparseCell/     per-frame moving sparse-cell scattered into the
                             full reference grid, no z-window gate
                             [SAVE_REF_SPACE_VOLUME]
-  refspace_reference_mem.tif  the cropped reference volume itself (220,1500,630),
-                            written once, not per frame               [SAVE_REF_SPACE_VOLUME]
+  ref_surface_mem/         the membrane reference sampled onto the same K
+                            fixed target planes as projected_mem/, one volume
+                            per run, not per frame                    [SAVE_REF_SURFACE]
+  ref_surface_sparseCell/  the sparse-cell reference sampled onto the same K
+                            fixed target planes as projected_sparseCell/, one
+                            volume per run, not per frame             [SAVE_REF_SURFACE]
   diagnostics/             CSVs (errors_membrane, errors_sparse, hole_summary,
                             refspace_summary)
     alignment_qc/          target_z_offset_per_plane.npy, zinit_match_curve.png,
@@ -37,7 +41,7 @@ Output (under f260517_0625_qc/ by default, see BASE_OUT below):
     ref_shape.npy, fixed_target_z.npy,
     projection_params.json                                [SAVE_PROJECTION_STATE]
     phase_new_f{i}.npy, motion_current_f{i}.npy           [SAVE_MOTION_FIELD]
-    mov_mem_f{i}.npy                                      [SAVE_COMPARE_INPUTS]
+    mov_mem_f{i}.npy                                      [SAVE_COMPARE_INPUTS, default off]
     coverage/                no_coverage_{i:06d}.npz       [SAVE_COVERAGE_MAP]
     refspace_summary.csv                                  [SAVE_REF_SPACE_VOLUME]
   Each array above (phase_new, motion_current, mov_mem, per frame) is
@@ -106,6 +110,8 @@ DIRS = {
     "projected_sparseCell":  BASE_OUT / "projected_sparseCell",
     "refspace_mem":          BASE_OUT / "refspace_mem",
     "refspace_sparseCell":   BASE_OUT / "refspace_sparseCell",
+    "ref_surface_mem":        BASE_OUT / "ref_surface_mem",
+    "ref_surface_sparseCell": BASE_OUT / "ref_surface_sparseCell",
     "diagnostics":           BASE_OUT / "diagnostics",
     # QC additions only (new keys; existing keys/names above are untouched).
     "alignment_qc":          BASE_OUT / "diagnostics" / "alignment_qc",
@@ -149,6 +155,40 @@ N_FRAMES_LIMIT = int(os.environ.get("N_FRAMES_LIMIT", "0")) or None
 # Timepoints to read off disk: enough for the warmup and the forward loop.
 N_LOAD = None if N_FRAMES_LIMIT is None else max(N_FRAMES_LIMIT, max(WARMUP_FRAMES) + 1)
 
+# Half-open z crop [REF_Z0, REF_Z1) applied to the (Z,C,Y,X) reference stack.
+# Every downstream reference-space coordinate is expressed in this cropped
+# frame: reference plane p in the source file is plane p - REF_Z0 here, and the
+# cropped volume has REF_Z1 - REF_Z0 planes. Named once so the two channel
+# slices below and the reference_crop entry in projection_params.json cannot
+# drift apart.
+REF_Z0 = int(os.environ.get("REF_Z0", "165"))
+REF_Z1 = int(os.environ.get("REF_Z1", "243"))
+REF_CHANNEL_MEM = 1
+REF_CHANNEL_SPARSE = 0
+
+# Which moving z slices to register, as indices into the moving file's z axis
+# (axis 1 of the (T,Z,C,Y,X) stack). K is len(MOV_SLICES); nothing downstream
+# reads a literal slice count, every consumer takes K from an array shape.
+MOV_SLICES = [int(s) for s in os.environ.get("MOV_SLICES", "8,9,10,11").split(",")
+              if s.strip() != ""]
+if len(MOV_SLICES) == 0:
+    raise ValueError("MOV_SLICES selected no slices")
+
+# Reference z plane (in the cropped [REF_Z0, REF_Z1) frame) each entry of
+# MOV_SLICES starts at. Supplied rather than searched for:
+# FindInitZ_stack_global_fixed_spacing slides the whole rigidly-spaced comb of
+# K slices through the reference and scores each integer offset, so with K=4
+# slices in a 78-plane crop the summed-ZNCC curve is scored from 4 planes and
+# the search is not constrained enough to trust. Set Z_INIT_PLANES="" to run
+# the search instead, in which case SAVE_ALIGNMENT_QC's two PNGs are produced
+# (they read the search's debug output) and are skipped otherwise.
+_z_init_env = os.environ.get("Z_INIT_PLANES", "25,35,45,55")
+Z_INIT_PLANES = [float(s) for s in _z_init_env.split(",") if s.strip() != ""]
+if Z_INIT_PLANES and len(Z_INIT_PLANES) != len(MOV_SLICES):
+    raise ValueError(
+        f"Z_INIT_PLANES has {len(Z_INIT_PLANES)} entries but MOV_SLICES has "
+        f"{len(MOV_SLICES)}; one starting reference plane per moving slice is required")
+
 percentiles = [0.1, 0.5, 1, 2, 5, 10, 25, 50, 75, 90, 95, 99, 99.5, 99.8]
 
 # ---------------------------------------------------------------------------
@@ -181,28 +221,55 @@ percentiles = [0.1, 0.5, 1, 2, 5, 10, 25, 50, 75, 90, 95, 99, 99.5, 99.8]
 #                                projection coverage array cov is zero.
 #   7. SAVE_REF_SPACE_VOLUME  -- refspace_mem/, refspace_sparseCell/: per-frame
 #                                moving intensity scattered (trilinear weights,
-#                                NO z-window gate) into the full (220,1500,630)
-#                                reference grid, plus refspace_reference_mem.tif
-#                                (written once) and diagnostics/refspace_summary.csv
+#                                NO z-window gate) into the full
+#                                (REF_Z1-REF_Z0, 1500, 630)
+#                                reference grid, plus diagnostics/refspace_summary.csv
 #                                (written every run). Stride via
 #                                REF_SPACE_SAVE_STRIDE, frame 0 and the final
 #                                processed frame always included, same
 #                                _frame_selected_for_stride predicate as
-#                                SAVE_MOTION_FIELD.
+#                                SAVE_MOTION_FIELD. The cropped reference volume
+#                                itself is NOT written: it is
+#                                F260517_ref_path[REF_Z0:REF_Z1, REF_CHANNEL_MEM]
+#                                already on disk, and projection_params.json
+#                                records that path and crop under
+#                                reference_source_path / reference_crop instead
+#                                of copying the volume.
+#   8. SAVE_REF_SURFACE       -- ref_surface_mem/, ref_surface_sparseCell/: the
+#                                reference sampled onto the same fixed_target_z
+#                                planes as projected_mem/projected_sparseCell,
+#                                through the same
+#                                project_coords_to_fixed_planes_gpu call with
+#                                values_xyk=None (that call's documented mode in
+#                                which values are sampled from ref_volume at the
+#                                supplied coordinates), on the frame-0
+#                                phase_for_proj geometry. One volume per channel
+#                                per run, not per frame.
 SAVE_ALIGNMENT_QC     = os.environ.get("SAVE_ALIGNMENT_QC", "1") == "1"
 SAVE_MASKS            = os.environ.get("SAVE_MASKS", "1") == "1"
 SAVE_MOTION_FIELD     = os.environ.get("SAVE_MOTION_FIELD", "1") == "1"
 PHASE_SAVE_STRIDE     = int(os.environ.get("PHASE_SAVE_STRIDE", "1"))
 SAVE_PROJECTION_STATE = os.environ.get("SAVE_PROJECTION_STATE", "1") == "1"
-SAVE_COMPARE_INPUTS   = os.environ.get("SAVE_COMPARE_INPUTS", "1") == "1"
+# Default off: mov_mem_f{i}.npy holds the same array raw_moving_mem/ already
+# stores as a TIFF, so the default run does not pay for the duplicate. Set
+# SAVE_COMPARE_INPUTS=1 when compare_projectors.py is going to be run.
+SAVE_COMPARE_INPUTS   = os.environ.get("SAVE_COMPARE_INPUTS", "0") == "1"
 SAVE_COVERAGE_MAP     = os.environ.get("SAVE_COVERAGE_MAP", "1") == "1"
 SAVE_REF_SPACE_VOLUME = os.environ.get("SAVE_REF_SPACE_VOLUME", "1") == "1"
 REF_SPACE_SAVE_STRIDE = int(os.environ.get("REF_SPACE_SAVE_STRIDE", "1"))
+SAVE_REF_SURFACE      = os.environ.get("SAVE_REF_SURFACE", "1") == "1"
 
-# Bytes for one frame's phase_new and one frame's motion_current, each
-# measured with os.path.getsize on a saved .npy at this dataset's native
-# resolution (630,1500,20,3) float32; the two arrays are the same shape.
-_PHASE_OR_MOTION_BYTES = 226_800_128
+# Bytes for one frame's phase_new and one frame's motion_current, each of shape
+# (Xmov, Ymov, K, 3) float32 plus a 128-byte .npy header. The formula below
+# reproduces 226_800_128 bytes at (630,1500,20,3), which is the value
+# os.path.getsize returned on a saved phase_new_f0.npy from the K=20 runs; the
+# formula rather than that constant is used so the printed projection tracks K
+# instead of restating a 20-slice number for a 4-slice run.
+_NPY_HEADER_BYTES = 128
+
+
+def _phase_or_motion_bytes(x_mov, y_mov, k):
+    return int(x_mov) * int(y_mov) * int(k) * 3 * 4 + _NPY_HEADER_BYTES
 
 
 def _frame_selected_for_stride(i, stride, final_idx):
@@ -371,14 +438,51 @@ def _scatter_trilinear_to_refspace(coords_xyz, values_xyk, ref_shape_zyx, eps=1e
     return out_np, occupied_np
 
 
-def _save_refspace_reference(volume_zyx, path):
-    """Write the cropped reference volume once (not per frame), fixed
-    filename rather than the vol_{label}_{frame_idx:06d}.tif pattern
-    fh.save_single_channel_ome_tiff produces, via the same underlying
-    IO.saveTiff_new writer as that helper uses."""
-    v = np.asarray(volume_zyx, dtype=np.float32)
-    img5d = v[np.newaxis, :, np.newaxis, :, :]  # (1,Z,1,Y,X)
-    IO.saveTiff_new(img5d, str(path), metadata={"spacing_x": 1.0, "spacing_y": 1.0}, verbose=False)
+_ref_surface_saved = False
+
+
+def _save_ref_surface(i, coords_xyk_xyz, ref_mem_volume_xyz, ref_sparse_volume_xyz):
+    """Sample the reference onto the fixed_target_z planes and write one volume
+    per channel for the whole run (frame-0 geometry, not per frame).
+
+    The call below is the same project_coords_to_fixed_planes_gpu call the
+    forward loop makes for proj_mem_zyx / proj_sparse_zyx -- same
+    target_z_planes, ref_volume_order, z_window, downsample_xy, fill_value,
+    output_order, xy_splat_mode and xy_extra_radius -- with values_xyk=None
+    instead of the moving intensity. values_xyk=None is that function's
+    documented first mode: it samples ref_volume at coords_ref_xyk_xyz via
+    generate_continuous_H_gpu / apply_H_to_matrix_gpu and splats those samples,
+    so the reference passes through the identical z-slab selection and XY
+    footprint splatting as the moving data. No second projection path is
+    introduced.
+
+    coords_xyk_xyz is the caller's frame-0 phase_for_proj, so the reference is
+    sampled at the same reference coordinates the frame-0 moving projection
+    used."""
+    global _ref_surface_saved
+    if not SAVE_REF_SURFACE or _ref_surface_saved or i != 0:
+        return
+    _ref_surface_saved = True
+    for label, ref_volume, out_dir in (
+        ("mem", ref_mem_volume_xyz, DIRS["ref_surface_mem"]),
+        ("sparseCell", ref_sparse_volume_xyz, DIRS["ref_surface_sparseCell"]),
+    ):
+        surf = project_coords_to_fixed_planes_gpu(
+            coords_ref_xyk_xyz=coords_xyk_xyz, ref_volume=ref_volume,
+            target_z_planes=fixed_target_z, values_xyk=None,
+            ref_volume_order="xyz", z_window=Z_WINDOW, downsample_xy=1,
+            fill_value=FILL_VALUE, return_numpy=True, output_order="zyx",
+            xy_splat_mode="subpixel_footprint", xy_extra_radius=0)
+        surf = np.asarray(surf, dtype=np.float32)
+        fh.save_single_channel_ome_tiff(surf, str(out_dir), frame_idx=0,
+                                         label=f"F260517_ref_surface_{label}")
+        print(f"[QC] ref_surface {label}: shape={surf.shape} "
+              f"min={float(np.min(surf)):.2f} max={float(np.max(surf)):.2f} "
+              f"mean={float(np.mean(surf)):.2f} "
+              f"frac_covered={float(np.mean(surf != FILL_VALUE)):.4f} "
+              f"(pixels not left at fill_value={FILL_VALUE})")
+        del surf
+        cp.get_default_memory_pool().free_all_blocks()
 
 
 def _save_refspace_volume(i, coords_xyz, mem_vals, sparse_vals, ref_shape_zyx):
@@ -438,20 +542,12 @@ t0 = time.time()
 F260517_mov, _ = fh.read_ome_tiff_timepoints(F260517_mov_path, n_timepoints=N_LOAD)
 F260517_ref, _ = IO.readTiff(F260517_ref_path)
 
-ref_mem_raw    = F260517_ref[90:310, 1, :, :].astype(np.float32)
-if SAVE_REF_SPACE_VOLUME:
-    # ref_mem_raw is the RAW (not intensity-calibrated) cropped reference --
-    # the intensity-calibrated array used during registration is ref_mem_adj,
-    # produced later (Section 3) by
-    # fh.update_reference_intensity_mapping_from_target_stack(ref_mem_raw, ...).
-    # Written once here, not per frame, so the refspace/reference pair can be
-    # opened together without a frame-indexed filename to hunt for.
-    _save_refspace_reference(ref_mem_raw, BASE_OUT / "refspace_reference_mem.tif")
+ref_mem_raw    = F260517_ref[REF_Z0:REF_Z1, REF_CHANNEL_MEM, :, :].astype(np.float32)
 if SAVE_PROJECTION_STATE:
     # QC addition 4: state needed to redo the projection call later, saved
     # immediately after ref_mem_raw is loaded/cropped. ref_mem_raw is a slice
-    # F260517_ref[90:310, 1, :, :] of the (Z,C,Y,X) reference stack, so its
-    # own axis order is (Z,Y,X).
+    # F260517_ref[REF_Z0:REF_Z1, REF_CHANNEL_MEM, :, :] of the
+    # (Z,C,Y,X) reference stack, so its own axis order is (Z,Y,X).
     np.save(str(DIRS["diagnostics"] / "ref_shape.npy"),
             np.array(ref_mem_raw.shape, dtype=np.int64))
     # Values read from the project_coords_to_fixed_planes_gpu call sites in
@@ -473,36 +569,73 @@ if SAVE_PROJECTION_STATE:
         "ref_shape_axis_order": "zyx",
         "save_ref_space_volume": SAVE_REF_SPACE_VOLUME,
         "ref_space_save_stride": REF_SPACE_SAVE_STRIDE,
+        # The cropped reference volume is not copied into the output tree; the
+        # path and crop that reproduce it are recorded instead. reference_crop
+        # is the half-open z range [z0, z1) applied to axis 0 of the (Z,C,Y,X)
+        # file, so ref_shape.npy[0] == z1 - z0.
+        "reference_source_path": F260517_ref_path,
+        "reference_crop": {"z0": REF_Z0, "z1": REF_Z1,
+                           "channel_mem": REF_CHANNEL_MEM,
+                           "channel_sparse": REF_CHANNEL_SPARSE},
+        "moving_source_path": F260517_mov_path,
+        "mov_slices": list(MOV_SLICES),
+        "z_init_planes_supplied": list(Z_INIT_PLANES),
+        "save_ref_surface": SAVE_REF_SURFACE,
     }
     with open(str(DIRS["diagnostics"] / "projection_params.json"), "w") as f_params:
         json.dump(projection_params, f_params, indent=2)
-ref_sparse_raw = F260517_ref[90:310, 0, :, :].astype(np.float32)
-mov_mem_all    = F260517_mov[:, :, 1, :, :].astype(np.float32)
-mov_sparse_all = F260517_mov[:, :, 0, :, :].astype(np.float32)
+ref_sparse_raw = F260517_ref[REF_Z0:REF_Z1, REF_CHANNEL_SPARSE, :, :].astype(np.float32)
+# Select the registered moving slices before the float32 cast, so RAM holds
+# len(MOV_SLICES) slices per channel rather than every slice in the file.
+mov_mem_all    = F260517_mov[:, MOV_SLICES, 1, :, :].astype(np.float32)
+mov_sparse_all = F260517_mov[:, MOV_SLICES, 0, :, :].astype(np.float32)
 
 print(f"  loaded in {time.time()-t0:.1f}s")
 print(f"  mov file: {F260517_mov_path}")
 print(f"  mov raw shape (T,Z,C,Y,X) = {F260517_mov.shape}  dtype={F260517_mov.dtype}")
 print(f"  ref raw shape            = {F260517_ref.shape}  dtype={F260517_ref.dtype}")
+print(f"  ref crop z [{REF_Z0},{REF_Z1}) -> ref_mem_raw {ref_mem_raw.shape} (Z,Y,X)")
+print(f"  mov slices {MOV_SLICES} -> mov_mem_all {mov_mem_all.shape} (T,K,Y,X)")
 
 # ===========================================================================
 # 2. z_init + coords
 # ===========================================================================
 print("\n[2/7] Initial setup ...")
-# return_debug=True: this script always requests the ZNCC-vs-z0 debug dict so
-# QC addition 1's zinit_match_curve.png/zinit_zncc_heatmap.png can be ported
-# from test_F260517_v2.py; z_init itself is bit-identical to the un-debugged
-# call (return_debug only adds a second return value).
-z_init, z_init_debug = calFlowCrossResolution.FindInitZ_stack_global_fixed_spacing(
-    mov_mem_all[0].transpose(2, 1, 0),
-    ref_mem_raw.transpose(2, 1, 0),
-    delta_ref_idx=10, use_gradient=False, return_debug=True,
-)
-z_init = z_init.astype(np.float32)
+if Z_INIT_PLANES:
+    # z_init supplied, search skipped. The entries are reference planes in the
+    # cropped [REF_Z0, REF_Z1) frame, one per entry of MOV_SLICES, checked
+    # against len(MOV_SLICES) where Z_INIT_PLANES is parsed.
+    z_init = np.asarray(Z_INIT_PLANES, dtype=np.float32)
+    z_init_debug = None
+    print(f"  z_init supplied (search skipped): {z_init} "
+          f"(cropped frame; source planes {z_init + REF_Z0})")
+else:
+    # return_debug=True: the ZNCC-vs-z0 debug dict is requested so QC addition
+    # 1's zinit_match_curve.png/zinit_zncc_heatmap.png can be produced; z_init
+    # itself is bit-identical to the un-debugged call (return_debug only adds a
+    # second return value).
+    z_init, z_init_debug = calFlowCrossResolution.FindInitZ_stack_global_fixed_spacing(
+        mov_mem_all[0].transpose(2, 1, 0),
+        ref_mem_raw.transpose(2, 1, 0),
+        delta_ref_idx=10, use_gradient=False, return_debug=True,
+    )
+    z_init = z_init.astype(np.float32)
+    print(f"  z_init searched: {z_init}")
+
+if z_init.shape[0] != mov_mem_all.shape[1]:
+    raise ValueError(
+        f"z_init has {z_init.shape[0]} entries but mov_mem_all carries "
+        f"{mov_mem_all.shape[1]} slices")
+if np.any(z_init < 0) or np.any(z_init > ref_mem_raw.shape[0] - 1):
+    raise ValueError(
+        f"z_init {z_init} falls outside the cropped reference z range "
+        f"[0, {ref_mem_raw.shape[0] - 1}]")
+
 z_idx = np.rint(z_init).astype(np.int32)
 z_idx = np.clip(z_idx, 0, ref_mem_raw.shape[0] - 1)
 
-K, T = int(z_init.shape[0]), int(mov_mem_all.shape[0])
+# K comes from the moving array's slice axis, not from a literal count.
+K, T = int(mov_mem_all.shape[1]), int(mov_mem_all.shape[0])
 T_FILE = T
 
 # The warmup indexes mov_mem_all directly, so a moving file with fewer frames
@@ -523,15 +656,16 @@ print(f"  frames in file={T_FILE}  forward-loop frames={T}  warmup={WARMUP_FRAME
 if SAVE_MOTION_FIELD:
     # Corrects the earlier draft of this banner, which named only phase_new
     # and so understated the per-frame write by 2x: motion_current is saved
-    # too, and the two arrays are the same shape (both measured with
-    # os.path.getsize at exactly _PHASE_OR_MOTION_BYTES bytes on this
-    # dataset's native resolution). n_frames_saved counts against the actual
-    # loop bound T, using the same predicate _save_motion_field applies, so
-    # this projection cannot drift from what the run actually writes.
+    # too, and the two arrays are the same shape. The byte count is computed
+    # from this run's (Xmov, Ymov, K) rather than restated from a K=20
+    # measurement. n_frames_saved counts against the actual loop bound T,
+    # using the same predicate _save_motion_field applies, so this projection
+    # cannot drift from what the run actually writes.
     n_frames_saved = sum(
         1 for i in range(T) if _frame_selected_for_stride(i, PHASE_SAVE_STRIDE, T - 1)
     )
-    per_frame_bytes = 2 * _PHASE_OR_MOTION_BYTES
+    per_frame_bytes = 2 * _phase_or_motion_bytes(
+        mov_mem_all.shape[3], mov_mem_all.shape[2], K)
     print(f"[QC] SAVE_MOTION_FIELD: {per_frame_bytes/1e6:.1f}MB/frame "
           f"(phase_new_f{{i}}.npy + motion_current_f{{i}}.npy) x {n_frames_saved}/{T} frames "
           f"(stride={PHASE_SAVE_STRIDE}, frame 0 and frame {T-1} always saved) "
@@ -625,9 +759,22 @@ if SAVE_ALIGNMENT_QC:
     np.save(str(alignment_qc_dir / "target_z_offset_per_plane.npy"),
             np.stack([offset.astype(np.float64), z_init.astype(np.float64)]))
 
+if SAVE_ALIGNMENT_QC and z_init_debug is None:
+    # Both PNGs plot arrays that exist only inside
+    # FindInitZ_stack_global_fixed_spacing's return_debug dict: the (K, Zref)
+    # ZNCC score matrix and the summed-ZNCC-vs-z0 curve. Z_INIT_PLANES supplied
+    # z_init directly, so that search never ran and neither array exists. No
+    # substitute is plotted, because any curve drawn without the search would
+    # not be the quantity the filenames name.
+    print("  [QC] alignment QC: target_z_offset_per_plane.npy written; "
+          "zinit_match_curve.png and zinit_zncc_heatmap.png skipped "
+          "(z_init supplied via Z_INIT_PLANES, so the z-init search that "
+          "produces the ZNCC curves did not run)")
+
+if SAVE_ALIGNMENT_QC and z_init_debug is not None:
     # zinit_match_curve.png / zinit_zncc_heatmap.png: ported from
     # test_F260517_v2.py (grepped for those two exact filenames at lines 169
-    # and 185 of that file), using the z_init_debug this script now requests
+    # and 185 of that file), using the z_init_debug this script requests
     # via return_debug=True on the FindInitZ_stack_global_fixed_spacing call
     # above -- the data the port needs is directly available from that call,
     # so no substitute quality metric is needed.
@@ -655,7 +802,7 @@ if SAVE_ALIGNMENT_QC:
     pl.legend()
     pl.savefig(str(alignment_qc_dir / "zinit_match_curve.png"), dpi=130, bbox_inches="tight")
     pl.close()
-    print(f"  [QC] alignment QC saved to {alignment_qc_dir}")
+    print(f"  [QC] alignment QC (offset array + 2 PNGs) saved to {alignment_qc_dir}")
 
 if SAVE_PROJECTION_STATE:
     # fixed_target_z.npy: confirmed missing from run_F260517_0625.py by
@@ -803,6 +950,12 @@ for i in range(0, T):
     refspace_row = _save_refspace_volume(i, phase_for_proj, mem_vals, sparse_vals, ref_mem_raw.shape)
     if refspace_row is not None:
         refspace_records.append(refspace_row)
+
+    # ---- Reference sampled onto the same fixed target planes (frame 0 only) ----
+    # Placed here so it sees the same phase_for_proj the two projection calls
+    # below consume. ref_mem_adj and ref_sparse_raw.transpose(2,1,0) are the
+    # same two ref_volume arguments those calls pass.
+    _save_ref_surface(i, phase_for_proj, ref_mem_adj, ref_sparse_raw.transpose(2, 1, 0))
 
     proj_mem_zyx = project_coords_to_fixed_planes_gpu(
         coords_ref_xyk_xyz=phase_for_proj, ref_volume=ref_mem_adj,
