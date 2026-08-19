@@ -1,6 +1,6 @@
 # Fix queue — remaining bug fixes, explained
 
-**Updated:** 2026-08-11. Every entry's title carries its current state (see legend). One entry per open finding, in review order, each with
+**Updated:** 2026-08-19 (see the banner below; the per-entry text below it is as of 2026-08-11). Every entry's title carries its current state (see legend). One entry per open finding, in review order, each with
 a plain-language explanation, expected impact, and who needs to decide.
 Evidence for every item: `audit/pass-1-bugs.md` / `audit/pass-2-math.md` and
 the verification log. Fixed items live in the ledger's Fix log — not here.
@@ -8,6 +8,33 @@ the verification log. Fixed items live in the ledger's Fix log — not here.
 Review protocol (agreed 2026-08-10): nothing lands without Virginia's per-item
 sign-off; fixes are applied to the working tree, verified with a before/after
 repro, and committed one bug per commit only on her word.
+
+## ⚠️ 2026-08-19 — `main` is red and part of this queue is stale
+
+Commit `8c52fbe` (cyf, 2026-08-12) rewrote `motion_correlation_pattern.py` from a
+pre-fix copy of the file and deleted `canny_edge_map` / `Yunfeng_edge_map` from
+`preprocess.py`. CI run `31600233151`: `12 failed, 54 passed, 4 xfailed`, against
+`66 passed, 4 xfailed` on the parent (run `31593179106`).
+
+What that changes in this queue:
+
+| Entry | Was | Now |
+|---|---|---|
+| B-018 / PR [#19](https://github.com/vruetten/wholistic-registration/pull/19) | ✅ merged | **reverted on `main`**; issue [#12](https://github.com/vruetten/wholistic-registration/issues/12) reopened |
+| B-017/B-019/B-020 / PR [#32](https://github.com/vruetten/wholistic-registration/pull/32) | ✅ merged | **reverted on `main`**; issue [#31](https://github.com/vruetten/wholistic-registration/issues/31) reopened |
+| B-058 / PR [#24](https://github.com/vruetten/wholistic-registration/pull/24) | 🔀 PR open | target function `canny_edge_map` **deleted** — moot if the deletion stands |
+| B-115 / issue [#25](https://github.com/vruetten/wholistic-registration/issues/25) | 📋 issue-worthy | same function deleted — moot if the deletion stands |
+| B-117 / issue [#33](https://github.com/vruetten/wholistic-registration/issues/33) | 📋 issue-worthy | `Yunfeng_edge_map` **deleted** — moot if the deletion stands, but `test_b055_yunfeng_edge_map_runs` still calls it and fails |
+| B-089 / branch `fix/b089-neidiff-z-component` | not yet filed | **fixed by `8c52fbe`** (`neiDiff[...,2]`, identical to the branch); drop the branch |
+| B-063 / PR [#22](https://github.com/vruetten/wholistic-registration/pull/22), B-116 / issue [#26](https://github.com/vruetten/wholistic-registration/issues/26) | 🔵 decision | unaffected; `8c52fbe` rewrote the *scale estimation* in `structural_difference_map` but not the `maximum`/`minimum` line |
+
+The three edge-map items above are blocked on one question for cyf: **do the two
+deletions stand?** If yes, close #24, #25, #33 as moot and delete their tests. If no,
+restore both functions. Either way the current state — functions gone, tests and
+issues still describing them — is the one state that cannot be right.
+
+New findings from the same commit (dangling calls to deleted functions, and four in
+the new code, one of them filed as B-118): [`../audit/cyf-2026-08-12-regression-audit.md`](../audit/cyf-2026-08-12-regression-audit.md).
 
 ## Status legend
 

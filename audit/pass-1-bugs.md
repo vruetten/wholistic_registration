@@ -48,19 +48,46 @@ minimal repros in a local CPU venv wherever executable.
    too weak to catch any of this (the `generate_demo_data` test passes despite
    B-060's constant-velocity bug) — hence the regression-test follow-up below.
 
+## ⚠️ Correction (2026-08-19) — eleven of the fixes below are NOT on `main`
+
+Commit `8c52fbe` (cyf, 2026-08-12) rewrote
+`src/wholistic_registration/utils/motion_correlation_pattern.py` from a copy of the
+file that predates this fix log, and `main` no longer contains the fixes for
+**B-001, B-002, B-009, B-012, B-017, B-019, B-020, B-041, B-043, B-044** (from this
+table) or **B-018** (from PR [#19](https://github.com/vruetten/wholistic-registration/pull/19)).
+`8c52fbe` also deleted `Yunfeng_edge_map`, so **B-055** no longer has a function to
+be fixed in.
+
+Measured: CI run `31600233151` reports `12 failed, 54 passed, 4 xfailed` on Python
+3.10/3.11/3.12, against `66 passed, 4 xfailed` on the parent commit `3168417`
+(run `31593179106`). `main` has been red since 2026-08-12T12:31:49Z.
+
+**Read every row below as "fixed once, state on `main` unverified" until the twelve
+failures are back to zero.** Rows carrying a ↩ marker are the reverted ones. The
+commit SHAs stay in the table because they are still the record of what the fix was
+and the cheapest way to re-apply it (`git show <sha> -- src/`).
+
+Issues [#12](https://github.com/vruetten/wholistic-registration/issues/12) and
+[#31](https://github.com/vruetten/wholistic-registration/issues/31) were closed as
+completed by the merges and have been **reopened** (2026-08-19). The other eight
+reverted IDs were fixed as direct commits in the 2026-08-10 batch and never had
+issues. Full analysis, including two dangling calls to deleted functions and four
+findings in the new code: [`cyf-2026-08-12-regression-audit.md`](./cyf-2026-08-12-regression-audit.md).
+
 ## Fix log (2026-08-10) — RESOLVED findings
 
 26 findings fixed, one commit per bug, each verified by a before/after repro
 (evidence in the commit messages). Table rows below remain as the finding
-record; these IDs are now **RESOLVED**:
+record; these IDs were **RESOLVED** as of 2026-08-11 — see the correction above for
+the eleven that were reverted on 2026-08-12 (marked ↩):
 
 | ID → commit | | | |
 |---|---|---|---|
-| B-001 → c81e861 | B-002 → 5b3c725 | B-009 → c33e6ce | B-012 → 83fd55b |
+| B-001 → c81e861 ↩ | B-002 → 5b3c725 ↩ | B-009 → c33e6ce ↩ | B-012 → 83fd55b ↩ |
 | B-070 → 521cf33 (2026-08-11, 🟥) | M-C1 → c07112f (2026-08-11) | B-074 → e21e08f (2026-08-11) | |
 | B-026 → 8eab9cf | B-027 → 9b326e9 | B-028 → aba9ee0 | B-029 → 6725eb8 |
-| B-030 → 49cf6c7 | B-033 → bd1ee1a | B-037 → 5103565 | B-041 → 867e82c |
-| B-043 → 8bfd0e2 | B-044 → 603282b | B-054 → cbf274c | B-055 → 8f9e3d3 |
+| B-030 → 49cf6c7 | B-033 → bd1ee1a | B-037 → 5103565 | B-041 → 867e82c ↩ |
+| B-043 → 8bfd0e2 ↩ | B-044 → 603282b ↩ | B-054 → cbf274c | B-055 → 8f9e3d3 ↩ (function deleted) |
 | B-056 → 283b255 | B-057 → 4ce9113 | B-060 → d728309 | B-061 → e41224c |
 | B-062 → c0d03ec | B-064 → fcbc933 | B-066 → f657d78 | B-068 → 98dea5b |
 | B-069 → 8893b4d | B-073 → 2910ffe | B-067 → 869775b (2026-08-11) | B-034 → 555f8ec (2026-08-11) |
