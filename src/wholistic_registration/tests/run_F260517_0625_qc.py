@@ -20,7 +20,16 @@ Output (under f260517_0625_qc/ by default, see BASE_OUT below):
   raw_moving_sparseCell/   raw moving sparse-cell per frame
   projected_mem/           z-plane-projected membrane
   projected_sparseCell/    z-plane-projected sparse-cell
-  diagnostics/             CSVs (errors_membrane, errors_sparse, hole_summary)
+  refspace_mem/            per-frame moving membrane scattered into the full
+                            (220,1500,630) reference grid, no z-window gate
+                            [SAVE_REF_SPACE_VOLUME]
+  refspace_sparseCell/     per-frame moving sparse-cell scattered into the
+                            full reference grid, no z-window gate
+                            [SAVE_REF_SPACE_VOLUME]
+  refspace_reference_mem.tif  the cropped reference volume itself (220,1500,630),
+                            written once, not per frame               [SAVE_REF_SPACE_VOLUME]
+  diagnostics/             CSVs (errors_membrane, errors_sparse, hole_summary,
+                            refspace_summary)
     alignment_qc/          target_z_offset_per_plane.npy, zinit_match_curve.png,
                             zinit_zncc_heatmap.png       [SAVE_ALIGNMENT_QC]
     masks_mov/              mask_mov_{i:06d}.npz          [SAVE_MASKS]
@@ -30,6 +39,7 @@ Output (under f260517_0625_qc/ by default, see BASE_OUT below):
     phase_new_f{i}.npy, motion_current_f{i}.npy           [SAVE_MOTION_FIELD]
     mov_mem_f{i}.npy                                      [SAVE_COMPARE_INPUTS]
     coverage/                no_coverage_{i:06d}.npz       [SAVE_COVERAGE_MAP]
+    refspace_summary.csv                                  [SAVE_REF_SPACE_VOLUME]
   Each array above (phase_new, motion_current, mov_mem, per frame) is
   written exactly once, flat under diagnostics/; no motion_field/
   subdirectory and no duplicate copy exist.
@@ -39,6 +49,7 @@ import json, os, sys, time
 from pathlib import Path
 
 import cupy as cp
+import cupyx
 import numpy as np
 import pandas as pd
 from scipy.ndimage import distance_transform_edt, label as label_ndi, sobel
@@ -93,6 +104,8 @@ DIRS = {
     "raw_moving_sparseCell": BASE_OUT / "raw_moving_sparseCell",
     "projected_mem":         BASE_OUT / "projected_mem",
     "projected_sparseCell":  BASE_OUT / "projected_sparseCell",
+    "refspace_mem":          BASE_OUT / "refspace_mem",
+    "refspace_sparseCell":   BASE_OUT / "refspace_sparseCell",
     "diagnostics":           BASE_OUT / "diagnostics",
     # QC additions only (new keys; existing keys/names above are untouched).
     "alignment_qc":          BASE_OUT / "diagnostics" / "alignment_qc",
@@ -166,6 +179,16 @@ percentiles = [0.1, 0.5, 1, 2, 5, 10, 25, 50, 75, 90, 95, 99, 99.5, 99.8]
 #   6. SAVE_COVERAGE_MAP      -- diagnostics/coverage/no_coverage_{i:06d}.npz,
 #                                a packed boolean map of where the per-frame
 #                                projection coverage array cov is zero.
+#   7. SAVE_REF_SPACE_VOLUME  -- refspace_mem/, refspace_sparseCell/: per-frame
+#                                moving intensity scattered (trilinear weights,
+#                                NO z-window gate) into the full (220,1500,630)
+#                                reference grid, plus refspace_reference_mem.tif
+#                                (written once) and diagnostics/refspace_summary.csv
+#                                (written every run). Stride via
+#                                REF_SPACE_SAVE_STRIDE, frame 0 and the final
+#                                processed frame always included, same
+#                                _frame_selected_for_stride predicate as
+#                                SAVE_MOTION_FIELD.
 SAVE_ALIGNMENT_QC     = os.environ.get("SAVE_ALIGNMENT_QC", "1") == "1"
 SAVE_MASKS            = os.environ.get("SAVE_MASKS", "1") == "1"
 SAVE_MOTION_FIELD     = os.environ.get("SAVE_MOTION_FIELD", "1") == "1"
@@ -173,6 +196,8 @@ PHASE_SAVE_STRIDE     = int(os.environ.get("PHASE_SAVE_STRIDE", "1"))
 SAVE_PROJECTION_STATE = os.environ.get("SAVE_PROJECTION_STATE", "1") == "1"
 SAVE_COMPARE_INPUTS   = os.environ.get("SAVE_COMPARE_INPUTS", "1") == "1"
 SAVE_COVERAGE_MAP     = os.environ.get("SAVE_COVERAGE_MAP", "1") == "1"
+SAVE_REF_SPACE_VOLUME = os.environ.get("SAVE_REF_SPACE_VOLUME", "1") == "1"
+REF_SPACE_SAVE_STRIDE = int(os.environ.get("REF_SPACE_SAVE_STRIDE", "1"))
 
 # Bytes for one frame's phase_new and one frame's motion_current, each
 # measured with os.path.getsize on a saved .npy at this dataset's native
@@ -224,6 +249,7 @@ _mask_mov_saved_frames = set()
 # motion-field / compare-inputs saves and for the coverage-map save.
 _motion_saved_frames = set()
 _coverage_saved_frames = set()
+_refspace_saved_frames = set()
 
 
 def _save_mask_mov(i, mask_arr):
@@ -277,6 +303,123 @@ def _save_coverage_map(i, cov_arr, axis_order):
         axis_order=axis_order,
     )
 
+
+def _scatter_trilinear_to_refspace(coords_xyz, values_xyk, ref_shape_zyx, eps=1e-6):
+    """Scatter one frame's upsampled moving samples into the full reference
+    grid via trilinear weights over the 2x2x2 neighbourhood of each sample's
+    continuous reference coordinate. No z-window gate: every finite,
+    in-bounds sample contributes (this is the property SAVE_REF_SPACE_VOLUME
+    exists for, contrasting with the z-window-gated projected_mem/
+    projected_sparseCell outputs above). coords_xyz: (Xup,Yup,K,3) with
+    [...,0]=x_ref, [...,1]=y_ref, [...,2]=z_ref (same layout
+    project_coords_to_fixed_planes_gpu documents for coords_ref_xyk_xyz).
+    values_xyk: (Xup,Yup,K) moving intensity, already upsampled by the
+    caller's fh.upsample_values_xy_for_supersurface call -- this function
+    does not upsample or resample the input.
+    Returns (out, occupied): out is (Zref,Yref,Xref) float32 with
+    weighted-mean intensity where the total scattered weight exceeds eps,
+    np.nan elsewhere; occupied is the boolean (Zref,Yref,Xref) array
+    out == out (i.e. weight > eps) the caller uses for the per-plane
+    occupancy count without a second NaN scan."""
+    Zref, Yref, Xref = ref_shape_zyx
+    coords = cp.asarray(coords_xyz, dtype=cp.float32)
+    values = cp.asarray(values_xyk, dtype=cp.float32)
+    x_ref, y_ref, z_ref = coords[..., 0], coords[..., 1], coords[..., 2]
+
+    valid = (
+        cp.isfinite(x_ref) & cp.isfinite(y_ref) & cp.isfinite(z_ref) & cp.isfinite(values)
+        & (x_ref >= 0) & (x_ref <= Xref - 1)
+        & (y_ref >= 0) & (y_ref <= Yref - 1)
+        & (z_ref >= 0) & (z_ref <= Zref - 1)
+    )
+    valid_w = valid.astype(cp.float32)
+    # Invalid samples get their coordinate/value zeroed (safe, in-bounds) and
+    # their corner weights zeroed via valid_w below, rather than being
+    # filtered out, so the 8-corner loop never needs a variable-length index.
+    x_s = cp.where(valid, x_ref, cp.float32(0.0))
+    y_s = cp.where(valid, y_ref, cp.float32(0.0))
+    z_s = cp.where(valid, z_ref, cp.float32(0.0))
+    val_s = cp.where(valid, values, cp.float32(0.0))
+    del coords, values, x_ref, y_ref, z_ref, valid
+
+    x0 = cp.floor(x_s).astype(cp.int32); x1 = cp.minimum(x0 + 1, Xref - 1)
+    y0 = cp.floor(y_s).astype(cp.int32); y1 = cp.minimum(y0 + 1, Yref - 1)
+    z0 = cp.floor(z_s).astype(cp.int32); z1 = cp.minimum(z0 + 1, Zref - 1)
+    fx, fy, fz = x_s - x0, y_s - y0, z_s - z0
+    del x_s, y_s, z_s
+
+    sum_val = cp.zeros(Zref * Yref * Xref, dtype=cp.float32)
+    sum_w = cp.zeros(Zref * Yref * Xref, dtype=cp.float32)
+    val_flat = val_s.ravel()
+    for zi, wz in ((z0, 1.0 - fz), (z1, fz)):
+        for yi, wy in ((y0, 1.0 - fy), (y1, fy)):
+            for xi, wx in ((x0, 1.0 - fx), (x1, fx)):
+                w = (wx * wy * wz * valid_w).ravel()
+                idx = ((zi * Yref + yi) * Xref + xi).ravel()
+                cupyx.scatter_add(sum_val, idx, w * val_flat)
+                cupyx.scatter_add(sum_w, idx, w)
+    del x0, x1, y0, y1, z0, z1, fx, fy, fz, valid_w, val_s, val_flat
+
+    sum_val = sum_val.reshape(Zref, Yref, Xref)
+    sum_w = sum_w.reshape(Zref, Yref, Xref)
+    occupied = sum_w > eps
+    out = cp.where(occupied, sum_val / cp.maximum(sum_w, eps), cp.float32(np.nan))
+    out_np = cp.asnumpy(out)
+    occupied_np = cp.asnumpy(occupied)
+    del sum_val, sum_w, occupied, out
+    cp.get_default_memory_pool().free_all_blocks()
+    return out_np, occupied_np
+
+
+def _save_refspace_reference(volume_zyx, path):
+    """Write the cropped reference volume once (not per frame), fixed
+    filename rather than the vol_{label}_{frame_idx:06d}.tif pattern
+    fh.save_single_channel_ome_tiff produces, via the same underlying
+    IO.saveTiff_new writer as that helper uses."""
+    v = np.asarray(volume_zyx, dtype=np.float32)
+    img5d = v[np.newaxis, :, np.newaxis, :, :]  # (1,Z,1,Y,X)
+    IO.saveTiff_new(img5d, str(path), metadata={"spacing_x": 1.0, "spacing_y": 1.0}, verbose=False)
+
+
+def _save_refspace_volume(i, coords_xyz, mem_vals, sparse_vals, ref_shape_zyx):
+    """For frame i, scatter both channels' already-upsampled moving samples
+    into the full reference grid (_scatter_trilinear_to_refspace), write one
+    OME-TIFF per channel, and return the per-frame occupancy row for
+    diagnostics/refspace_summary.csv. Frees each channel's GPU accumulators
+    before starting the next channel, so both channels' accumulators are
+    never resident at once."""
+    if not SAVE_REF_SPACE_VOLUME or i in _refspace_saved_frames:
+        return None
+    if not _frame_selected_for_stride(i, REF_SPACE_SAVE_STRIDE, T - 1):
+        return None
+    _refspace_saved_frames.add(i)
+
+    Zref = ref_shape_zyx[0]
+    row = {"frame": i}
+    for label, vals, out_dir in (
+        ("mem", mem_vals, DIRS["refspace_mem"]),
+        ("sparse", sparse_vals, DIRS["refspace_sparseCell"]),
+    ):
+        vol, occ = _scatter_trilinear_to_refspace(coords_xyz, vals, ref_shape_zyx)
+        fh.save_single_channel_ome_tiff(vol, str(out_dir), frame_idx=i,
+                                         label=f"F260517_refspace_{label}")
+        z_occupied = np.flatnonzero(occ.any(axis=(1, 2)))
+        row[f"{label}_nonnan_frac"] = float(np.mean(occ))
+        row[f"{label}_n_planes_occupied"] = int(z_occupied.size)
+        row[f"{label}_z_min"] = int(z_occupied.min()) if z_occupied.size else -1
+        row[f"{label}_z_max"] = int(z_occupied.max()) if z_occupied.size else -1
+        del vol, occ
+
+    print(f"[QC] refspace frame {i}: "
+          f"mem {row['mem_nonnan_frac']*100:.2f}% non-NaN, "
+          f"{row['mem_n_planes_occupied']}/{Zref} planes occupied "
+          f"(z={row['mem_z_min']}..{row['mem_z_max']}) | "
+          f"sparse {row['sparse_nonnan_frac']*100:.2f}% non-NaN, "
+          f"{row['sparse_n_planes_occupied']}/{Zref} planes occupied "
+          f"(z={row['sparse_z_min']}..{row['sparse_z_max']})")
+    return row
+
+
 # ===========================================================================
 # 1. Load data
 # ===========================================================================
@@ -296,6 +439,14 @@ F260517_mov, _ = fh.read_ome_tiff_timepoints(F260517_mov_path, n_timepoints=N_LO
 F260517_ref, _ = IO.readTiff(F260517_ref_path)
 
 ref_mem_raw    = F260517_ref[90:310, 1, :, :].astype(np.float32)
+if SAVE_REF_SPACE_VOLUME:
+    # ref_mem_raw is the RAW (not intensity-calibrated) cropped reference --
+    # the intensity-calibrated array used during registration is ref_mem_adj,
+    # produced later (Section 3) by
+    # fh.update_reference_intensity_mapping_from_target_stack(ref_mem_raw, ...).
+    # Written once here, not per frame, so the refspace/reference pair can be
+    # opened together without a frame-indexed filename to hunt for.
+    _save_refspace_reference(ref_mem_raw, BASE_OUT / "refspace_reference_mem.tif")
 if SAVE_PROJECTION_STATE:
     # QC addition 4: state needed to redo the projection call later, saved
     # immediately after ref_mem_raw is loaded/cropped. ref_mem_raw is a slice
@@ -320,6 +471,8 @@ if SAVE_PROJECTION_STATE:
         "ref_volume_order": "xyz",
         "output_order": "zyx",
         "ref_shape_axis_order": "zyx",
+        "save_ref_space_volume": SAVE_REF_SPACE_VOLUME,
+        "ref_space_save_stride": REF_SPACE_SAVE_STRIDE,
     }
     with open(str(DIRS["diagnostics"] / "projection_params.json"), "w") as f_params:
         json.dump(projection_params, f_params, indent=2)
@@ -601,6 +754,7 @@ registered_cache = {}
 error_mem = []
 error_sparse = []
 hole_records = []
+refspace_records = []
 
 frames_since_ref_update = 0
 ref_update_id = 0
@@ -641,6 +795,14 @@ for i in range(0, T):
     raw_sparse_xyk = raw_sparse_zyx.transpose(2, 1, 0).astype(np.float32, copy=False)
     mem_vals  = fh.upsample_values_xy_for_supersurface(raw_mem_xyk, upsample_factor=2, order=1)
     sparse_vals = fh.upsample_values_xy_for_supersurface(raw_sparse_xyk, upsample_factor=2, order=0)
+
+    # ---- Full reference-space scatter (no z-window gate) ----
+    # Reuses phase_for_proj/mem_vals/sparse_vals computed just above (same
+    # arrays the z-window-gated projection below consumes), so this output
+    # never re-upsamples or resamples anything the projection already did.
+    refspace_row = _save_refspace_volume(i, phase_for_proj, mem_vals, sparse_vals, ref_mem_raw.shape)
+    if refspace_row is not None:
+        refspace_records.append(refspace_row)
 
     proj_mem_zyx = project_coords_to_fixed_planes_gpu(
         coords_ref_xyk_xyz=phase_for_proj, ref_volume=ref_mem_adj,
@@ -760,6 +922,9 @@ df_holes = pd.DataFrame(hole_records)
 df_mem.to_csv(str(DIRS["diagnostics"] / "errors_membrane.csv"), index=False)
 df_sparse.to_csv(str(DIRS["diagnostics"] / "errors_sparse.csv"), index=False)
 df_holes.to_csv(str(DIRS["diagnostics"] / "hole_summary.csv"), index=False)
+
+df_refspace = pd.DataFrame(refspace_records)
+df_refspace.to_csv(str(DIRS["diagnostics"] / "refspace_summary.csv"), index=False)
 
 # ===========================================================================
 # 7. Summary
