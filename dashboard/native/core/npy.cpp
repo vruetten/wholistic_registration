@@ -44,11 +44,6 @@ template <> char expected_kind<int32_t>() { return 'i'; }
 template <> char expected_kind<int64_t>() { return 'i'; }
 template <> char expected_kind<uint8_t>() { return 'u'; }
 
-struct Descr {
-  char order;   // '<', '|', or '='
-  char kind;    // 'f', 'i', 'u', ...
-};
-
 // Parses the raw .npy magic + header dict directly, ahead of handing the
 // file to cnpy, so truncation, non-little-endian dtypes, dtype-kind
 // confusion and fortran-order arrays get a message naming the actual
@@ -58,13 +53,15 @@ struct Descr {
 // produces plausible-looking garbage, and cnpy::NpyArray also discards the
 // dtype-kind character entirely — only word_size survives past
 // cnpy::npy_load — so kind confusion must be caught here or nowhere).
-// Returns the parsed order and kind characters; throws if the header dict
-// cannot be understood well enough to extract them.
+// Returns the whole parsed header; throws if the header dict cannot be
+// understood well enough to extract it. Callers take the fields they need —
+// load() checks order and kind against the type it was asked for, peek()
+// reports shape without reading the body.
 //
 // The dict scan itself lives in detail/npy_header.cpp so that .npz members,
 // which arrive as decompressed buffers rather than files, pass through the
 // identical parse instead of a second copy of it.
-Descr require_c_order_little_endian(const std::filesystem::path& p) {
+detail::Header require_c_order_little_endian(const std::filesystem::path& p) {
   std::ifstream f(p, std::ios::binary);
   if (!f) throw std::runtime_error("cannot open " + p.string());
 
@@ -124,14 +121,19 @@ Descr require_c_order_little_endian(const std::filesystem::path& p) {
         "fortran_order=True npy not supported in " + p.string() +
         "; write with np.ascontiguousarray(...) before np.save()");
   }
-  return {h.order, h.kind};
+  return h;
 }
 
 }  // namespace
 
+Info peek(const std::filesystem::path& path) {
+  const detail::Header h = require_c_order_little_endian(path);
+  return {h.shape, h.kind, h.word_size};
+}
+
 template <typename T>
 Array<T> load(const std::filesystem::path& path, int expect_ndim) {
-  const Descr descr = require_c_order_little_endian(path);
+  const detail::Header descr = require_c_order_little_endian(path);
 
   cnpy::NpyArray arr = cnpy::npy_load(path.string());
 

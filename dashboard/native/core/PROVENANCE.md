@@ -32,6 +32,12 @@ A copy diverges. Two things are meant to slow that down:
   preamble before the declared header length, so a valid file with a long header
   no longer reports "header exceeds available bytes".
 - `CMakeLists.txt` and `tests/CMakeLists.txt` list the files above.
+- `npy::peek` reports a header's shape, kind and word size without reading the
+  array body, and the internal header helper now returns the whole parsed
+  header instead of just its order and kind characters. The run loader needs
+  the moving slice count K, which lives in the displacement field's shape; the
+  field is 227 MB at K=20, and reading all of it to learn one integer is a
+  cost the loader would pay once per run at startup.
 
 ## What the source has that this copy does not
 

@@ -42,6 +42,20 @@ struct Array {
   }
 };
 
+// What the header says, without reading the array body. A caller that only
+// needs a shape — to size a panel, to learn how many planes a field has —
+// would otherwise pay a full read for it, and these files reach 227 MB.
+struct Info {
+  std::vector<int64_t> shape;
+  char kind = 'f';            // 'f', 'i', 'u', ... as the descr spells it
+  std::size_t word_size = 0;  // bytes per element for the numeric kinds
+};
+
+// Applies the same magic, truncation, byte-order and fortran-order guards
+// load() applies, and reports the header rather than checking it against an
+// expected type: peek does not know what the caller wants.
+Info peek(const std::filesystem::path& path);
+
 template <typename T>
 Array<T> load(const std::filesystem::path& path, int expect_ndim = -1);
 

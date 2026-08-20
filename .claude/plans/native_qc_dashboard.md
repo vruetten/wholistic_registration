@@ -7,8 +7,22 @@ wholistic-specific application whose panels are declared in TOML.
 Decisions taken 2026-08-19:
 
 - Architecture: `wrdash` built on `dashcore`, not a single-layer icampsnfr-style app.
-- Reprojection: the dashboard reads precomputed artifacts only. No cupy, no GPU,
-  no subprocess. Changing projection parameters means re-running the pipeline.
+- ~~Reprojection: the dashboard reads precomputed artifacts only. No cupy, no GPU,
+  no subprocess. Changing projection parameters means re-running the pipeline.~~
+  **Reversed 2026-08-20.** The dashboard projects the raw moving stack into
+  reference space itself, on the CPU in C, and overlays the result on the
+  reference anatomy — membrane and sparse-cell channels both. The precomputed
+  `refspace_*` and `refspace_movie_*` artifacts stay loadable as the oracle the
+  C scatter is checked against, not as the thing displayed.
+
+  What changed is the arithmetic, not the preference. The runs this dashboard
+  targets now carry K=4 moving slices rather than K=20, which puts one frame's
+  trilinear scatter at 15.1 M samples (121 M weighted adds) at the pipeline's
+  `upsample_factor=2`, or 3.8 M at 1. That is a few hundred milliseconds
+  single-threaded. The 12.3 s in `dashboard/reproject.py` was cupy
+  initialisation plus K=20 at full resolution, and is not evidence about this
+  case. Accumulating into the movie's grid rather than the full reference grid
+  keeps the working set at 104 MB against 590 MB.
 - Display: native on physical `DISPLAY=:1`, per the `launch-dashboard-natively`
   memory. No browser, no xpra.
 
@@ -96,11 +110,17 @@ preserve in the port.
 
 ## Open questions
 
-- Frame scale. `SPEC.md` Correction 3 says real runs reach 200 frames with
-  per-artifact frame sets from `PHASE_SAVE_STRIDE` and `REF_SPACE_SAVE_STRIDE`
-  that are neither contiguous nor arithmetic. The native loader should read the
-  frame set per artifact kind from the start rather than inheriting the
-  browser version's 5-frame assumption.
+- ~~Frame scale.~~ **Settled 2026-08-20, and the warning was an understatement.**
+  Measured on `f260517_0625_qc_4slice_100t_movie`, one run directory holds three
+  frame sets at once: `{0, 10, ..., 90, 99}` for phase, motion and refspace;
+  `{0..99}` for masks, coverage, projected and raw moving; and nothing at all
+  for `mov_mem`. The stride families are not arithmetic — the final frame is
+  appended, so 90 is followed by 99 — and `mov_mem`'s absence crashes the
+  Python loader, which probes `mov_mem_f{frames[0]}.npy` for the moving shape.
+  `Run` discovers each family independently and takes K from the field header
+  instead. The consequence that matters for the projector: only the 11 frames
+  carrying a displacement field are projectable, though the raw stack offers
+  100.
 - Memory. One `motion_current_f{n}.npy` is 227 MB and the reference anatomy is
   831 MB. Whether panels mmap or read is not yet decided; NMFDemo's async
   loading behind a modal is the precedent if reads turn out to block the frame.
