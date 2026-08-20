@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WHOLISTIC Registration &mdash; QC dashboard</title>
+<style>
+  :root {
+    --border: #d0d3d8;
+    --bg-panel: #ffffff;
+    --bg-page: #f2f3f5;
+    --text: #1c1e21;
+    --muted: #6b7280;
+    --accent: #2b6cb0;
+    --warn-bg: #fff3cd;
+    --warn-border: #f0c14b;
+    --err: #b02a2a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg-page);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 13px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 0 0 10px; }
+  #manifest-line { color: var(--muted); font-family: ui-monospace, Menlo, monospace; font-size: 11px; margin-bottom: 14px; }
+  .fatal { background: #fde2e2; border: 1px solid var(--err); color: var(--err); padding: 8px 12px; margin-bottom: 12px; }
+  main { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 14px; align-items: start; }
+  section.panel { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
+  section.panel.wide { grid-column: 1 / -1; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
+  label { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--muted); }
+  label > span.control-label { color: var(--text); }
+  select, input[type=number], input[type=text] { font: inherit; padding: 3px 4px; border: 1px solid var(--border); border-radius: 3px; }
+  input[type=range] { width: 160px; }
+  .inline-check { flex-direction: row; align-items: center; gap: 4px; }
+  .note { color: var(--muted); font-size: 11px; margin: 4px 0; }
+  .gap-note { background: #eef1f5; border: 1px dashed var(--border); padding: 6px 8px; color: var(--muted); font-size: 11px; }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--accent); background: var(--accent); color: #fff; border-radius: 3px; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.secondary { background: #fff; color: var(--accent); }
+
+  /* Fixed-aspect image slot: reserving the box before the image arrives is
+     what keeps a slider drag from reflowing the page on every swap. */
+  .imgbox { position: relative; width: 100%; max-width: 300px; aspect-ratio: 630 / 1500; background: #14161a; border-radius: 4px; overflow: hidden; }
+  .imgbox.wide-box { max-width: 900px; aspect-ratio: auto; min-height: 220px; }
+  .imgbox img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .imgbox .overlay-msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; padding: 8px; font-size: 11px; }
+  .imgbox .loading { background: rgba(0,0,0,0.45); color: #fff; }
+  .imgbox .loading[hidden] { display: none; }
+  .imgbox .imgerror { background: rgba(176,42,42,0.9); color: #fff; }
+  .imgbox .imgerror[hidden] { display: none; }
+
+  .scale-banner { background: var(--warn-bg); border: 1px solid var(--warn-border); padding: 5px 8px; margin-bottom: 8px; font-weight: 600; }
+  .scale-banner[hidden] { display: none; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 11px; }
+  th, td { border: 1px solid var(--border); padding: 3px 6px; text-align: left; }
+  .plots-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-bottom: 10px; }
+  canvas.metric-canvas { width: 100%; height: 90px; border: 1px solid var(--border); background: #fff; }
+  #hole-heatmap { image-rendering: pixelated; border: 1px solid var(--border); cursor: crosshair; max-width: 100%; }
+  .heatmap-wrap { overflow-x: auto; }
+  #align-canvas-row canvas { width: 100%; height: 120px; border: 1px solid var(--border); background: #fff; }
+</style>
+</head>
+<body>
+
+<h1>WHOLISTIC Registration &mdash; QC dashboard</h1>
+<div id="manifest-line">loading /api/manifest ...</div>
+<div id="fatal-slot"></div>
+
+<main>
+
+  <!-- Panel 1: motion field -->
+  <section class="panel" id="panel-motion">
+    <h2>1. Motion field</h2>
+    <div class="row">
+      <label><span class="control-label">frame</span>
+        <select id="mf-frame"></select>
+      </label>
+      <label><span class="control-label">quantity</span>
+        <select id="mf-quantity">
+          <option value="norm" selected>norm |d|</option>
+          <option value="dx">dx</option>
+          <option value="dy">dy</option>
+          <option value="dz">dz</option>
+        </select>
+      </label>
+      <label><span class="control-label">z-plane k = <span id="mf-k-val">0</span></span>
+        <input type="range" id="mf-k" min="0" max="19" step="1" value="0">
+      </label>
+      <label><span class="control-label">colormap</span>
+        <select id="mf-cmap">
+          <option value="gray">gray</option>
+          <option value="magma" selected>magma</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
+      <label><span class="control-label">lo pct</span>
+        <input type="number" id="mf-lo-pct" value="1" min="0" max="100" step="0.5" style="width:60px">
+      </label>
+      <label><span class="control-label">hi pct</span>
+        <input type="number" id="mf-hi-pct" value="99" min="0" max="100" step="0.5" style="width:60px">
+      </label>
+      <span id="mf-pct-note" class="gap-note" hidden>lo pct mirrors hi pct: a diverging scale is symmetric about zero.</span>
+      <label><span class="control-label">alpha = <span id="mf-alpha-val">0.6</span></span>
+        <input type="range" id="mf-alpha" min="0" max="1" step="0.05" value="0.6">
+      </label>
+      <label class="inline-check"><input type="checkbox" id="mf-base" checked><span class="control-label">anatomy base (mov)</span></label>
+    </div>
+    <div class="row">
+      <label class="inline-check"><input type="checkbox" id="mf-mask"><span class="control-label">mask overlay</span></label>
+      <label class="inline-check"><input type="checkbox" id="mf-quiver"><span class="control-label">quiver</span></label>
+      <label><span class="control-label">stride</span>
+        <input type="number" id="mf-stride" value="22" min="1" step="1" style="width:60px" disabled>
+      </label>
+    </div>
+    <p class="note">Mask overlay is off by default: mask_mov covers ~0.48% of voxels (measured, SPEC.md), so a gated
+      plane would render as almost entirely empty. When on, the field composites over anatomy with alpha rather
+      than hiding outside-mask pixels outright.</p>
+    <div class="imgbox" id="mf-imgbox">
+      <img id="mf-img" alt="motion field">
+      <div class="overlay-msg loading" id="mf-loading" hidden>loading&hellip;</div>
+      <div class="overlay-msg imgerror" id="mf-error" hidden></div>
+    </div>
+  </section>
+
+  <!-- Panel 2: tiling montage -->
+  <section class="panel" id="panel-montage">
+    <h2>2. Tiling montage</h2>
+    <div class="row">
+      <label><span class="control-label">axis</span>
+        <select id="mt-axis">
+          <option value="time" selected>time</option>
+          <option value="z">z</option>
+        </select>
+      </label>
+      <label><span class="control-label">quantity</span>
+        <select id="mt-quantity">
+          <option value="norm" selected>norm |d|</option>
+          <option value="dx">dx</option>
+          <option value="dy">dy</option>
+          <option value="dz">dz</option>
+        </select>
+      </label>
+      <label id="mt-k-label"><span class="control-label">z-plane k</span>
+        <input type="number" id="mt-k" value="0" min="0" max="19" style="width:60px">
+      </label>
+      <label id="mt-frame-label" hidden><span class="control-label">frame</span>
+        <select id="mt-frame"></select>
+      </label>
+    </div>
+    <div class="scale-banner" id="mt-scale-banner" hidden></div>
+    <div class="imgbox wide-box" id="mt-imgbox">
+      <img id="mt-img" alt="tiling montage">
+      <div class="overlay-msg loading" id="mt-loading" hidden>loading&hellip;</div>
+      <div class="overlay-msg imgerror" id="mt-error" hidden></div>
+    </div>
+  </section>
+
+  <!-- Panel 3: reference-space projection -->
+  <section class="panel wide" id="panel-refspace">
+    <h2>3. Reference-space projection</h2>
+    <div class="row">
+      <label><span class="control-label">reference z = <span id="rs-z-val">0</span></span>
+        <input type="range" id="rs-z" min="0" max="219" step="1" value="0">
+      </label>
+      <label><span class="control-label">channel</span>
+        <select id="rs-channel">
+          <option value="mem" selected>mem</option>
+          <option value="sparseCell">sparseCell</option>
+        </select>
+      </label>
+      <label><span class="control-label">source frame (precomputed)</span>
+        <select id="rs-frame"></select>
+      </label>
+      <label><span class="control-label">colormap</span>
+        <select id="rs-cmap">
+          <option value="gray" selected>gray</option>
+          <option value="magma">magma</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
+      <label class="inline-check"><input type="checkbox" id="rs-overlay" checked><span class="control-label">overlay on reference anatomy</span></label>
+      <label><span class="control-label">alpha = <span id="rs-alpha-val">0.6</span></span>
+        <input type="range" id="rs-alpha" min="0" max="1" step="0.05" value="0.6">
+      </label>
+      <label><span class="control-label">lo pct</span>
+        <input type="number" id="rs-lo-pct" value="1" min="0" max="100" step="0.5" style="width:60px">
+      </label>
+      <label><span class="control-label">hi pct</span>
+        <input type="number" id="rs-hi-pct" value="99" min="0" max="100" step="0.5" style="width:60px">
+      </label>
+      <label><span class="control-label">source</span>
+        <select id="rs-source"><option value="precomputed" selected>precomputed</option></select>
+      </label>
+    </div>
+    <div class="imgbox" id="rs-imgbox">
+      <img id="rs-img" alt="reference-space projection">
+      <div class="overlay-msg loading" id="rs-loading" hidden>loading&hellip;</div>
+      <div class="overlay-msg imgerror" id="rs-error" hidden></div>
+    </div>
+
+    <h2 style="margin-top:14px">Reprojection (POST /api/reproject)</h2>
+    <p class="note">field_frame and image_frame are separate on purpose: applying frame i's field to frame j's
+      image (i &ne; j) is the null test for whether the field, not the image, drives the result.</p>
+    <div class="row">
+      <label><span class="control-label">field_frame</span>
+        <select id="rp-field-frame"></select>
+      </label>
+      <label><span class="control-label">image_frame</span>
+        <select id="rp-image-frame"></select>
+      </label>
+      <label><span class="control-label">mode</span>
+        <select id="rp-mode">
+          <option value="refspace" selected>refspace</option>
+          <option value="planes">planes</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
+      <label><span class="control-label">z_window</span>
+        <input type="number" id="rp-z-window" placeholder="(run default)" style="width:90px">
+      </label>
+      <label><span class="control-label">upsample_factor</span>
+        <input type="number" id="rp-upsample" placeholder="(run default)" style="width:90px">
+      </label>
+      <label><span class="control-label">xy_splat_mode</span>
+        <input type="text" id="rp-splat-mode" placeholder="(run default)" style="width:110px">
+      </label>
+      <label><span class="control-label">values_interp_order_mem</span>
+        <input type="number" id="rp-interp-order" placeholder="(run default)" style="width:90px">
+      </label>
+      <button id="rp-submit">submit</button>
+    </div>
+    <p class="note" id="rp-status"></p>
+
+    <h2 style="margin-top:10px">Held jobs (GET /api/jobs)</h2>
+    <table>
+      <thead><tr><th>job</th><th>field_frame</th><th>image_frame</th><th>mode</th><th>bytes</th><th></th></tr></thead>
+      <tbody id="jobs-body"></tbody>
+    </table>
+  </section>
+
+  <!-- Panel 4: metrics -->
+  <section class="panel wide" id="panel-metrics">
+    <h2>4. Metrics</h2>
+    <p class="note" id="mask-support-note">mask_support_frac: loading&hellip;</p>
+    <div class="plots-grid">
+      <canvas class="metric-canvas" id="metric-mae"></canvas>
+      <canvas class="metric-canvas" id="metric-nmae"></canvas>
+      <canvas class="metric-canvas" id="metric-ncc"></canvas>
+      <canvas class="metric-canvas" id="metric-holefrac"></canvas>
+    </div>
+    <p class="note" id="metrics-error"></p>
+    <h2>hole_summary.csv &mdash; frame &times; plane heatmap (click a cell to set frame/plane above)</h2>
+    <div class="heatmap-wrap"><canvas id="hole-heatmap" width="400" height="200"></canvas></div>
+    <p class="note" id="heatmap-click-target"></p>
+  </section>
+
+  <!-- Panel 5: alignment QC -->
+  <section class="panel wide" id="panel-alignment">
+    <h2>5. Alignment QC</h2>
+    <p class="note">target_z_offset_per_plane.npy is not served by any route in SPEC.md's authoritative route
+      table (verified: no /img or /api entry names it or the diagnostics/alignment_qc directory). Row 1 of that
+      file is z_init, computable client-side as 20 + 10k. Row 0 is fixed_target_z - z_init
+      (source: run_F260517_0625_qc.py:684), and fixed_target_z is already in /api/manifest, so both curves are
+      plotted below from data the route table does provide, without waiting on a new route.</p>
+    <div id="align-canvas-row" class="plots-grid">
+      <div><div class="note">fixed_target_z &minus; z_init, per plane k</div><canvas id="align-offset-canvas"></canvas></div>
+      <div><div class="note">z_init = 20 + 10k, per plane k</div><canvas id="align-zinit-canvas"></canvas></div>
+    </div>
+    <div class="gap-note">zinit_zncc_heatmap.png and zinit_match_curve.png (diagnostics/alignment_qc/) are also not
+      exposed by the authoritative route table &mdash; see "Spec gaps" in the implementer report. Not fetched here
+      because there is no documented route to fetch them from.</div>
+  </section>
+
+</main>
+
+<script>
+"use strict";
+
+var DEBOUNCE_MS = 250;
+var manifest = null;
+var metricsData = null;
+
+function $(id) { return document.getElementById(id); }
+
+function debounce(fn, ms) {
+  var t = null;
+  return function () {
+    var args = arguments;
+    clearTimeout(t);
+    t = setTimeout(function () { fn.apply(null, args); }, ms);
+  };
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+
+async function fetchJSON(url, opts) {
+  var resp = await fetch(url, opts);
+  if (!resp.ok) {
+    var msg = resp.status + " " + resp.statusText;
+    try {
+      var body = await resp.json();
+      if (body && body.error) msg = body.error;
+    } catch (e) { /* body was not JSON; keep the status-line message */ }
+    throw new Error(msg);
+  }
+  return resp.json();
+}
+
+/* One image slot = one <img> plus its loading/error overlay and the
+   AbortController for its in-flight request, so a superseded fetch (e.g. the
+   slider moved again before the previous PNG arrived) never overwrites a
+   newer one. */
+function makeImageSlot(prefix) {
+  return {
+    img: $(prefix + "-img"),
+    loading: $(prefix + "-loading"),
+    error: $(prefix + "-error"),
+    controller: null,
+    objectUrl: null,
+  };
+}
+
+function loadImage(slot, url, onHeaders) {
+  if (slot.controller) slot.controller.abort();
+  var controller = new AbortController();
+  slot.controller = controller;
+  slot.loading.hidden = false;
+  slot.error.hidden = true;
+  fetch(url, { signal: controller.signal }).then(async function (resp) {
+    if (!resp.ok) {
+      var msg = resp.status + " " + resp.statusText;
+      try {
+        var body = await resp.json();
+        if (body && body.error) msg = body.error;
+      } catch (e) { /* non-JSON error body */ }
+      throw new Error(msg);
+    }
+    var blob = await resp.blob();
+    var objUrl = URL.createObjectURL(blob);
+    if (slot.objectUrl) URL.revokeObjectURL(slot.objectUrl);
+    slot.objectUrl = objUrl;
+    slot.img.src = objUrl;
+    slot.loading.hidden = true;
+    if (onHeaders) onHeaders(resp.headers);
+  }).catch(function (err) {
+    if (err.name === "AbortError") return; /* superseded by a later request, not a failure */
+    slot.loading.hidden = true;
+    slot.error.hidden = false;
+    slot.error.textContent = "Error: " + err.message;
+  });
+}
+
+function fillSelect(select, values, keepIfPresent) {
+  var prior = keepIfPresent ? select.value : null;
+  select.innerHTML = "";
+  values.forEach(function (v) {
+    var opt = document.createElement("option");
+    opt.value = String(v);
+    opt.textContent = String(v);
+    select.appendChild(opt);
+  });
+  if (prior !== null && values.map(String).indexOf(prior) !== -1) select.value = prior;
+}
+
+/* manifest.kinds is the Correction-3 shape (per-artifact-kind frame lists);
+   the qc_bundle.py checked into this branch still returns only a flat
+   `frames` list (the 5-frame smoke-test shape). Both are read here so the
+   page populates against either, see "Spec gaps" in the implementer report. */
+function framesFor(kind, fallbackKind) {
+  if (manifest.kinds) {
+    if (manifest.kinds[kind]) return manifest.kinds[kind];
+    if (fallbackKind && manifest.kinds[fallbackKind]) return manifest.kinds[fallbackKind];
+  }
+  return manifest.frames || [];
+}
+
+/* ---------------- Panel 1: motion field ---------------- */
+
+var mfSlot = makeImageSlot("mf");
+
+function mfQuantity() { return $("mf-quantity").value; }
+
+function syncMfCmap() {
+  var cmapSel = $("mf-cmap");
+  var lo = $("mf-lo-pct"), hi = $("mf-hi-pct"), note = $("mf-pct-note");
+  if (mfQuantity() === "norm") {
+    cmapSel.disabled = false;
+    lo.disabled = false;
+    note.hidden = true;
+  } else {
+    cmapSel.disabled = true; /* diverging is forced for a signed quantity, see SPEC.md route table note */
+    /* A diverging scale must be symmetric about zero, and the server rejects asymmetric
+       percentiles with 400. Mirror lo from hi so the control cannot express the rejected
+       request at all, rather than letting the panel fail after the fact. */
+    lo.disabled = true;
+    lo.value = String(Math.round((100 - parseFloat(hi.value)) * 100) / 100);
+    note.hidden = false;
+  }
+}
+
+function motionUrl() {
+  var p = new URLSearchParams();
+  p.set("frame", $("mf-frame").value);
+  p.set("k", $("mf-k").value);
+  p.set("quantity", mfQuantity());
+  p.set("cmap", mfQuantity() === "norm" ? $("mf-cmap").value : "diverging");
+  p.set("lo_pct", $("mf-lo-pct").value);
+  p.set("hi_pct", $("mf-hi-pct").value);
+  p.set("base", $("mf-base").checked ? "mov" : "none");
+  p.set("alpha", $("mf-alpha").value);
+  p.set("mask", $("mf-mask").checked ? "1" : "0");
+  p.set("quiver", $("mf-quiver").checked ? "1" : "0");
+  if ($("mf-quiver").checked) p.set("stride", $("mf-stride").value);
+  return "/img/motion?" + p.toString();
+}
+
+function doRefreshMotion() { loadImage(mfSlot, motionUrl()); }
+var refreshMotionDebounced = debounce(doRefreshMotion, DEBOUNCE_MS);
+
+function setMotionFrameAndPlane(frame, k) {
+  var frameSel = $("mf-frame");
+  if (frameSel.querySelector('option[value="' + frame + '"]')) frameSel.value = String(frame);
+  $("mf-k").value = String(k);
+  $("mf-k-val").textContent = String(k);
+  doRefreshMotion();
+}
+
+$("mf-frame").addEventListener("change", doRefreshMotion);
+$("mf-quantity").addEventListener("change", function () { syncMfCmap(); doRefreshMotion(); });
+$("mf-cmap").addEventListener("change", doRefreshMotion);
+$("mf-lo-pct").addEventListener("change", doRefreshMotion);
+$("mf-hi-pct").addEventListener("change", function () { syncMfCmap(); doRefreshMotion(); });
+$("mf-base").addEventListener("change", doRefreshMotion);
+$("mf-mask").addEventListener("change", doRefreshMotion);
+$("mf-quiver").addEventListener("change", function () {
+  $("mf-stride").disabled = !$("mf-quiver").checked;
+  doRefreshMotion();
+});
+$("mf-stride").addEventListener("change", doRefreshMotion);
+$("mf-k").addEventListener("input", function () {
+  $("mf-k-val").textContent = $("mf-k").value;
+  refreshMotionDebounced();
+});
+$("mf-alpha").addEventListener("input", function () {
+  $("mf-alpha-val").textContent = $("mf-alpha").value;
+  refreshMotionDebounced();
+});
+
+/* ---------------- Panel 2: tiling montage ---------------- */
+
+var mtSlot = makeImageSlot("mt");
+
+function syncMtAxisFields() {
+  var isTime = $("mt-axis").value === "time";
+  $("mt-k-label").hidden = !isTime;
+  $("mt-frame-label").hidden = isTime;
+}
+
+function montageUrl() {
+  var p = new URLSearchParams();
+  var axis = $("mt-axis").value;
+  p.set("axis", axis);
+  p.set("quantity", $("mt-quantity").value);
+  if (axis === "time") p.set("k", $("mt-k").value);
+  else p.set("frame", $("mt-frame").value);
+  return "/img/montage?" + p.toString();
+}
+
+function doRefreshMontage() {
+  loadImage(mtSlot, montageUrl(), function (headers) {
+    var scale = parseFloat(headers.get("X-Tile-Scale"));
+    var banner = $("mt-scale-banner");
+    if (!isNaN(scale) && Math.abs(scale - 1.0) > 1e-9) {
+      banner.hidden = false;
+      banner.textContent = "Decimated montage: server applied a per-tile scale factor of " + scale.toFixed(4) +
+        " (X-Tile-Scale header) — tiles are NOT full resolution.";
+    } else {
+      banner.hidden = true;
+    }
+  });
+}
+var refreshMontageDebounced = debounce(doRefreshMontage, DEBOUNCE_MS);
+
+$("mt-axis").addEventListener("change", function () { syncMtAxisFields(); doRefreshMontage(); });
+$("mt-quantity").addEventListener("change", doRefreshMontage);
+$("mt-frame").addEventListener("change", doRefreshMontage);
+$("mt-k").addEventListener("input", refreshMontageDebounced);
+
+/* ---------------- Panel 3: reference-space projection ---------------- */
+
+var rsSlot = makeImageSlot("rs");
+
+function refspaceUrl() {
+  var p = new URLSearchParams();
+  var source = $("rs-source").value;
+  if (source === "precomputed") p.set("frame", $("rs-frame").value);
+  p.set("z", $("rs-z").value);
+  p.set("channel", $("rs-channel").value);
+  p.set("source", source);
+  p.set("overlay", $("rs-overlay").checked ? "1" : "0");
+  p.set("alpha", $("rs-alpha").value);
+  p.set("cmap", $("rs-cmap").value);
+  p.set("lo_pct", $("rs-lo-pct").value);
+  p.set("hi_pct", $("rs-hi-pct").value);
+  return "/img/refspace?" + p.toString();
+}
+
+function doRefreshRefspace() { loadImage(rsSlot, refspaceUrl()); }
+var refreshRefspaceDebounced = debounce(doRefreshRefspace, DEBOUNCE_MS);
+
+$("rs-frame").addEventListener("change", doRefreshRefspace);
+$("rs-channel").addEventListener("change", doRefreshRefspace);
+$("rs-cmap").addEventListener("change", doRefreshRefspace);
+$("rs-overlay").addEventListener("change", doRefreshRefspace);
+$("rs-lo-pct").addEventListener("change", doRefreshRefspace);
+$("rs-hi-pct").addEventListener("change", doRefreshRefspace);
+$("rs-source").addEventListener("change", doRefreshRefspace);
+$("rs-z").addEventListener("input", function () {
+  $("rs-z-val").textContent = $("rs-z").value;
+  refreshRefspaceDebounced();
+});
+$("rs-alpha").addEventListener("input", function () {
+  $("rs-alpha-val").textContent = $("rs-alpha").value;
+  refreshRefspaceDebounced();
+});
+
+function addJobAsSource(jobId) {
+  var sel = $("rs-source");
+  if (!sel.querySelector('option[value="' + jobId + '"]')) {
+    var opt = document.createElement("option");
+    opt.value = String(jobId);
+    opt.textContent = "job " + jobId;
+    sel.appendChild(opt);
+  }
+}
+
+async function refreshJobs() {
+  var jobs = await fetchJSON("/api/jobs");
+  var body = $("jobs-body");
+  body.innerHTML = "";
+  (Array.isArray(jobs) ? jobs : []).forEach(function (job) {
+    var id = job.job_id !== undefined ? job.job_id : job.id;
+    var tr = document.createElement("tr");
+    var bytes = job.bytes !== undefined ? job.bytes : (job.n_bytes !== undefined ? job.n_bytes : "");
+    tr.innerHTML = "<td>" + escapeHtml(id) + "</td><td>" + escapeHtml(job.field_frame) +
+      "</td><td>" + escapeHtml(job.image_frame) + "</td><td>" + escapeHtml(job.mode || "") +
+      "</td><td>" + escapeHtml(bytes) + "</td>";
+    var delTd = document.createElement("td");
+    var delBtn = document.createElement("button");
+    delBtn.className = "secondary";
+    delBtn.textContent = "free";
+    delBtn.addEventListener("click", function () { deleteJob(id); });
+    delTd.appendChild(delBtn);
+    tr.appendChild(delTd);
+    body.appendChild(tr);
+    addJobAsSource(id);
+  });
+}
+
+async function deleteJob(id) {
+  try {
+    await fetch("/api/jobs/" + encodeURIComponent(id), { method: "DELETE" });
+  } finally {
+    await refreshJobs();
+  }
+}
+
+async function submitReproject() {
+  var body = {
+    field_frame: Number($("rp-field-frame").value),
+    image_frame: Number($("rp-image-frame").value),
+    mode: $("rp-mode").value,
+    params: {},
+  };
+  if ($("rp-z-window").value !== "") body.params.z_window = Number($("rp-z-window").value);
+  if ($("rp-upsample").value !== "") body.params.upsample_factor = Number($("rp-upsample").value);
+  if ($("rp-splat-mode").value !== "") body.params.xy_splat_mode = $("rp-splat-mode").value;
+  if ($("rp-interp-order").value !== "") body.params.values_interp_order_mem = Number($("rp-interp-order").value);
+
+  var status = $("rp-status");
+  var submitBtn = $("rp-submit");
+  submitBtn.disabled = true;
+  status.textContent = "submitting…";
+  try {
+    var resp = await fetch("/api/reproject", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      var errBody = {};
+      try { errBody = await resp.json(); } catch (e) { /* non-JSON error body */ }
+      throw new Error(errBody.error || (resp.status + " " + resp.statusText));
+    }
+    var result = await resp.json();
+    status.textContent = "job " + result.job_id + " shape=" + JSON.stringify(result.shape) +
+      " elapsed_s=" + result.elapsed_s;
+    await refreshJobs();
+    if (body.mode === "refspace") {
+      addJobAsSource(result.job_id);
+      $("rs-source").value = String(result.job_id);
+      doRefreshRefspace();
+    } else {
+      status.textContent += " (mode=planes has no /img route in SPEC.md's route table — " +
+        "the job is held in memory only; see the Jobs table above.)";
+    }
+  } catch (err) {
+    status.textContent = "Error: " + err.message;
+  } finally {
+    submitBtn.disabled = false;
+  }
+}
+
+$("rp-submit").addEventListener("click", submitReproject);
+
+/* ---------------- Panel 4: metrics ---------------- */
+
+function columnIndex(columns, name) {
+  var i = columns.findIndex(function (c) { return c.toLowerCase() === name.toLowerCase(); });
+  return i;
+}
+
+function drawLine(canvas, xs, ys, label, color) {
+  var ctx = canvas.getContext("2d");
+  var w = canvas.width = canvas.clientWidth || 220;
+  var h = canvas.height = canvas.clientHeight || 90;
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = "10px monospace";
+  if (xs.length === 0) {
+    ctx.fillStyle = "#999";
+    ctx.fillText("no data for " + label, 6, h / 2);
+    return;
+  }
+  var xMin = Math.min.apply(null, xs), xMax = Math.max.apply(null, xs);
+  var yMin = Math.min.apply(null, ys), yMax = Math.max.apply(null, ys);
+  var pad = 20;
+  function sx(v) { return pad + (w - 2 * pad) * (xMax > xMin ? (v - xMin) / (xMax - xMin) : 0.5); }
+  function sy(v) { return h - pad + 6 - (h - 2 * pad) * (yMax > yMin ? (v - yMin) / (yMax - yMin) : 0.5); }
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  xs.forEach(function (x, i) {
+    var px = sx(x), py = sy(ys[i]);
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  });
+  ctx.stroke();
+  ctx.fillStyle = "#333";
+  ctx.fillText(label + " [" + yMin.toFixed(3) + ", " + yMax.toFixed(3) + "]", 4, 11);
+}
+
+function renderMetricLines(data) {
+  var table = data.errors_membrane;
+  if (!table) { $("metrics-error").textContent = "errors_membrane not present in /api/metrics response."; return; }
+  var cols = table.columns, rows = table.rows;
+  var frameIdx = columnIndex(cols, "frame");
+  var xs = rows.map(function (r, i) { return frameIdx >= 0 ? Number(r[frameIdx]) : i; });
+  [["MAE", "metric-mae", "#2b6cb0"], ["nMAE", "metric-nmae", "#2f855a"],
+   ["NCC", "metric-ncc", "#805ad5"], ["hole_frac", "metric-holefrac", "#c05621"]].forEach(function (spec) {
+    var idx = columnIndex(cols, spec[0]);
+    var ys = idx >= 0 ? rows.map(function (r) { return Number(r[idx]); }) : [];
+    drawLine($(spec[1]), idx >= 0 ? xs : [], ys, spec[0], spec[2]);
+  });
+}
+
+function heatColor(u) {
+  var r = Math.round(255 - u * 90), g = Math.round(255 - u * 210), b = Math.round(255 - u * 225);
+  return "rgb(" + r + "," + g + "," + b + ")";
+}
+
+function renderHoleHeatmap(data) {
+  var table = data.hole_summary;
+  if (!table) return;
+  var cols = table.columns, rows = table.rows;
+  var frameIdx = columnIndex(cols, "frame");
+  var kCols = [];
+  cols.forEach(function (c, i) {
+    var m = /^hole_frac_k(\d+)$/i.exec(c);
+    if (m) kCols.push({ i: i, k: parseInt(m[1], 10) });
+  });
+  kCols.sort(function (a, b) { return a.k - b.k; });
+  var nF = rows.length, nK = kCols.length;
+  if (nF === 0 || nK === 0) return;
+  var cellW = 18, cellH = Math.max(6, Math.min(18, Math.floor(300 / nF)));
+  var canvas = $("hole-heatmap");
+  canvas.width = cellW * nK;
+  canvas.height = cellH * nF;
+  var ctx = canvas.getContext("2d");
+  var maxV = 0;
+  rows.forEach(function (r) { kCols.forEach(function (o) { maxV = Math.max(maxV, Number(r[o.i]) || 0); }); });
+  rows.forEach(function (r, ri) {
+    kCols.forEach(function (o, ki) {
+      var v = Number(r[o.i]) || 0;
+      ctx.fillStyle = heatColor(maxV > 0 ? v / maxV : 0);
+      ctx.fillRect(ki * cellW, ri * cellH, cellW, cellH);
+    });
+  });
+  canvas.onclick = function (ev) {
+    var rect = canvas.getBoundingClientRect();
+    var x = (ev.clientX - rect.left) * (canvas.width / rect.width);
+    var y = (ev.clientY - rect.top) * (canvas.height / rect.height);
+    var ki = Math.max(0, Math.min(nK - 1, Math.floor(x / cellW)));
+    var ri = Math.max(0, Math.min(nF - 1, Math.floor(y / cellH)));
+    var frame = frameIdx >= 0 ? Number(rows[ri][frameIdx]) : ri;
+    var k = kCols[ki].k;
+    $("heatmap-click-target").textContent = "clicked frame=" + frame + " k=" + k + " → set on panel 1 (motion field)";
+    setMotionFrameAndPlane(frame, k);
+  };
+}
+
+function renderMaskSupport(data) {
+  var frac = data.mask_support_frac;
+  var el = $("mask-support-note");
+  if (!frac || Object.keys(frac).length === 0) {
+    el.textContent = "mask_support_frac not present in /api/metrics response — the fraction of voxels " +
+      "the MAE/nMAE/NCC/hole_frac figures above are computed over (mask_mov, measured near 0.48% of voxels, " +
+      "SPEC.md) is unknown here.";
+    return;
+  }
+  var parts = Object.keys(frac).map(function (f) { return "frame " + f + ": " + (frac[f] * 100).toFixed(3) + "%"; });
+  el.textContent = "mask_support_frac — the MAE/nMAE/NCC/hole_frac figures above are computed over mask_mov " +
+    "only, measured near 0.48% of voxels (SPEC.md), not the full volume: " + parts.join(", ");
+}
+
+async function loadMetrics() {
+  var data = await fetchJSON("/api/metrics");
+  metricsData = data;
+  renderMetricLines(data);
+  renderHoleHeatmap(data);
+  renderMaskSupport(data);
+}
+
+/* ---------------- Panel 5: alignment QC ---------------- */
+
+function renderAlignment() {
+  var fixedZ = manifest.fixed_target_z || [];
+  var K = fixedZ.length;
+  var ks = [];
+  var zInit = [];
+  for (var k = 0; k < K; k++) { ks.push(k); zInit.push(20 + 10 * k); }
+  var offset = fixedZ.map(function (v, i) { return v - zInit[i]; });
+  drawLine($("align-offset-canvas"), ks, offset, "fixed_target_z - z_init", "#c05621");
+  drawLine($("align-zinit-canvas"), ks, zInit, "z_init", "#2b6cb0");
+}
+
+/* ---------------- boot ---------------- */
+
+function applyManifest() {
+  $("manifest-line").textContent = "run_dir=" + manifest.run_dir +
+    " ref_shape_zyx=" + JSON.stringify(manifest.ref_shape_zyx) +
+    " mov_shape_zyx=" + JSON.stringify(manifest.mov_shape_zyx);
+
+  var kMax = (manifest.mov_shape_zyx && manifest.mov_shape_zyx[0]) ? manifest.mov_shape_zyx[0] - 1 : 19;
+  var zMax = (manifest.ref_shape_zyx && manifest.ref_shape_zyx[0]) ? manifest.ref_shape_zyx[0] - 1 : 219;
+  $("mf-k").max = String(kMax);
+  $("mt-k").max = String(kMax);
+  $("rs-z").max = String(zMax);
+
+  var motionFrames = framesFor("motion", "phase");
+  var movFrames = framesFor("mov", "raw_moving");
+  var refspaceFrames = framesFor("refspace", "motion");
+
+  fillSelect($("mf-frame"), motionFrames);
+  fillSelect($("mt-frame"), motionFrames);
+  fillSelect($("rs-frame"), refspaceFrames);
+  fillSelect($("rp-field-frame"), motionFrames);
+  fillSelect($("rp-image-frame"), movFrames);
+
+  syncMfCmap();
+  syncMtAxisFields();
+}
+
+async function boot() {
+  try {
+    manifest = await fetchJSON("/api/manifest");
+  } catch (err) {
+    $("manifest-line").textContent = "";
+    $("fatal-slot").innerHTML = '<div class="fatal">Could not load /api/manifest: ' + escapeHtml(err.message) + "</div>";
+    return;
+  }
+  applyManifest();
+  renderAlignment();
+  doRefreshMotion();
+  doRefreshMontage();
+  doRefreshRefspace();
+  try {
+    await loadMetrics();
+  } catch (err) {
+    $("metrics-error").textContent = "Error loading /api/metrics: " + err.message;
+  }
+  try {
+    await refreshJobs();
+  } catch (err) {
+    /* /api/jobs is a convenience list for the reprojection panel; its absence
+       at boot does not block the other four panels. */
+  }
+}
+
+boot();
+</script>
+</body>
+</html>
