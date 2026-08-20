@@ -1,0 +1,16 @@
+build/
+build-*/
+compile_commands.json
+.cache/
+imgui.ini
+window.ini
+ui_state.ini
+.wrdash/
+
+# The repo root ignores *.txt to keep run outputs out. The build files are the
+# one kind of .txt this tree needs tracked.
+!CMakeLists.txt
+
+# Machine-specific symlinks into the conda sysroot; see build_include/README.md.
+build_include/GL/
+build_include/KHR/
