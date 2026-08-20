@@ -15,6 +15,7 @@ set(WRDASH_RUN_100T "${WRDASH_RUN_ROOT}/f260517_0625_qc_4slice_100t_movie")
 if(EXISTS "${WRDASH_RUN_V4}" AND EXISTS "${WRDASH_RUN_100T}")
   add_executable(wrdash_tests
     test_main.cpp
+    test_project.cpp
     test_run.cpp
   )
   target_link_libraries(wrdash_tests PRIVATE wrdash_run doctest::doctest)

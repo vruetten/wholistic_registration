@@ -3,6 +3,7 @@
 # below it knows none of those words, and core/tests/check_no_domain_leak.sh
 # fails the build if one reaches it.
 add_library(wrdash_run STATIC
+  project.cpp
   run.cpp
   tiff_volume.cpp
   csv_table.cpp
