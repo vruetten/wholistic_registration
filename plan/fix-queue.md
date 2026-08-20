@@ -16,22 +16,9 @@ pre-fix copy of the file and deleted `canny_edge_map` / `Yunfeng_edge_map` from
 `preprocess.py`. CI run `31600233151`: `12 failed, 54 passed, 4 xfailed`, against
 `66 passed, 4 xfailed` on the parent (run `31593179106`).
 
-What that changes in this queue:
-
-| Entry | Was | Now |
-|---|---|---|
-| B-018 / PR [#19](https://github.com/vruetten/wholistic-registration/pull/19) | ✅ merged | **reverted on `main`**; issue [#12](https://github.com/vruetten/wholistic-registration/issues/12) reopened |
-| B-017/B-019/B-020 / PR [#32](https://github.com/vruetten/wholistic-registration/pull/32) | ✅ merged | **reverted on `main`**; issue [#31](https://github.com/vruetten/wholistic-registration/issues/31) reopened |
-| B-058 / PR [#24](https://github.com/vruetten/wholistic-registration/pull/24) | 🔀 PR open | target function `canny_edge_map` **deleted** — moot if the deletion stands |
-| B-115 / issue [#25](https://github.com/vruetten/wholistic-registration/issues/25) | 📋 issue-worthy | same function deleted — moot if the deletion stands |
-| B-117 / issue [#33](https://github.com/vruetten/wholistic-registration/issues/33) | 📋 issue-worthy | `Yunfeng_edge_map` **deleted** — moot if the deletion stands, but `test_b055_yunfeng_edge_map_runs` still calls it and fails |
-| B-089 / branch `fix/b089-neidiff-z-component` | not yet filed | **fixed by `8c52fbe`** (`neiDiff[...,2]`, identical to the branch); drop the branch |
-| B-063 / PR [#22](https://github.com/vruetten/wholistic-registration/pull/22), B-116 / issue [#26](https://github.com/vruetten/wholistic-registration/issues/26) | 🔵 decision | unaffected; `8c52fbe` rewrote the *scale estimation* in `structural_difference_map` but not the `maximum`/`minimum` line |
-
-The three edge-map items above are blocked on one question for cyf: **do the two
-deletions stand?** If yes, close #24, #25, #33 as moot and delete their tests. If no,
-restore both functions. Either way the current state — functions gone, tests and
-issues still describing them — is the one state that cannot be right.
+The legacy `canny_edge_map` and `Yunfeng_edge_map` deletions were confirmed by
+cyf. Their tests and active tracking entries are retired with this cleanup; the
+audit retains the historical record.
 
 New findings from the same commit (dangling calls to deleted functions, and four in
 the new code, one of them filed as B-118): [`../audit/cyf-2026-08-12-regression-audit.md`](../audit/cyf-2026-08-12-regression-audit.md).
@@ -55,34 +42,9 @@ the new code, one of them filed as B-118): [`../audit/cyf-2026-08-12-regression-
 | [#21](https://github.com/vruetten/wholistic_registration/pull/21) | B-049 mad_k | green CI — results-changing, cyf sign-off |
 | [#22](https://github.com/vruetten/wholistic_registration/pull/22) | B-063 min vs max | 🔵 proposal — Virginia's decision, pairs with [#26](https://github.com/vruetten/wholistic_registration/issues/26) |
 | [#23](https://github.com/vruetten/wholistic_registration/pull/23) | B-071 zRatio | green CI — f2013 ran 9× off; cluster validation advised |
-| [#24](https://github.com/vruetten/wholistic_registration/pull/24) | B-058 canny fold | green CI — spawned follow-up [#25](https://github.com/vruetten/wholistic_registration/issues/25) |
 
-Issues with no PR yet: [#25](https://github.com/vruetten/wholistic_registration/issues/25) (canny diagonal pairs — merge after #24), [#26](https://github.com/vruetten/wholistic_registration/issues/26) (silent scale-basis switch), [#33](https://github.com/vruetten/wholistic_registration/issues/33) (B-117 edge-map defaults inert).
+Issues with no PR yet: [#26](https://github.com/vruetten/wholistic_registration/issues/26) (silent scale-basis switch).
 
-### 📋 ISSUE-WORTHY · [#33](https://github.com/vruetten/wholistic_registration/issues/33) — B-117: `Yunfeng_edge_map` defaults detect only division-by-zero artifacts (preprocess.py:359) — *needs cyf sign-off*
-
-**What's wrong.** At the default `sigma=4, outcoef=3` the function returns an
-all-zero map for every smooth input tested. The one case where it fires
-(256×256 disk, r=80) produces 171 detections that are *all* `±inf` from
-dividing a float residue (~1e-10) by `std == 0`, located at radius 56–61 when
-the true edge is at 80. Max *finite* `|Norm|` anywhere is 0.775 against a
-threshold of 3, so nothing legitimate can ever fire.
-
-**Why it matters.** A caller gets either nothing, or a few spurious edges ~20 px
-off the real boundary — which reads as a weak detection rather than a failure.
-Not on a pipeline path today (no in-repo caller uses the defaults), hence 🟧.
-
-**Fix.** Clamp the variance (as `reliability_map` and B-061's
-`local_zscore_difference` already do — this is the third site with the same
-pattern) and add `where=std > 0` to the division, so a flat region yields 0
-rather than `inf`. The clamp alone leaves the defaults inert, so **picking a
-workable `outcoef` is cyf's call** and is deliberately not guessed at.
-
-**Found by** hardening the B-055 regression test, which had only asserted that
-the function runs. Pinned meanwhile as known-suspect behaviour in
-`test_b055_yunfeng_edge_map_runs`.
-
----
 
 ## 1 · Was "awaiting verdict" — now all have PRs
 
@@ -172,13 +134,6 @@ forward pass at `mid_end + 1` (keep the middle-block result), or make the
 middle block exclusive. Small, but changes which reference produced one output
 frame per run. Backward seam verified clean.
 
-### 🔀 PR OPEN · [#24](https://github.com/vruetten/wholistic_registration/pull/24) (issue [#15](https://github.com/vruetten/wholistic_registration/issues/15)) — B-058: canny edge-map suppresses against the wrong diagonal (preprocess.py:307)
-Non-maximum suppression folds the gradient angle with `abs()` instead of
-mod-180°, so angles in (−157.5°,−112.5°)∪(−67.5°,−22.5°) are compared against
-the perpendicular diagonal — measured ~15% differing edge pixels on curved
-edges (under-suppression: thicker/spurious edges). **Fix:** fold with
-`angle[angle<0] += 180`. Strict-xfail test pins it. **Impact:** edge maps
-change on diagonal/curved structure.
 
 ### 🔀 PR OPEN · [#21](https://github.com/vruetten/wholistic_registration/pull/21) (issue [#16](https://github.com/vruetten/wholistic_registration/issues/16)) — B-049: event detection's `mad_k` knob is inert on sparse traces (motion_correlation_pattern.py:5001) — *needs cyf sign-off*
 Class activation traces are mostly exact zeros, so median=0 and MAD=0: the
