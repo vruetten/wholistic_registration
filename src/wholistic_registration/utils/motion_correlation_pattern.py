@@ -46,7 +46,7 @@ except Exception:
     nx = None
 try:
     import cupy as cp
-    from cupyx.scipy import ndi as cupy_ndi
+    from cupyx.scipy import ndimage as cupy_ndi
     HAS_CUPY = True
 except Exception:
     cp = None
@@ -674,14 +674,14 @@ def _safe_corr(a, b, eps=1e-12):
         L = min(a.size, b.size)
         a = a[:L]
         b = b[:L]
+    a0 = a
+    b0 = b
     a = a - np.mean(a)
     b = b - np.mean(b)
     na = np.linalg.norm(a)
     nb = np.linalg.norm(b)
     if na < eps or nb < eps:
-        # fall back to cosine without demeaning
-        a0 = np.asarray(a, dtype=np.float32).reshape(-1)
-        b0 = np.asarray(b, dtype=np.float32).reshape(-1)
+        # fall back to cosine without demeaning (on the original inputs)
         return float(np.dot(a0, b0) / (np.linalg.norm(a0) * np.linalg.norm(b0) + eps))
     return float(np.dot(a, b) / (na * nb + eps))
 
@@ -824,6 +824,68 @@ def motions_obtain(motion, mask, patch_size, return_abs=False):
     return patch_delta.astype(np.float32), mask_patched.astype(bool)
 
 
+def _resolve_use_gpu(use_gpu, func_name):
+    """
+    Resolve a ``use_gpu`` argument to a bool.
+
+    ``"auto"`` follows CuPy availability. An explicit ``True`` on a machine
+    without a working CuPy import is an error here rather than an opaque
+    ``AttributeError: 'NoneType' object has no attribute 'asarray'`` further down.
+    """
+    if isinstance(use_gpu, str):
+        if use_gpu != "auto":
+            raise ValueError(
+                f"{func_name}: use_gpu must be True, False or 'auto', got {use_gpu!r}."
+            )
+        return HAS_CUPY
+
+    if bool(use_gpu) and not HAS_CUPY:
+        raise RuntimeError(
+            f"{func_name}: use_gpu=True was requested but CuPy is unavailable "
+            "(import of `cupy` / `cupyx.scipy.ndimage` failed). Install the GPU "
+            'extra (`pip install -e ".[gpu]"`) or pass use_gpu=False / use_gpu="auto".'
+        )
+    return bool(use_gpu)
+
+
+def _close_temporal_gaps(active, close_gap_frames, use_gpu):
+    """
+    Merge active runs separated by temporal gaps of at most ``close_gap_frames``.
+
+    Shared by the GPU and CPU paths of :func:`getMotionUnit` so both backends
+    produce identical active masks.
+
+    Two non-obvious details:
+
+    - a 1-D closing structure of length ``s`` bridges gaps of at most ``s - 1``
+      frames, so the structure has to be ``close_gap_frames + 1`` long;
+    - ``binary_closing`` treats outside-the-array as inactive, so runs touching
+      t=0 / t=T-1 get eroded. Replicating the edge frames before closing and
+      cropping afterwards leaves those runs intact.
+
+    Parameters
+    ----------
+    active : (T, X, Y) bool array (numpy or cupy, matching ``use_gpu``)
+    close_gap_frames : int or None
+        Gaps strictly wider than this are left open. <= 0 (or None) is a no-op.
+    """
+    if close_gap_frames is None:
+        return active
+    n = int(close_gap_frames)
+    if n <= 0:
+        return active
+
+    xp, xndi = (cp, cupy_ndi) if use_gpu else (np, ndi)
+
+    struct_len = n + 1
+    pad = struct_len
+    T = active.shape[0]
+    padded = xp.pad(active, ((pad, pad), (0, 0), (0, 0)), mode="edge")
+    structure = xp.ones((struct_len, 1, 1), dtype=bool)
+    closed = xndi.binary_closing(padded, structure=structure)
+    return closed[pad:pad + T]
+
+
 def estimate_rest_state_motion(
     motionMag_patched,
     window_size_t=21,
@@ -852,7 +914,7 @@ def estimate_rest_state_motion(
         when use_abs_dev=True, so abs_dev = |motionMag - median_local| can be
         compared against restMotion instead of raw motionMag).
     """
-    use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
+    use_gpu = _resolve_use_gpu(use_gpu, "estimate_rest_state_motion")
 
     motionMag_np = np.asarray(motionMag_patched, dtype=np.float32)
     T, X, Y = motionMag_np.shape
@@ -931,9 +993,18 @@ def getMotionUnit(
     ----------
     close_gap_frames : int
         If > 0, apply temporal binary closing to the active mask before
-        start/end detection. This merges nearby active intervals separated
-        by gaps <= close_gap_frames, dramatically reducing CPU loop time
-        when using noisy signals like cumulative displacement.
+        start/end detection, bridging gaps of at most close_gap_frames
+        frames. Dramatically reduces CPU loop time on noisy signals like
+        cumulative displacement. Applied identically on the GPU and CPU
+        paths, and activity touching t=0 / t=T-1 is preserved rather than
+        eroded. 0 (the default) is a strict no-op.
+
+        NOTE: this is the closing step's contract, not the function's.
+        The interval-extension step below independently merges intervals
+        separated by gaps of at most 2 * extend_radius, so the EFFECTIVE
+        end-to-end merge width is max(close_gap_frames, 2 * extend_radius).
+        At the default extend_radius=1, close_gap_frames of 1 or 2 therefore
+        make no difference to the emitted units.
     use_abs_dev : bool
         If True (default), the active condition is:
             |motionMag - median_local| > restMotion
@@ -951,7 +1022,7 @@ def getMotionUnit(
         Spatial window for median_local computation (only used when
         use_abs_dev=True and median_local is not provided).
     """
-    use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
+    use_gpu = _resolve_use_gpu(use_gpu, "getMotionUnit")
 
     motion_np = np.asarray(motion_patched, dtype=np.float32)
     motionMag_np = np.asarray(motionMag_patched, dtype=np.float32)
@@ -980,10 +1051,7 @@ def getMotionUnit(
             active = motionMag_gpu > rest_gpu  # (T, X, Y)
 
         # Merge nearby active gaps on GPU to reduce CPU loop iterations
-        if close_gap_frames is not None and close_gap_frames > 0:
-            import cupy as _cp
-            structure = _cp.ones((int(close_gap_frames) + 2, 1, 1), dtype=bool)
-            active = cupy_ndi.binary_closing(active, structure=structure)
+        active = _close_temporal_gaps(active, close_gap_frames, use_gpu=True)
 
         prev_active = cp.zeros_like(active)
         prev_active[1:] = active[:-1]
@@ -1089,6 +1157,8 @@ def getMotionUnit(
     else:
         active = motionMag_np > rest_np
 
+    active = _close_temporal_gaps(active, close_gap_frames, use_gpu=False)
+
     units_map = [[[] for _ in range(Y)] for _ in range(X)]
     active_mask = np.zeros((T, X, Y), dtype=bool)
 
@@ -1142,7 +1212,7 @@ def filterMotionUnits(
     """
     Remove isolated MotionUnits using local spatiotemporal active support.
     """
-    use_gpu = (HAS_CUPY if use_gpu == "auto" else bool(use_gpu))
+    use_gpu = _resolve_use_gpu(use_gpu, "filterMotionUnits")
 
     active_np = np.asarray(active_mask, dtype=np.float32)
 
@@ -1467,7 +1537,8 @@ def filter_episodes_artifacts(
         # ------------------------------------------------------------
         if max_global_corr is not None:
             gm = ep.global_motion
-            md = ep.motion_delta
+            # units must match global_motion: both are cumulative displacement
+            md = ep.motion_abs
 
             if gm is not None and md is not None:
                 gm = np.asarray(gm, dtype=np.float32)  # (T, 2)
@@ -2537,10 +2608,11 @@ def split_mode_to_regions(
     if B.ndim != 3 or B.shape[-1] != 2:
         raise ValueError(f"mode.response_field should be (X,Y,2), got {B.shape}")
 
-    vmax = float(np.max(A))
-    if vmax <= 0:
+    vmax = float(np.nanmax(A)) if A.size else 0.0
+    if not np.isfinite(vmax) or vmax <= 0:
         return []
 
+    # NaN pixels compare False and are excluded from the support automatically
     raw_support = A > (support_rel_thresh * vmax)
 
     if not np.any(raw_support):
@@ -3268,25 +3340,25 @@ def compute_region_distance_matrix_simple(
                                 D_b = _response_field_distance_on_overlap(
                                     regions[i], regions[j], sign2=sign_j)
 
-                        if not np.isfinite(D_h) or not np.isfinite(D_b):
-                            dist = incompatible_dist
-                            compatible = False
-                            reason = "invalid_distance"
-                        else:
-                            dist = omega * D_h + mu * D_b
-                            compatible = True
-                            reason = "ok"
+                            if not np.isfinite(D_h) or not np.isfinite(D_b):
+                                dist = incompatible_dist
+                                compatible = False
+                                reason = "invalid_distance"
+                            else:
+                                dist = omega * D_h + mu * D_b
+                                compatible = True
+                                reason = "ok"
 
-                        info = {
-                            "compatible": bool(compatible),
-                            "reason": reason,
-                            "iou": float(spatial_info["iou"]),
-                            "centroid_distance": float(spatial_info["centroid_distance"]),
-                            "D_h": float(D_h),
-                            "D_b": float(D_b),
-                            "distance": float(dist),
-                            "sign": float(sign_j),
-                        }
+                            info = {
+                                "compatible": bool(compatible),
+                                "reason": reason,
+                                "iou": float(spatial_info["iou"]),
+                                "centroid_distance": float(spatial_info["centroid_distance"]),
+                                "D_h": float(D_h),
+                                "D_b": float(D_b),
+                                "distance": float(dist),
+                                "sign": float(sign_j),
+                            }
 
             D[i, j] = dist
             D[j, i] = dist
@@ -4036,8 +4108,9 @@ def _auto_contrast(img):
 
 
 def _get_BH_from_episode(ep):
-    if not hasattr(ep, "mode_model") or ep.mode_model is None:
-        raise ValueError("episode.mode_model is missing.")
+    model = getattr(ep, "mode_model", None)
+    if not model or "B" not in model:
+        raise ValueError("episode.mode_model is missing or empty (episode not fitted).")
     B = np.asarray(ep.mode_model["B"], dtype=np.float32)  # (2N, K)
     H = np.asarray(ep.mode_model["H"], dtype=np.float32)  # (K, T)
     return B, H
@@ -4161,6 +4234,9 @@ def visualize_episode_sources_overview(
     order = order[:min(max_modes, K)]
 
     n = len(order)
+    if n == 0:
+        print("[visualize_episode_sources_overview] no modes to visualize (K=0)")
+        return diag
     ncols = 4
     nrows = int(np.ceil(n / ncols))
 
@@ -4439,7 +4515,7 @@ def visualize_episode_regions(
         ax.imshow(_auto_contrast(ref_img), cmap="gray", origin="upper")
     else:
         ax.imshow(np.asarray(episode.spatial_region).T, cmap="gray", origin="upper")
-    cmap = cm.get_cmap("tab20")
+    cmap = plt.get_cmap("tab20")
     for i, r in enumerate(regions[:max_regions]):
         A = np.asarray(r.response_strength, dtype=np.float32)
         vmax = float(np.max(A))
@@ -4509,6 +4585,9 @@ def compare_sources_to_observed_frames(
     order = order[:min(max_modes, K)]
 
     n = len(order)
+    if n == 0:
+        print("[compare_sources_to_observed_frames] no modes to visualize (K=0)")
+        return None
     fig, axes = plt.subplots(n, 3, figsize=(figsize_per_row[0], figsize_per_row[1] * n))
     if n == 1:
         axes = axes[None, :]
@@ -4564,7 +4643,8 @@ def summarize_temporal_basis_likeness(episodes):
     rows = []
 
     for ei, ep in enumerate(episodes):
-        if not hasattr(ep, "mode_model") or ep.mode_model is None:
+        model = getattr(ep, "mode_model", None)
+        if not model or "B" not in model:
             continue
 
         B, H = _get_BH_from_episode(ep)
