@@ -16,8 +16,10 @@ This document has been updated to reflect the V2 refactoring. See the **V2: Spar
 - **H constraint**: unit-sphere Riemannian gradient (`||H[k]||_2 = 1`) replaces post-hoc row normalization with scale absorption into B.
 - **Simplified post-processing**: a single hard-threshold step replaces the old merge → prune → refine pipeline.
 - **Backtracking line search**: replaces fixed-step gradient descent. B uses sufficient-decrease backtracking; H uses Armijo backtracking (c=1e-4).
+- **Current canonical velocity configuration**: V2 is applied to frame-to-frame velocity (`use_velocity=True`) with `Kmax=8`, `K_selection_method="svd"`, `svd_target_r2=0.90`, `lambda_sc=0.05`, `rho=1.0`, `kappa=4.0`, `support_rel_thresh=0.08`, and `max_iter=200`.
 
 ### Motion Unit Extraction
+- **Current canonical preprocessing**: registered displacement fields are averaged into non-overlapping 7 x 7 patches and median-filtered with a 1 x 3 x 3 x 1 window. Motion-unit detection uses frame-to-frame velocity, `use_abs_dev=True`, and a MAD threshold with `window_size_t=21`, `window_size_xy=3`. The runner does not pass `median_local` to `getMotionUnit`, so its internal local-median calculation uses API defaults (`median_window_t=21`, `median_window_xy=5`); record this for exact reproduction.
 - `estimate_rest_state_motion`: new **`return_median`** parameter — when True, also returns the local median motion for reuse in `getMotionUnit`.
 - `getMotionUnit`: new **`use_abs_dev`** mode (default `True`) — a patch is active when its **deviation from the local median baseline** exceeds the MAD threshold (`|motionMag - median_local| > restMotion`), instead of comparing raw magnitude against the threshold. New parameters: `median_local`, `median_window_t`, `median_window_xy`.
 
@@ -27,6 +29,7 @@ This document has been updated to reflect the V2 refactoring. See the **V2: Spar
 - **`getMotionRegionPattern()`** is now a backward-compatible wrapper that delegates to `getMotionPattern(unit_type="region")`.
 - `filter_regions_for_patterns` now handles both `MotionRegion` and `MotionMode` objects, auto-computing missing attributes (`strength`, `area_effective`, `duration`, `mean_response_vector`) from `response_strength` / `response_field` / `activation` as needed.
 - New helpers: `collect_modes_from_episodes`, `collect_units_from_episodes`, `_unit_centroid`, `_response_field_correlation_on_overlap`.
+- **Current canonical direct-mode configuration**: `getMotionPattern(..., unit_type="mode")` clusters modes directly, so no Stage 05 region cache is written. It uses `min_iou=0.08`, `omega=mu=0.5`, `b_distance="correlation"`, `spatial_rule="iou"`, complete linkage, `cluster_dist_thresh=0.45`, `compute_unified=True`, `unified_mask_mode="best_cc"`, `unified_sign_method="correlation"`, `min_pattern_members=2`, and `min_unified_area=50`. `n_members >= 5` is a downstream analysis/visualisation filter, not an extraction threshold. The separate threshold comparison changes only `cluster_dist_thresh` to 0.55 while reusing the same mode cache.
 
 ### File Organization
 - V2 code lives directly in `motion_correlation_pattern.py`. V1 code has been replaced in-place; there is no separate `motion_correlation_pattern_v2.py` file.
@@ -62,6 +65,8 @@ When `use_abs_dev=True`, the local median can be either precomputed via `estimat
 We couldn't analyze the  slow, long-timescale motions.
 
 ### Merged into motion episodes
+
+**Current canonical episode configuration:** `tolerant_time=1`, `min_total_area=30`, `expand_frames=1`, `min_cc_area=8`, and `global_motion_mode="median"`. After grouping, episodes are filtered with `max_fov_fraction=0.5`, `min_duration=3`, `max_global_corr=0.90`, `max_edge_fraction=0.80`, and `edge_width=3`.
 #### Assumption
 When numerous patches contain detected motion units at the same time point, it indicates that the organism is undergoing coordinated physiological activities associated with movement. Such activities may arise from the coordination of multiple distinct biological events. However, these fine-grained details are not considered in the current analysis; synchronous occurrence of these motion units implies that they originate from a single large-scale physiological event.
 #### Implementation details
@@ -516,6 +521,8 @@ Both spatial components (x, y) are zeroed together. Default: `support_rel_thresh
 A small grid search over V2 parameters is recommended rather than attempting to convert from V1 values.
 
 ## API Usage
+
+The examples below show generic API values. The current canonical velocity and direct-mode configuration is recorded in the V2 update summary above.
 
 ```python
 from wholistic_registration.utils.motion_correlation_pattern import (
