@@ -241,9 +241,10 @@ def zncc_2d(a, b, eps=1e-8):
     a = np.asarray(a, dtype=np.float32).ravel()
     b = np.asarray(b, dtype=np.float32).ravel()
     a_c, b_c = a - np.mean(a), b - np.mean(b)
-    numer = np.dot(a_c, b_c)
-    denom = np.sqrt(np.dot(a_c, a_c) * np.dot(b_c, b_c) + eps)
-    return float(numer / denom) if denom >= eps else np.nan
+    denom = np.sqrt(np.dot(a_c, a_c) * np.dot(b_c, b_c))
+    if denom < eps:
+        return np.nan
+    return float(np.dot(a_c, b_c) / denom)
 
 
 def symmetric_edge_distance_2d(a, b):
