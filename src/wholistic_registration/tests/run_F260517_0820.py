@@ -45,7 +45,11 @@ sys.path.insert(0, str(PKG_DIR))
 sys.path.insert(0, str(HERE))
 
 from utils import IO, calFlowCrossResolution, mask, preprocess as prep
-from utils.calFlowCrossResolution import project_coords_to_fixed_planes_gpu
+from utils.calFlowCrossResolution import (
+    apply_H_to_matrix_gpu,
+    generate_continuous_H_gpu,
+    project_coords_to_fixed_planes_gpu,
+)
 import f260517_helpers as fh
 
 # ---------------------------------------------------------------------------
@@ -383,6 +387,11 @@ def compute_sparse_metrics(mov_zyx, mapped_zyx, mask_mov_zyx=None):
 print("\n[5/7] Forward loop ...")
 print(f"      Ref update every {ref_update_every} frames (raw moving target)")
 
+# The sparse reference never changes, so its interpolator is built once here
+# rather than once per frame.
+H_sp = generate_continuous_H_gpu(
+    cp.asarray(ref_sparse_raw.transpose(2, 1, 0), dtype=cp.float32), zRatio=1)
+
 error_mem = []
 error_sparse = []
 hole_records = []
@@ -515,9 +524,7 @@ for i in range(0, T):
     mem_metrics = compute_frame_metrics(raw_mem_zyx, mem_mapped_zyx, mask_mov_zyx)
 
     # Sample sparse-cell reference at phase_new for mem_mapped comparison
-    from utils.calFlowCrossResolution import generate_continuous_H_gpu as genH, apply_H_to_matrix_gpu as applyH
-    H_sp = genH(cp.asarray(ref_sparse_raw.transpose(2, 1, 0), dtype=cp.float32), zRatio=1)
-    sparse_mapped_xyk = applyH(cp.asarray(phase_new, dtype=cp.float32), H_sp)
+    sparse_mapped_xyk = apply_H_to_matrix_gpu(cp.asarray(phase_new, dtype=cp.float32), H_sp)
     if hasattr(sparse_mapped_xyk, "get"): sparse_mapped_xyk = sparse_mapped_xyk.get()
     sparse_mapped_zyx = np.asarray(sparse_mapped_xyk, dtype=np.float32).transpose(2, 1, 0)
 
