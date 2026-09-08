@@ -278,9 +278,10 @@ def compute_frame_metrics(mov_zyx, mapped_zyx, mask_mov_zyx=None):
         if mask_mov_zyx is not None:
             valid = mask_mov_zyx[kk].astype(bool)
             if not np.any(valid): valid = np.ones_like(mm, dtype=bool)
+        # Mean over in-mask pixels only; dividing by the full plane size would
+        # scale MAE by the mask fraction and break cross-frame comparability.
         diff = np.abs(mm.astype(np.float32) - mp.astype(np.float32))
-        diff[~valid] = 0.0
-        mae = float(np.sum(diff) / mm.size)
+        mae = float(np.mean(diff[valid]))
         p1, p99 = np.percentile(mm[valid], [1, 99])
         dyn = max(p99 - p1, 1e-8)
         out["MAE"].append(mae); out["nMAE"].append(mae/dyn)
@@ -299,8 +300,7 @@ def compute_sparse_metrics(mov_zyx, mapped_zyx, mask_mov_zyx=None):
             valid = mask_mov_zyx[kk].astype(bool)
             if not np.any(valid): valid = np.ones_like(ms, dtype=bool)
         diff = np.abs(ms.astype(np.float32) - mp.astype(np.float32))
-        diff[~valid] = 0.0
-        mae = float(np.sum(diff) / ms.size)
+        mae = float(np.mean(diff[valid]))
         p1, p99 = np.percentile(ms[valid], [1, 99])
         dyn = max(p99 - p1, 1e-8)
         out["MAE"].append(mae); out["nMAE"].append(mae/dyn)
