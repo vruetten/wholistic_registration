@@ -35,7 +35,9 @@ from skimage.measure import regionprops
 # ---------------------------------------------------------------------------
 # GPU + paths
 # ---------------------------------------------------------------------------
-cp.cuda.Device(1).use()
+# Machine-specific settings; F260517_* environment variables override the
+# defaults so the script runs on other hosts without editing tracked code.
+cp.cuda.Device(int(os.environ.get("F260517_GPU_DEVICE", "1"))).use()
 
 HERE = Path(__file__).resolve().parent
 PKG_DIR = HERE.parent
@@ -45,16 +47,26 @@ sys.path.insert(0, str(PKG_DIR))
 sys.path.insert(0, str(HERE))
 
 from utils import IO, calFlowCrossResolution, mask, preprocess as prep
-from utils.calFlowCrossResolution import project_coords_to_fixed_planes_gpu
+from utils.calFlowCrossResolution import (
+    apply_H_to_matrix_gpu,
+    generate_continuous_H_gpu,
+    project_coords_to_fixed_planes_gpu,
+)
 import f260517_helpers as fh
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-F260517_mov_path = "/home/cyf/wbi/Virginia/raw_data/f260517/260517_exp_00001_TZCYX.ome.tiff"
-F260517_ref_path = "/home/cyf/wbi/Virginia/raw_data/f260517/260517_anat_00003_TZCYX.ome.tiff"
+F260517_mov_path = os.environ.get(
+    "F260517_MOV_PATH",
+    "/home/cyf/wbi/Virginia/raw_data/f260517/260517_exp_00001_TZCYX.ome.tiff")
+F260517_ref_path = os.environ.get(
+    "F260517_REF_PATH",
+    "/home/cyf/wbi/Virginia/raw_data/f260517/260517_anat_00003_TZCYX.ome.tiff")
 
-BASE_OUT = Path("/home/cyf/wbi/Virginia/registrated_data/f260517/f260517_0820")
+BASE_OUT = Path(os.environ.get(
+    "F260517_OUT_DIR",
+    "/home/cyf/wbi/Virginia/registrated_data/f260517/f260517_0820"))
 DIAGNOSTICS_DIR = BASE_OUT / "diagnostics"
 DIRS = {
     "raw_moving_mem":        BASE_OUT / "raw_moving_mem",
@@ -305,9 +317,10 @@ def zncc_2d(a, b, eps=1e-8):
     a = np.asarray(a, dtype=np.float32).ravel()
     b = np.asarray(b, dtype=np.float32).ravel()
     a_c, b_c = a - np.mean(a), b - np.mean(b)
-    numer = np.dot(a_c, b_c)
-    denom = np.sqrt(np.dot(a_c, a_c) * np.dot(b_c, b_c) + eps)
-    return float(numer / denom) if denom >= eps else np.nan
+    denom = np.sqrt(np.dot(a_c, a_c) * np.dot(b_c, b_c))
+    if denom < eps:
+        return np.nan
+    return float(np.dot(a_c, b_c) / denom)
 
 
 def symmetric_edge_distance_2d(a, b):
@@ -328,10 +341,10 @@ def sparse_centroid_metrics_2d(mov_p, mapped_p, thresh=3.0, radius=5.0):
         if not np.any(bm): return np.empty((0, 2), dtype=np.float32)
         lbl, _ = label_ndi(bm)
         return np.array([p.centroid for p in regionprops(lbl)], dtype=np.float32)
-    cm, cp = get_centroids(mov_p), get_centroids(mapped_p)
-    if len(cm) == 0 or len(cp) == 0: return np.nan, np.nan, np.nan
-    d_m2p = np.array([np.min(np.sqrt(np.sum((cp - c)**2, axis=1))) for c in cm])
-    d_p2m = np.array([np.min(np.sqrt(np.sum((cm - c)**2, axis=1))) for c in cp])
+    cent_mov, cent_map = get_centroids(mov_p), get_centroids(mapped_p)
+    if len(cent_mov) == 0 or len(cent_map) == 0: return np.nan, np.nan, np.nan
+    d_m2p = np.array([np.min(np.sqrt(np.sum((cent_map - c)**2, axis=1))) for c in cent_mov])
+    d_p2m = np.array([np.min(np.sqrt(np.sum((cent_mov - c)**2, axis=1))) for c in cent_map])
     return (float(0.5*(np.nanmean(d_m2p)+np.nanmean(d_p2m))),
             float(np.mean(d_m2p <= radius)), float(np.mean(d_p2m <= radius)))
 
@@ -346,9 +359,10 @@ def compute_frame_metrics(mov_zyx, mapped_zyx, mask_mov_zyx=None):
         if mask_mov_zyx is not None:
             valid = mask_mov_zyx[kk].astype(bool)
             if not np.any(valid): valid = np.ones_like(mm, dtype=bool)
+        # Mean over in-mask pixels only; dividing by the full plane size would
+        # scale MAE by the mask fraction and break cross-frame comparability.
         diff = np.abs(mm.astype(np.float32) - mp.astype(np.float32))
-        diff[~valid] = 0.0
-        mae = float(np.sum(diff) / mm.size)
+        mae = float(np.mean(diff[valid]))
         p1, p99 = np.percentile(mm[valid], [1, 99])
         dyn = max(p99 - p1, 1e-8)
         out["MAE"].append(mae); out["nMAE"].append(mae/dyn)
@@ -367,8 +381,7 @@ def compute_sparse_metrics(mov_zyx, mapped_zyx, mask_mov_zyx=None):
             valid = mask_mov_zyx[kk].astype(bool)
             if not np.any(valid): valid = np.ones_like(ms, dtype=bool)
         diff = np.abs(ms.astype(np.float32) - mp.astype(np.float32))
-        diff[~valid] = 0.0
-        mae = float(np.sum(diff) / ms.size)
+        mae = float(np.mean(diff[valid]))
         p1, p99 = np.percentile(ms[valid], [1, 99])
         dyn = max(p99 - p1, 1e-8)
         out["MAE"].append(mae); out["nMAE"].append(mae/dyn)
@@ -383,7 +396,11 @@ def compute_sparse_metrics(mov_zyx, mapped_zyx, mask_mov_zyx=None):
 print("\n[5/7] Forward loop ...")
 print(f"      Ref update every {ref_update_every} frames (raw moving target)")
 
-registered_cache = {}
+# The sparse reference never changes, so its interpolator is built once here
+# rather than once per frame.
+H_sp = generate_continuous_H_gpu(
+    cp.asarray(ref_sparse_raw.transpose(2, 1, 0), dtype=cp.float32), zRatio=1)
+
 error_mem = []
 error_sparse = []
 hole_records = []
@@ -421,8 +438,6 @@ for i in range(0, T):
     # Save the direct algorithm output, before any supersurface upsampling.
     phase_new_path = DIRS["phase_new"] / f"phase_new_f{i:06d}.npy"
     np.save(str(phase_new_path), phase_new, allow_pickle=False)
-
-    registered_cache[i] = mem_mapped_zyx
 
     # ---- Z-plane projection ----
     phase_for_proj = fh.upsample_phase_xy_for_supersurface(phase_new, upsample_factor=2)
@@ -518,9 +533,7 @@ for i in range(0, T):
     mem_metrics = compute_frame_metrics(raw_mem_zyx, mem_mapped_zyx, mask_mov_zyx)
 
     # Sample sparse-cell reference at phase_new for mem_mapped comparison
-    from utils.calFlowCrossResolution import generate_continuous_H_gpu as genH, apply_H_to_matrix_gpu as applyH
-    H_sp = genH(cp.asarray(ref_sparse_raw.transpose(2, 1, 0), dtype=cp.float32), zRatio=1)
-    sparse_mapped_xyk = applyH(cp.asarray(phase_new, dtype=cp.float32), H_sp)
+    sparse_mapped_xyk = apply_H_to_matrix_gpu(cp.asarray(phase_new, dtype=cp.float32), H_sp)
     if hasattr(sparse_mapped_xyk, "get"): sparse_mapped_xyk = sparse_mapped_xyk.get()
     sparse_mapped_zyx = np.asarray(sparse_mapped_xyk, dtype=np.float32).transpose(2, 1, 0)
 
@@ -556,7 +569,7 @@ for i in range(0, T):
     # ---- Ref update ----
     frames_since_ref_update += 1
     if frames_since_ref_update >= ref_update_every:
-        calib_frames = sorted(registered_cache.keys())[-5:]
+        calib_frames = list(range(max(0, i - 4), i + 1))
         ref_update_id += 1
 
         stacks = [mov_mem_all[fi].astype(np.float32, copy=False) for fi in calib_frames]
