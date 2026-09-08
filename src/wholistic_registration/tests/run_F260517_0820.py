@@ -383,7 +383,6 @@ def compute_sparse_metrics(mov_zyx, mapped_zyx, mask_mov_zyx=None):
 print("\n[5/7] Forward loop ...")
 print(f"      Ref update every {ref_update_every} frames (raw moving target)")
 
-registered_cache = {}
 error_mem = []
 error_sparse = []
 hole_records = []
@@ -421,8 +420,6 @@ for i in range(0, T):
     # Save the direct algorithm output, before any supersurface upsampling.
     phase_new_path = DIRS["phase_new"] / f"phase_new_f{i:06d}.npy"
     np.save(str(phase_new_path), phase_new, allow_pickle=False)
-
-    registered_cache[i] = mem_mapped_zyx
 
     # ---- Z-plane projection ----
     phase_for_proj = fh.upsample_phase_xy_for_supersurface(phase_new, upsample_factor=2)
@@ -556,7 +553,7 @@ for i in range(0, T):
     # ---- Ref update ----
     frames_since_ref_update += 1
     if frames_since_ref_update >= ref_update_every:
-        calib_frames = sorted(registered_cache.keys())[-5:]
+        calib_frames = list(range(max(0, i - 4), i + 1))
         ref_update_id += 1
 
         stacks = [mov_mem_all[fi].astype(np.float32, copy=False) for fi in calib_frames]
