@@ -264,10 +264,10 @@ def sparse_centroid_metrics_2d(mov_p, mapped_p, thresh=3.0, radius=5.0):
         if not np.any(bm): return np.empty((0, 2), dtype=np.float32)
         lbl, _ = label_ndi(bm)
         return np.array([p.centroid for p in regionprops(lbl)], dtype=np.float32)
-    cm, cp = get_centroids(mov_p), get_centroids(mapped_p)
-    if len(cm) == 0 or len(cp) == 0: return np.nan, np.nan, np.nan
-    d_m2p = np.array([np.min(np.sqrt(np.sum((cp - c)**2, axis=1))) for c in cm])
-    d_p2m = np.array([np.min(np.sqrt(np.sum((cm - c)**2, axis=1))) for c in cp])
+    cent_mov, cent_map = get_centroids(mov_p), get_centroids(mapped_p)
+    if len(cent_mov) == 0 or len(cent_map) == 0: return np.nan, np.nan, np.nan
+    d_m2p = np.array([np.min(np.sqrt(np.sum((cent_map - c)**2, axis=1))) for c in cent_mov])
+    d_p2m = np.array([np.min(np.sqrt(np.sum((cent_mov - c)**2, axis=1))) for c in cent_map])
     return (float(0.5*(np.nanmean(d_m2p)+np.nanmean(d_p2m))),
             float(np.mean(d_m2p <= radius)), float(np.mean(d_p2m <= radius)))
 
