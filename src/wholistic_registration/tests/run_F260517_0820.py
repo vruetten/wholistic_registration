@@ -35,7 +35,9 @@ from skimage.measure import regionprops
 # ---------------------------------------------------------------------------
 # GPU + paths
 # ---------------------------------------------------------------------------
-cp.cuda.Device(1).use()
+# Machine-specific settings; F260517_* environment variables override the
+# defaults so the script runs on other hosts without editing tracked code.
+cp.cuda.Device(int(os.environ.get("F260517_GPU_DEVICE", "1"))).use()
 
 HERE = Path(__file__).resolve().parent
 PKG_DIR = HERE.parent
@@ -55,10 +57,16 @@ import f260517_helpers as fh
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-F260517_mov_path = "/home/cyf/wbi/Virginia/raw_data/f260517/260517_exp_00001_TZCYX.ome.tiff"
-F260517_ref_path = "/home/cyf/wbi/Virginia/raw_data/f260517/260517_anat_00003_TZCYX.ome.tiff"
+F260517_mov_path = os.environ.get(
+    "F260517_MOV_PATH",
+    "/home/cyf/wbi/Virginia/raw_data/f260517/260517_exp_00001_TZCYX.ome.tiff")
+F260517_ref_path = os.environ.get(
+    "F260517_REF_PATH",
+    "/home/cyf/wbi/Virginia/raw_data/f260517/260517_anat_00003_TZCYX.ome.tiff")
 
-BASE_OUT = Path("/home/cyf/wbi/Virginia/registrated_data/f260517/f260517_0820")
+BASE_OUT = Path(os.environ.get(
+    "F260517_OUT_DIR",
+    "/home/cyf/wbi/Virginia/registrated_data/f260517/f260517_0820"))
 DIAGNOSTICS_DIR = BASE_OUT / "diagnostics"
 DIRS = {
     "raw_moving_mem":        BASE_OUT / "raw_moving_mem",
