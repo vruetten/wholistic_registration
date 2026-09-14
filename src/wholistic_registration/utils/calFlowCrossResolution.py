@@ -271,6 +271,19 @@ def compute_new_grid(grid, r, motion_shape):
 ####################################################################################################
 
 
+def _free_pool():
+    """Return cupy's cached (unreferenced) blocks to the device.
+
+    The continuous-reference sampler re-runs an order-3 spline prefilter on
+    every call, each leaving a full-volume temporary cached in the pool. Across
+    the many iterations / correction passes at the finest layer these caches add
+    up and can exhaust the device even though they are reclaimable. Calling this
+    at pass boundaries bounds the footprint. No-op when cupy is unavailable.
+    """
+    if hasattr(cp, "get_default_memory_pool"):
+        cp.get_default_memory_pool().free_all_blocks()
+
+
 def _softmax_stable(x, axis=-1, eps=1e-8):
     """
     Numerically stable softmax.
@@ -1141,6 +1154,189 @@ def project_coords_to_fixed_planes_gpu(
     return out
 
 
+def project_coords_inverse_gather_gpu(
+    coords_ref_xyk_xyz,
+    ref_volume,
+    target_z_planes,
+    values_xyk,
+    ref_volume_order="xyz",
+    z_window=1.5,
+    z_sigma=None,
+    z_weight_mode="gaussian",
+    downsample_xy=1,
+    fill_value=0.0,
+    fold_check=True,
+    return_numpy=False,
+    output_order="zyx",
+    eps=1e-6,
+):
+    """
+    Inverse-gather ("backward warp") projection onto fixed reference z planes.
+
+    This is the option (C) projector. Unlike the forward-scatter projectors
+    (``project_coords_to_fixed_planes_gpu`` = max splat,
+    ``project_coords_to_fixed_planes_weighted_gpu`` = weighted-average splat),
+    which push moving intensities into the reference grid, this routine builds
+    the *inverse* coordinate field and then samples the moving image once:
+
+        1. Invert the forward map by scattering the moving *indices*
+           (x, y, k), not the intensities, into reference planes. Because the
+           index field is smooth and slowly varying, the weighted-average
+           scatter densifies it cleanly; the accumulated weight doubles as the
+           coverage map.
+        2. Gather: bilinearly sample the moving volume at the recovered
+           continuous moving coordinates. The intensity therefore comes from a
+           single backward sample of real data, not an average of pushed
+           values, so it is sharper and intensity-faithful.
+        3. Mask: a reference pixel is valid only where step 1 accumulated
+           weight (i.e. some moving voxel maps there). Everything else is
+           genuine non-coverage and is set to ``fill_value``.
+
+    In smooth regions this matches the weighted-average splat closely (a
+    weighted mean of coordinates followed by one sample ~ a weighted mean of
+    samples). It differs where the moving image has high spatial frequency or
+    where the warp stretches: there the gather stays sharp and the scatter
+    blurs.
+
+    Parameters
+    ----------
+    coords_ref_xyk_xyz:
+        shape (Xmov, Ymov, K, 3), ``phase_new`` (moving grid -> reference xyz).
+    ref_volume:
+        Reference volume, used only to infer reference XY shape (and z-slab
+        target frame). Order set by ``ref_volume_order``.
+    target_z_planes:
+        Fixed reference z planes to observe.
+    values_xyk:
+        shape (Xmov, Ymov, K). The moving signal to gather. Required: unlike
+        the scatter projectors there is no "sample the reference" mode here,
+        because the whole point of (C) is to read the moving data.
+    z_window, z_sigma, z_weight_mode, downsample_xy:
+        Forwarded to the index-scatter step; identical semantics to
+        ``project_coords_to_fixed_planes_weighted_gpu``.
+    fold_check:
+        If True, moving voxels where the in-plane Jacobian determinant is
+        non-positive (the warp folds / is non-invertible) are excluded from the
+        inverse so they cannot corrupt the gather.
+    fill_value:
+        Value for reference pixels with no coverage.
+    output_order:
+        "zyx" -> (Nplanes, Yout, Xout); "zxy" -> (Nplanes, Xout, Yout).
+
+    Returns
+    -------
+    out:
+        Projected moving signal, shape per ``output_order``.
+    valid_mask:
+        Boolean array (same shape as ``out``). True where a moving voxel maps
+        to that reference pixel; False marks genuine non-coverage / folds.
+    """
+    if values_xyk is None:
+        raise ValueError(
+            "project_coords_inverse_gather_gpu requires values_xyk "
+            "(the moving signal to gather)."
+        )
+
+    coords = cp.asarray(coords_ref_xyk_xyz, dtype=cp.float32)
+    if coords.ndim != 4 or coords.shape[-1] != 3:
+        raise ValueError(
+            f"coords_ref_xyk_xyz should have shape (X,Y,K,3), got {coords.shape}"
+        )
+
+    values = cp.asarray(values_xyk, dtype=cp.float32)
+    if values.shape != coords.shape[:-1]:
+        raise ValueError(
+            f"values_xyk shape {values.shape} does not match coords shape "
+            f"{coords.shape[:-1]}"
+        )
+
+    Xmov, Ymov, K = values.shape
+
+    # ------------------------------------------------------------
+    # Moving index fields (the "addresses" we will invert).
+    # ------------------------------------------------------------
+    i_idx = cp.arange(Xmov, dtype=cp.float32)[:, None, None]
+    j_idx = cp.arange(Ymov, dtype=cp.float32)[None, :, None]
+    k_idx = cp.arange(K, dtype=cp.float32)[None, None, :]
+
+    idx_x = cp.broadcast_to(i_idx, values.shape).astype(cp.float32, copy=True)
+    idx_y = cp.broadcast_to(j_idx, values.shape).astype(cp.float32, copy=True)
+    idx_k = cp.broadcast_to(k_idx, values.shape).astype(cp.float32, copy=True)
+
+    # ------------------------------------------------------------
+    # Optional fold guard: drop source voxels whose in-plane map is
+    # non-invertible (Jacobian det <= 0) by marking them non-finite so the
+    # scatter kernel skips them.
+    # ------------------------------------------------------------
+    if fold_check:
+        for k in range(K):
+            xr = coords[:, :, k, 0]
+            yr = coords[:, :, k, 1]
+            dxr_di, dxr_dj = cp.gradient(xr)
+            dyr_di, dyr_dj = cp.gradient(yr)
+            det = dxr_di * dyr_dj - dxr_dj * dyr_di
+            folded = det <= 0
+            if bool(cp.any(folded)):
+                idx_x[:, :, k] = cp.where(folded, cp.nan, idx_x[:, :, k])
+                idx_y[:, :, k] = cp.where(folded, cp.nan, idx_y[:, :, k])
+                idx_k[:, :, k] = cp.where(folded, cp.nan, idx_k[:, :, k])
+
+    # ------------------------------------------------------------
+    # Step 1: invert the forward map by scattering the indices.
+    # The accumulated weight (from the x-index pass) is the coverage map.
+    # ------------------------------------------------------------
+    common = dict(
+        coords_ref_xyk_xyz=coords,
+        ref_volume=ref_volume,
+        target_z_planes=target_z_planes,
+        ref_volume_order=ref_volume_order,
+        z_window=z_window,
+        z_sigma=z_sigma,
+        z_weight_mode=z_weight_mode,
+        downsample_xy=downsample_xy,
+        fill_value=0.0,
+        return_numpy=False,
+        output_order="zxy",
+        eps=eps,
+    )
+
+    imap, weight = project_coords_to_fixed_planes_weighted_gpu(values_xyk=idx_x, **common)
+    jmap, _ = project_coords_to_fixed_planes_weighted_gpu(values_xyk=idx_y, **common)
+    kmap, _ = project_coords_to_fixed_planes_weighted_gpu(values_xyk=idx_k, **common)
+
+    valid = weight > eps
+
+    # ------------------------------------------------------------
+    # Step 2: gather the moving signal at the recovered coordinates.
+    # One bilinear backward sample of the real moving volume.
+    # ------------------------------------------------------------
+    gather_coords = cp.stack(
+        [imap.reshape(-1), jmap.reshape(-1), kmap.reshape(-1)], axis=0
+    )
+    sampled = cupy_ndimage.map_coordinates(
+        values, gather_coords, order=1, mode="nearest"
+    )
+    out = sampled.reshape(imap.shape)
+
+    # ------------------------------------------------------------
+    # Step 3: mask genuine non-coverage.
+    # ------------------------------------------------------------
+    out = cp.where(valid, out, cp.asarray(fill_value, dtype=cp.float32))
+
+    if output_order == "zyx":
+        out = out.transpose(0, 2, 1)
+        valid = valid.transpose(0, 2, 1)
+    elif output_order == "zxy":
+        pass
+    else:
+        raise ValueError("output_order should be 'zyx' or 'zxy'.")
+
+    if return_numpy:
+        return cp.asnumpy(out), cp.asnumpy(valid)
+
+    return out, valid
+
+
 def apply_H_to_matrix_gpu(A, H):
     """
     A: cp.ndarray, shape (X,Y,Z,3)
@@ -1914,6 +2110,53 @@ def compose_phase_from_motion(phase_current, motion_current, zRatio, zRatio_hr):
     return phase_new
 
 
+def imresize_xy(vol, out_x, out_y, method="bicubic", work_dtype=cp.float32, z_chunk=32):
+    """
+    Resize a 3D volume in X and Y only, keeping Z, processing Z in chunks.
+
+    This exists for memory reasons. ``imresize`` rescales all three axes at once
+    and, when downsampling, materialises an ``(out_x, P, Y, Z)`` gather buffer
+    spanning the *full* Y and Z (P grows with the downsample factor), which is
+    the dominant GPU peak that OOMs commodity cards on full-size reference
+    volumes.
+
+    Because this pipeline never rescales Z (moving Z = K, reference Z = Zref are
+    fixed across the pyramid), the Z pass of ``imresize`` is an identity cubic
+    resample. Resizing X/Y one Z-chunk at a time is therefore *exactly* equal to
+    the full 3D ``imresize`` (a given output plane depends only on the matching
+    input plane), but the gather buffer is bounded by ``z_chunk`` instead of Z.
+
+    Parameters
+    ----------
+    vol : cp.ndarray, shape (X, Y, Z)
+    out_x, out_y : int
+        Target X, Y sizes. Z is preserved.
+    z_chunk : int
+        Number of Z planes resized per iteration.
+
+    Returns
+    -------
+    cp.ndarray, shape (out_x, out_y, Z)
+    """
+    x_in, y_in, z_in = vol.shape
+    if (out_x, out_y) == (x_in, y_in):
+        return vol
+
+    out_dtype = vol.dtype if vol.dtype == cp.uint8 else work_dtype
+    out = cp.empty((out_x, out_y, z_in), dtype=out_dtype)
+
+    for z0 in range(0, z_in, int(z_chunk)):
+        z1 = min(z0 + int(z_chunk), z_in)
+        sub = vol[:, :, z0:z1]
+        out[:, :, z0:z1] = imresize(
+            sub, output_shape=(out_x, out_y, z1 - z0), method=method, work_dtype=work_dtype
+        )
+        if hasattr(cp, "get_default_memory_pool"):
+            cp.get_default_memory_pool().free_all_blocks()
+
+    return out
+
+
 def resample_exclude_mask(mask, output_shape, threshold=0.5):
     """
     Resize exclusion mask.
@@ -1934,7 +2177,16 @@ def resample_exclude_mask(mask, output_shape, threshold=0.5):
     mask_out : cp.ndarray, bool
         True = exclude, False = keep
     """
-    mask_rs = imresize(cp.asarray(mask, dtype=cp.float32), output_shape=output_shape)
+    mask = cp.asarray(mask, dtype=cp.float32)
+    out_x, out_y, out_z = output_shape
+    if (out_x, out_y, out_z) == tuple(mask.shape):
+        return mask > threshold
+    # Z is not rescaled in this pipeline; resize X/Y chunked over Z to bound the
+    # gather buffer (memory). Equivalent to a full imresize when out_z == in_z.
+    if out_z == mask.shape[2]:
+        mask_rs = imresize_xy(mask, out_x, out_y, work_dtype=cp.float32)
+    else:
+        mask_rs = imresize(mask, output_shape=output_shape, work_dtype=cp.float32)
     return mask_rs > threshold
 
 
@@ -2393,6 +2645,7 @@ def correct_wrong_regions_one_layer(
     # -----------------------------------------------------
     # Pass 2: robust rerun using corrected mask
     # -----------------------------------------------------
+    _free_pool()
     res1 = optimize_layer_cross_resolution(
         data_mov_layer=data_mov_layer,
         data_ref_layer=data_ref_layer,
@@ -2419,6 +2672,11 @@ def correct_wrong_regions_one_layer(
     # -----------------------------------------------------
     # Pass 3: refinement with original moving mask
     # -----------------------------------------------------
+    # The corrected-mask interpolant (and the full-volume masks behind it) are
+    # only needed for pass 2; drop them before the third pass to free a couple
+    # of full-reference-sized buffers at the finest layer.
+    del H_mask_ref_layer_corrected, corrected_mask_ref, trap_mask_ref
+    _free_pool()
     res2 = optimize_layer_cross_resolution(
         data_mov_layer=data_mov_layer,
         data_ref_layer=data_ref_layer,
@@ -2444,6 +2702,7 @@ def correct_wrong_regions_one_layer(
     # visualization.visualize_2d_image(res0["data_ref_sampled"].get(),title="first processed")
     # visualization.visualize_2d_image(res1["data_ref_sampled"].get(),title="after mask")
     # visualization.visualize_2d_image(res2["data_ref_sampled"].get(),title="removed mask")
+    _free_pool()
     current_error2 = res2["current_error"]
 
     if verbose:
@@ -2546,11 +2805,31 @@ def getMotion_v2(data_mov, data_ref, option, verbose=False):
         y_hr = int(SZ_HR[1] / (2**layer))
         z_hr = SZ_HR[2]
 
-        data_mov_layer = imresize(data_mov, output_shape=(x, y, z))
-        data_ref_layer = imresize(data_ref, output_shape=(x_hr, y_hr, z_hr))
+        # At the finest layer the resize target equals the source shape, so
+        # imresize is a (near) no-op cubic resample -- but it still allocates a
+        # large float64 temporary inside imresizevec, which is the dominant peak
+        # that OOMs commodity GPUs. Skip it there and otherwise drop back to
+        # float32 (imresize upcasts to float64) to halve the persistent layer
+        # arrays and the continuous-H interpolant built from them.
+        # Z is never rescaled (z == SZ[2], z_hr == SZ_HR[2]), so resize X/Y
+        # chunked over Z. This is exactly equivalent to a full imresize but
+        # bounds the multi-GB float64 gather buffer that otherwise OOMs the GPU
+        # when downsampling the full-size reference (see imresize_xy).
+        data_mov_layer = imresize_xy(data_mov, x, y, work_dtype=cp.float32)
+        data_ref_layer = imresize_xy(data_ref, x_hr, y_hr, work_dtype=cp.float32)
+
+        # Each imresize leaves a multi-GB gather buffer cached in the cupy pool.
+        # Return those cached blocks to the device between the (sequential)
+        # large resizes so the next one can allocate, instead of letting them
+        # accumulate to the full pyramid's worth of temporaries.
+        if hasattr(cp, "get_default_memory_pool"):
+            cp.get_default_memory_pool().free_all_blocks()
 
         mask_mov_layer = resample_exclude_mask(option["mask_mov"], output_shape=(x, y, z))
         mask_ref_layer = resample_exclude_mask(option["mask_ref"], output_shape=(x_hr, y_hr, z_hr))
+
+        if hasattr(cp, "get_default_memory_pool"):
+            cp.get_default_memory_pool().free_all_blocks()
 
         zRatio = zRatio_raw / (2**layer)
         zRatio_hr = zRatio_HR / (2**layer)
@@ -2641,6 +2920,15 @@ def getMotion_v2(data_mov, data_ref, option, verbose=False):
         motion_current = result["motion"]
         phase_new = result["phase_new"]
         data_ref_sampled = result["data_ref_sampled"]
+
+        # Release this layer's large temporaries (layer images, continuous
+        # interpolants, dense error maps held in `result`) before building the
+        # next, finer layer, so peak GPU memory tracks a single layer rather
+        # than accumulating across the whole pyramid.
+        del data_mov_layer, data_ref_layer, mask_mov_layer, mask_ref_layer
+        del H_ref_layer, H_mask_ref_layer, result
+        if hasattr(cp, "get_default_memory_pool"):
+            cp.get_default_memory_pool().free_all_blocks()
 
     # -----------------------------------------------------
     # Return as numpy
