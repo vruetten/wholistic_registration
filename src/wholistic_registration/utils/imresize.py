@@ -82,33 +82,34 @@ def contributions(in_length, out_length, scale, kernel, k_width):
     return weights, indices
 
 
-def imresizemex(inimg, weights, indices, dim):
+def imresizemex(inimg, weights, indices, dim, work_dtype=cp.float64):
     in_shape = inimg.shape
     w_shape = weights.shape
     out_shape = list(in_shape)
     out_shape[dim] = w_shape[0]
-    outimg = cp.zeros(out_shape)
+    outimg = cp.zeros(out_shape, dtype=work_dtype)
+    weights = weights.astype(work_dtype, copy=False)
 
     if dim == 0:
         for i_img in range(in_shape[1]):
             for i_w in range(w_shape[0]):
                 w = weights[i_w, :]
                 ind = indices[i_w, :]
-                im_slice = inimg[ind, i_img].astype(cp.float64)
+                im_slice = inimg[ind, i_img].astype(work_dtype)
                 outimg[i_w, i_img] = cp.sum(cp.multiply(cp.squeeze(im_slice, axis=0), w.T), axis=0)
     elif dim == 1:
         for i_img in range(in_shape[0]):
             for i_w in range(w_shape[0]):
                 w = weights[i_w, :]
                 ind = indices[i_w, :]
-                im_slice = inimg[i_img, ind].astype(cp.float64)
+                im_slice = inimg[i_img, ind].astype(work_dtype)
                 outimg[i_img, i_w] = cp.sum(cp.multiply(cp.squeeze(im_slice, axis=0), w.T), axis=0)
     elif dim == 2:
         for i_img in range(in_shape[0]):
             for i_w in range(w_shape[0]):
                 w = weights[i_w, :]
                 ind = indices[i_w, :]
-                im_slice = inimg[i_img, :, ind].astype(cp.float64)
+                im_slice = inimg[i_img, :, ind].astype(work_dtype)
                 outimg[i_img, i_w] = cp.sum(cp.multiply(cp.squeeze(im_slice, axis=2), w.T), axis=1)
 
     if inimg.dtype == cp.uint8:
@@ -118,17 +119,18 @@ def imresizemex(inimg, weights, indices, dim):
         return outimg
 
 
-def imresizevec(inimg, weights, indices, dim):
+def imresizevec(inimg, weights, indices, dim, work_dtype=cp.float64):
     wshape = weights.shape
+    weights = weights.astype(work_dtype, copy=False)
     if dim == 0:
         weights = weights.reshape((wshape[0], wshape[2], 1, 1))
-        outimg = cp.sum(weights * (inimg[indices].squeeze(axis=1)).astype(cp.float64), axis=1)
+        outimg = cp.sum(weights * (inimg[indices].squeeze(axis=1)).astype(work_dtype), axis=1)
     elif dim == 1:
         weights = weights.reshape((1, wshape[0], wshape[2], 1))
-        outimg = cp.sum(weights * (inimg[:, indices].squeeze(axis=2)).astype(cp.float64), axis=2)
+        outimg = cp.sum(weights * (inimg[:, indices].squeeze(axis=2)).astype(work_dtype), axis=2)
     elif dim == 2:
         weights = weights.reshape((1, 1, wshape[0], wshape[2]))
-        outimg = cp.sum(weights * (inimg[:, :, indices].squeeze(axis=3)).astype(cp.float64), axis=3)
+        outimg = cp.sum(weights * (inimg[:, :, indices].squeeze(axis=3)).astype(work_dtype), axis=3)
 
     if inimg.dtype == cp.uint8:
         outimg = cp.clip(outimg, 0, 255)
@@ -137,21 +139,31 @@ def imresizevec(inimg, weights, indices, dim):
         return outimg
 
 
-def resizeAlongDim(A, dim, weights, indices, mode="vec"):
+def resizeAlongDim(A, dim, weights, indices, mode="vec", work_dtype=cp.float64):
     if mode == "org":
-        out = imresizemex(A, weights, indices, dim)
+        out = imresizemex(A, weights, indices, dim, work_dtype=work_dtype)
     else:
-        out = imresizevec(A, weights, indices, dim)
+        out = imresizevec(A, weights, indices, dim, work_dtype=work_dtype)
     return out
 
 
-def imresize(I, scalar_scale=None, method="bicubic", output_shape=None, mode="vec"):
+def imresize(
+    I, scalar_scale=None, method="bicubic", output_shape=None, mode="vec", work_dtype=None
+):
     if method == "bicubic":
         kernel = cubic
     elif method == "bilinear":
         kernel = triangle
     else:
         raise ValueError("unidentified kernel method supplied")
+
+    # Accumulation/gather dtype. Default float64 preserves the original
+    # (MATLAB-matching) behaviour exactly for existing callers. Passing
+    # work_dtype=cp.float32 halves the large intermediate gather buffers, which
+    # is what lets the cross-resolution pipeline downsample full-size reference
+    # volumes without exhausting GPU memory.
+    if work_dtype is None:
+        work_dtype = cp.float64
 
     kernel_width = 4.0
     # Fill scale and output_size
@@ -184,7 +196,7 @@ def imresize(I, scalar_scale=None, method="bicubic", output_shape=None, mode="ve
 
     for k in range(3):
         dim = int(order[k])
-        B = resizeAlongDim(B, dim, weights[dim], indices[dim], mode)
+        B = resizeAlongDim(B, dim, weights[dim], indices[dim], mode, work_dtype=work_dtype)
 
     if flag2D:
         B = cp.squeeze(B, axis=2)
