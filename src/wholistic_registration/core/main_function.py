@@ -9,6 +9,22 @@ import toml
 from ..utils import IO, reference, registration
 
 
+def _output_xy_downsample_factors(config):
+    save_config = config.get("save_config", {})
+    factors = {
+        name: save_config.get(name, 1)
+        for name in (
+            "membrane_downsample_xy",
+            "calcium_downsample_xy",
+            "motion_downsample_xy",
+        )
+    }
+    for name, factor in factors.items():
+        if isinstance(factor, bool) or not isinstance(factor, (int, np.integer)) or factor < 1:
+            raise ValueError(f"save_config.{name} must be a positive integer")
+    return factors
+
+
 ####################################################################################################################
 ##  Define the parameters
 ##  haven't update the params of the reliable analysis.
@@ -45,6 +61,9 @@ def DefineParams(
     save_ref=True,
     save_motion=False,
     verbose=True,
+    membrane_downsample_xy=1,
+    calcium_downsample_xy=1,
+    motion_downsample_xy=1,
 ):
     """
     General parameters:
@@ -60,6 +79,9 @@ def DefineParams(
         Whether to save reference images. Default: True
     -save_motion
         Whether to save motion fields. Default: False
+    -membrane_downsample_xy, -calcium_downsample_xy, -motion_downsample_xy
+        Output-only XY block-mean factors; these do not change registration.
+        A value of 1 preserves full-resolution output.
     -verbose
         Whether to print detailed information during processing. Default: True
 
@@ -321,6 +343,9 @@ def DefineParams(
     # change the save config
     config["save_config"]["save_ref"] = save_ref
     config["save_config"]["save_motion"] = save_motion
+    config["save_config"]["membrane_downsample_xy"] = membrane_downsample_xy
+    config["save_config"]["calcium_downsample_xy"] = calcium_downsample_xy
+    config["save_config"]["motion_downsample_xy"] = motion_downsample_xy
 
     print("[INFO]Config created =====> Saving the config")
     # Create directory if it doesn't exist
@@ -605,6 +630,15 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
         out_ca = None
     save_ref = bool(config["save_config"]["save_ref"])
     save_motion = bool(config["save_config"]["save_motion"])
+    output_downsample = _output_xy_downsample_factors(config)
+    membrane_downsample_xy = output_downsample["membrane_downsample_xy"]
+    calcium_downsample_xy = output_downsample["calcium_downsample_xy"]
+    motion_downsample_xy = output_downsample["motion_downsample_xy"]
+    print(
+        "[INFO]Output-only XY downsampling factors: "
+        f"membrane={membrane_downsample_xy}, calcium={calcium_downsample_xy}, "
+        f"motion={motion_downsample_xy}"
+    )
 
     if save_ref:
         IO.reset_dir(out_ref)
@@ -769,16 +803,36 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
         # save immediately
         for k, fid in enumerate(batch_frames):
             IO.write_volume_as_ome_tiff(
-                mem_reg[k], out_mem, channel_index_map["membrane"], fid, configPath
+                IO.downsample_xy_mean(mem_reg[k], membrane_downsample_xy),
+                out_mem,
+                channel_index_map["membrane"],
+                fid,
+                configPath,
+                spacing_x=membrane_downsample_xy,
+                spacing_y=membrane_downsample_xy,
             )
             if dual_channel:
                 IO.write_volume_as_ome_tiff(
-                    ca_reg[k], out_ca, channel_index_map["calcium"], fid, configPath
+                    IO.downsample_xy_mean(ca_reg[k], calcium_downsample_xy),
+                    out_ca,
+                    channel_index_map["calcium"],
+                    fid,
+                    configPath,
+                    spacing_x=calcium_downsample_xy,
+                    spacing_y=calcium_downsample_xy,
                 )
 
             if save_motion:
                 with h5py.File(os.path.join(out_mot, f"motion_{fid:06d}.h5"), "w") as hf:
-                    hf.create_dataset("motion", data=motion[k], compression="gzip")
+                    hf.attrs["xy_downsample_factor"] = motion_downsample_xy
+                    hf.attrs["xy_pooling"] = "block_mean"
+                    hf.create_dataset(
+                        "motion",
+                        data=IO.downsample_xy_mean(
+                            motion[k], motion_downsample_xy, vector_field=True
+                        ),
+                        compression="gzip",
+                    )
 
         # ---------- maintain reference windows ----------
         # Top up on every batch (mirrors tail_mem below): batch 0 alone only ever
@@ -1552,6 +1606,11 @@ def process_directional_chunks(
     import h5py
     import numpy as np
 
+    output_downsample = _output_xy_downsample_factors(config)
+    membrane_downsample_xy = output_downsample["membrane_downsample_xy"]
+    calcium_downsample_xy = output_downsample["calcium_downsample_xy"]
+    motion_downsample_xy = output_downsample["motion_downsample_xy"]
+
     # Route through the package shim (numpy fallback when CuPy/CUDA is absent)
     # instead of importing cupy directly: this function runs in the SERIAL path
     # too, where a hard cupy import aborted CPU-only runs right after the middle
@@ -1666,15 +1725,35 @@ def process_directional_chunks(
             # Save batch results immediately
             for k, fid in enumerate(batch_frames):
                 IO.write_volume_as_ome_tiff(
-                    mem_reg[k], out_mem, channel_index_map["membrane"], fid, configPath
+                    IO.downsample_xy_mean(mem_reg[k], membrane_downsample_xy),
+                    out_mem,
+                    channel_index_map["membrane"],
+                    fid,
+                    configPath,
+                    spacing_x=membrane_downsample_xy,
+                    spacing_y=membrane_downsample_xy,
                 )
                 if dual_channel:
                     IO.write_volume_as_ome_tiff(
-                        ca_reg[k], out_ca, channel_index_map["calcium"], fid, configPath
+                        IO.downsample_xy_mean(ca_reg[k], calcium_downsample_xy),
+                        out_ca,
+                        channel_index_map["calcium"],
+                        fid,
+                        configPath,
+                        spacing_x=calcium_downsample_xy,
+                        spacing_y=calcium_downsample_xy,
                     )
                 if save_motion:
                     with h5py.File(os.path.join(out_mot, f"motion_{fid:06d}.h5"), "w") as hf:
-                        hf.create_dataset("motion", data=motion[k], compression="gzip")
+                        hf.attrs["xy_downsample_factor"] = motion_downsample_xy
+                        hf.attrs["xy_pooling"] = "block_mean"
+                        hf.create_dataset(
+                            "motion",
+                            data=IO.downsample_xy_mean(
+                                motion[k], motion_downsample_xy, vector_field=True
+                            ),
+                            compression="gzip",
+                        )
 
                 # -------------------------------
                 # Update rolling reference window

@@ -939,6 +939,46 @@ def readTiff(tiff_path):
     return images, desc
 
 
+def downsample_xy_mean(image, factor=1, vector_field=False):
+    """Block-average XY while preserving leading (Z) and optional vector axes.
+
+    Incomplete bottom/right blocks are cropped, matching the patch-generation
+    code used downstream.
+    """
+    if isinstance(factor, bool) or not isinstance(factor, (int, np.integer)) or factor < 1:
+        raise ValueError("factor must be a positive integer")
+    image = np.asarray(image)
+    if vector_field:
+        if image.ndim < 3:
+            raise ValueError("vector_field must have shape (..., Y, X, components)")
+        height, width = image.shape[-3:-1]
+    else:
+        if image.ndim < 2:
+            raise ValueError("image must have shape (..., Y, X)")
+        height, width = image.shape[-2:]
+    if factor == 1:
+        return image
+    pooled_height, pooled_width = height // factor, width // factor
+    if pooled_height == 0 or pooled_width == 0:
+        raise ValueError("factor must not exceed either XY dimension")
+    if vector_field:
+        cropped = image[..., : pooled_height * factor, : pooled_width * factor, :]
+        blocks = cropped.reshape(
+            *cropped.shape[:-3],
+            pooled_height,
+            factor,
+            pooled_width,
+            factor,
+            cropped.shape[-1],
+        )
+        return blocks.mean(axis=(-4, -2), dtype=np.float32)
+    cropped = image[..., : pooled_height * factor, : pooled_width * factor]
+    blocks = cropped.reshape(
+        *cropped.shape[:-2], pooled_height, factor, pooled_width, factor
+    )
+    return blocks.mean(axis=(-3, -1), dtype=np.float32)
+
+
 def write_volume_as_ome_tiff(
     volume, out_dir, ch_idx, frame_idx, configPath, spacing_x=1.0, spacing_y=1.0
 ):
