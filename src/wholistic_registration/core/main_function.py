@@ -7,7 +7,7 @@ import h5py
 import numpy as np
 import toml
 
-from ..utils import IO, reference, registration
+from ..utils import IO, reference, registration, registration_checkpoint
 from ..utils.runlog import log_progress
 
 
@@ -511,7 +511,7 @@ def DefineParams(
 
 ####################################################################################################################
 ##  main process
-def Registration_v3(configPath="./configs/config.toml", parallel=True):
+def Registration_v3(configPath="./configs/config.toml", parallel=True, resume=False):
     """
     Full 2D/3D registration pipeline for multi-channel volumetric time-lapse data.
 
@@ -522,6 +522,9 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
     parallel : bool, default=True
         Whether to run forward/backward registration in parallel using multiprocessing.
         If True, uses GPU 0 and GPU 1 (if available) for backward and forward processing.
+    resume : bool, default=False
+        Resume from the most recent durable batch/chunk checkpoint in the existing output root.
+        Input, configuration, and registration code must match the interrupted run.
 
     Returns
     -------
@@ -557,11 +560,62 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
     # basic params
     output_root = config["file_path"]["registrated_path"]
     movingFilePath = config["file_path"]["input_path"]
-    run_started = time.monotonic()
     log_path = os.path.join(output_root, "registration.log")
+    state_path = os.path.join(output_root, ".registration_state.json")
+    checkpoint_paths = {
+        "middle": os.path.join(output_root, ".registration_middle.npz"),
+        "backward": os.path.join(output_root, ".registration_backward.npz"),
+        "forward": os.path.join(output_root, ".registration_forward.npz"),
+    }
+    fingerprint = registration_checkpoint.registration_fingerprint(
+        configPath,
+        movingFilePath,
+        code_paths=[
+            __file__, registration.__file__, reference.__file__, IO.__file__,
+            registration_checkpoint.__file__,
+        ],
+    )
+    if resume:
+        if not os.path.isfile(state_path):
+            raise FileNotFoundError(
+                f"No registration state at {state_path}; only an existing interrupted run can be resumed."
+            )
+        state = registration_checkpoint.load_json_state(state_path)
+        if state.get("fingerprint") != fingerprint:
+            raise ValueError(
+                "Resume refused: input file, configuration, or registration code differs from the saved run."
+            )
+        elapsed_values = [
+            float(state.get("elapsed_seconds", 0.0)),
+            registration_checkpoint.max_logged_elapsed(log_path),
+        ]
+        elapsed_values.extend(
+            registration_checkpoint.checkpoint_elapsed_seconds(path)
+            for path in checkpoint_paths.values()
+        )
+        elapsed_offset = max(elapsed_values)
+        run_started = time.monotonic() - elapsed_offset
+        if state.get("status") == "complete":
+            log_progress(log_path, run_started, "resume_already_complete")
+            return
+        state["status"] = "running"
+        registration_checkpoint.save_json_state(state_path, state)
+    else:
+        for path in [state_path, *checkpoint_paths.values(), log_path]:
+            if os.path.isfile(path):
+                os.remove(path)
+        elapsed_offset = 0.0
+        run_started = time.monotonic()
+        state = {
+            "format_version": 1,
+            "status": "running",
+            "fingerprint": fingerprint,
+            "elapsed_seconds": 0.0,
+        }
+        registration_checkpoint.save_json_state(state_path, state)
     log_progress(
-        log_path, run_started, "registration_started",
-        input_path=movingFilePath, parallel_requested=bool(parallel),
+        log_path, run_started, "resume_started" if resume else "registration_started",
+        input_path=movingFilePath, parallel_requested=bool(parallel), resumed=bool(resume),
     )
 
     # get basic meta info
@@ -603,21 +657,34 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
     out_mem = os.path.join(output_root, "membrane")
     out_ref = os.path.join(output_root, "reference")
     out_mot = os.path.join(output_root, "motion")
-    IO.reset_dir(out_mem)
     if dual_channel:
         out_ca = os.path.join(output_root, "calcium")
         out_ca_ref = os.path.join(output_root, "calcium_reference")
-        IO.reset_dir(out_ca)
-        IO.reset_dir(out_ca_ref)
     else:
         out_ca = None
+        out_ca_ref = None
     save_ref = bool(config["save_config"]["save_ref"])
     save_motion = bool(config["save_config"]["save_motion"])
 
-    if save_ref:
-        IO.reset_dir(out_ref)
-    if save_motion:
-        IO.reset_dir(out_mot)
+    if resume:
+        required_dirs = [out_mem]
+        if dual_channel:
+            required_dirs.extend([out_ca, out_ca_ref])
+        if save_ref:
+            required_dirs.append(out_ref)
+        if save_motion:
+            required_dirs.append(out_mot)
+        for directory in required_dirs:
+            os.makedirs(directory, exist_ok=True)
+    else:
+        IO.reset_dir(out_mem)
+        if dual_channel:
+            IO.reset_dir(out_ca)
+            IO.reset_dir(out_ca_ref)
+        if save_ref:
+            IO.reset_dir(out_ref)
+        if save_motion:
+            IO.reset_dir(out_mot)
 
     # Channel index mapping for file naming
     # Using channel indices as they appear in the ND2 file
@@ -741,12 +808,92 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
     tail_mem = deque(maxlen=reference_chunk)
     tail_ca = deque(maxlen=reference_chunk)
     num_frames = len(frames_mid)
+    middle_frame_ids = [process_frames[j] for j in frames_mid]
+    middle_batches = [
+        middle_frame_ids[i : i + batch_size]
+        for i in range(0, num_frames, batch_size)
+    ]
+    backward_chunks = build_chunks(mid_start, 0, window_size_frames, "backward")
+    forward_chunks = build_chunks(
+        mid_end + 1, total_process_frames, window_size_frames, "forward"
+    )
+    middle_checkpoint = checkpoint_paths["middle"]
+    middle_metadata = {}
+    middle_arrays = {}
+    next_middle_batch = 0
+    motion_start = None
+    motion_end = None
+    backward_initial_reference = None
+    forward_initial_reference = None
+    backward_initial_reference_path = None
+    forward_initial_reference_path = None
 
-    for i in range(0, num_frames, batch_size):
-        batch_frames = [
-            process_frames[j]
-            for j in list(range(mid_start + i, mid_start + min(num_frames, i + batch_size)))
+    if resume and os.path.isfile(middle_checkpoint):
+        middle_metadata, middle_arrays = registration_checkpoint.load_checkpoint(
+            middle_checkpoint
+        )
+        next_middle_batch = int(middle_metadata.get("next_batch", 0))
+        if next_middle_batch < 0 or next_middle_batch > len(middle_batches):
+            raise ValueError("Middle checkpoint batch index is outside the configured run.")
+        completed_middle_ids = [
+            frame
+            for batch in middle_batches[:next_middle_batch]
+            for frame in batch
         ]
+        _check_checkpoint_frames(
+            completed_middle_ids, out_mem, out_ca, out_mot,
+            dual_channel, save_motion, "middle",
+        )
+        if next_middle_batch:
+            if "motion_start" not in middle_arrays or "motion_end" not in middle_arrays:
+                raise RuntimeError("Middle checkpoint is missing boundary motion fields.")
+            motion_start = middle_arrays["motion_start"]
+            motion_end = middle_arrays["motion_end"]
+        backward_initial_reference_path = middle_metadata.get(
+            "backward_reference_path"
+        )
+        forward_initial_reference_path = middle_metadata.get(
+            "forward_reference_path"
+        )
+        if "backward_reference" in middle_arrays:
+            backward_initial_reference = middle_arrays["backward_reference"]
+        if "forward_reference" in middle_arrays:
+            forward_initial_reference = middle_arrays["forward_reference"]
+
+        if backward_chunks and backward_initial_reference is None:
+            if not backward_initial_reference_path or not os.path.isfile(
+                backward_initial_reference_path
+            ):
+                backward_initial_reference_path = None
+        if forward_chunks and forward_initial_reference is None:
+            if not forward_initial_reference_path or not os.path.isfile(
+                forward_initial_reference_path
+            ):
+                forward_initial_reference_path = None
+
+        refs_ready = (
+            (
+                not backward_chunks
+                or backward_initial_reference is not None
+                or backward_initial_reference_path is not None
+            )
+            and (
+                not forward_chunks
+                or forward_initial_reference is not None
+                or forward_initial_reference_path is not None
+            )
+        )
+        if next_middle_batch and (
+            next_middle_batch < len(middle_batches) or not refs_ready
+        ):
+            _restore_middle_windows(
+                completed_middle_ids, reference_chunk, Dim, dual_channel,
+                out_mem, out_ca, head_mem, head_ca, tail_mem, tail_ca,
+            )
+
+    for batch_index, batch_frames in enumerate(middle_batches):
+        if batch_index < next_middle_batch:
+            continue
         mem_batch = IO.readND2Frame(
             movingFilePath,
             batch_frames,
@@ -777,10 +924,9 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
             mem_reg, ca_reg, _, frame_errors, motion = registration.wbi_registration_2d(
                 mem_batch, configPath, ref_img, frame=batch_frames, moving_Ca_image=ca_batch
             )
-        if i == 0:
+        if batch_index == 0:
             motion_start = motion[0].copy()
-        if i + batch_size >= num_frames:
-            motion_end = motion[-1].copy()
+        motion_end = motion[-1].copy()
         # save immediately
         for k, fid in enumerate(batch_frames):
             IO.write_volume_as_ome_tiff(
@@ -818,8 +964,64 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
             if dual_channel:
                 tail_ca.append(ca_reg[k])
 
+        middle_arrays = {}
+        if motion_start is not None:
+            middle_arrays["motion_start"] = motion_start
+        if motion_end is not None:
+            middle_arrays["motion_end"] = motion_end
+        registration_checkpoint.save_checkpoint(
+            middle_checkpoint,
+            {
+                "next_batch": batch_index + 1,
+                "elapsed_seconds": max(0.0, time.monotonic() - run_started),
+            },
+            **middle_arrays,
+        )
         del mem_batch, ca_batch, mem_reg, ca_reg, motion
 
+    if backward_chunks and backward_initial_reference is None and backward_initial_reference_path is None:
+        backward_initial_reference, _ = reference.compute_reference_from_block(
+            list(head_mem), config, list(head_ca)
+        )
+        if save_ref:
+            first = backward_chunks[0]
+            backward_initial_reference_path = IO.write_volume_as_ome_tiff(
+                backward_initial_reference, out_ref, "ref",
+                f"{process_frames[first[-1]]}~{process_frames[first[0]]}", configPath,
+            )
+    if forward_chunks and forward_initial_reference is None and forward_initial_reference_path is None:
+        forward_initial_reference, _ = reference.compute_reference_from_block(
+            list(tail_mem), config, list(tail_ca)
+        )
+        if save_ref:
+            first = forward_chunks[0]
+            forward_initial_reference_path = IO.write_volume_as_ome_tiff(
+                forward_initial_reference, out_ref, "ref",
+                f"{process_frames[first[0]]}~{process_frames[first[-1]]}", configPath,
+            )
+
+    middle_metadata = {
+        "next_batch": len(middle_batches),
+        "elapsed_seconds": max(0.0, time.monotonic() - run_started),
+    }
+    middle_arrays = {}
+    if motion_start is not None:
+        middle_arrays["motion_start"] = motion_start
+    if motion_end is not None:
+        middle_arrays["motion_end"] = motion_end
+    if backward_initial_reference_path is not None:
+        middle_metadata["backward_reference_path"] = backward_initial_reference_path
+    elif backward_initial_reference is not None:
+        middle_arrays["backward_reference"] = backward_initial_reference
+    if forward_initial_reference_path is not None:
+        middle_metadata["forward_reference_path"] = forward_initial_reference_path
+    elif forward_initial_reference is not None:
+        middle_arrays["forward_reference"] = forward_initial_reference
+    registration_checkpoint.save_checkpoint(
+        middle_checkpoint, middle_metadata, **middle_arrays
+    )
+    state["elapsed_seconds"] = max(0.0, time.monotonic() - run_started)
+    registration_checkpoint.save_json_state(state_path, state)
     log_progress(log_path, run_started, "middle_registration_complete")
 
     # ---------------------------
@@ -860,8 +1062,8 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
             frame_list=process_frames,
             start_frame=mid_start,  # Starting from the beginning of the middle chunk
             end_frame=0,  # Ending at the first frame of the dataset
-            init_mem_windows=head_mem,  # Initial membrane reference windows
-            init_ca_windows=head_ca,  # Initial calcium reference windows
+            init_mem_windows=[],  # Initial membrane reference windows
+            init_ca_windows=[],  # Initial calcium reference windows
             device_id=None,  # Use CPU (no GPU)
             configPath=configPath,  # Path to configuration file
             config=config,  # Configuration dictionary
@@ -880,6 +1082,10 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
             batch_size=batch_size,  # Batch size for processing
             reference_chunk=reference_chunk,  # Reference chunk size
             motion_init=motion_start,
+            initial_reference=backward_initial_reference if backward_initial_reference_path is None else None,
+            initial_reference_path=backward_initial_reference_path,
+            resume=resume,
+            checkpoint_path=checkpoint_paths["backward"],
             log_path=log_path,
             run_started=run_started,
         )
@@ -896,8 +1102,8 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
             # the better result.
             start_frame=mid_end + 1,  # Starting just after the end of the middle chunk
             end_frame=total_process_frames,  # Ending at the last frame of the dataset
-            init_mem_windows=tail_mem,  # Initial membrane reference windows
-            init_ca_windows=tail_ca,  # Initial calcium reference windows
+            init_mem_windows=[],  # Initial membrane reference windows
+            init_ca_windows=[],  # Initial calcium reference windows
             device_id=None,  # Use CPU (no GPU)
             configPath=configPath,
             config=config,
@@ -916,6 +1122,10 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
             batch_size=batch_size,  # Batch size for processing
             reference_chunk=reference_chunk,  # Reference chunk size
             motion_init=motion_end,
+            initial_reference=forward_initial_reference if forward_initial_reference_path is None else None,
+            initial_reference_path=forward_initial_reference_path,
+            resume=resume,
+            checkpoint_path=checkpoint_paths["forward"],
             log_path=log_path,
             run_started=run_started,
         )
@@ -933,8 +1143,8 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
                 frame_list=process_frames,
                 start_frame=mid_start,
                 end_frame=0,
-                init_mem_windows=head_mem,
-                init_ca_windows=head_ca,
+                init_mem_windows=[],
+                init_ca_windows=[],
                 device_id=0,  # Use GPU 0 for backward processing
                 configPath=configPath,
                 config=config,
@@ -953,6 +1163,10 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
                 batch_size=batch_size,  # Batch size for processing
                 reference_chunk=reference_chunk,  # Reference chunk size
                 motion_init=motion_start,
+                initial_reference=backward_initial_reference if backward_initial_reference_path is None else None,
+                initial_reference_path=backward_initial_reference_path,
+                resume=resume,
+                checkpoint_path=checkpoint_paths["backward"],
                 log_path=log_path,
                 run_started=run_started,
             ),
@@ -966,8 +1180,8 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
                 frame_list=process_frames,
                 start_frame=mid_end + 1,  # see the serial branch: frames_mid includes mid_end
                 end_frame=total_process_frames,
-                init_mem_windows=tail_mem,
-                init_ca_windows=tail_ca,
+                init_mem_windows=[],
+                init_ca_windows=[],
                 device_id=1,  # Use GPU 1 for forward processing
                 configPath=configPath,
                 config=config,
@@ -986,6 +1200,10 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
                 batch_size=batch_size,  # Batch size for processing
                 reference_chunk=reference_chunk,  # Reference chunk size
                 motion_init=motion_end,
+                initial_reference=forward_initial_reference if forward_initial_reference_path is None else None,
+                initial_reference_path=forward_initial_reference_path,
+                resume=resume,
+                checkpoint_path=checkpoint_paths["forward"],
                 log_path=log_path,
                 run_started=run_started,
             ),
@@ -995,7 +1213,21 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
         p_fwd.start()
         p_bwd.join()
         p_fwd.join()
+        if p_bwd.exitcode != 0 or p_fwd.exitcode != 0:
+            state["elapsed_seconds"] = max(0.0, time.monotonic() - run_started)
+            registration_checkpoint.save_json_state(state_path, state)
+            log_progress(
+                log_path, run_started, "directional_worker_failed",
+                backward_exitcode=p_bwd.exitcode, forward_exitcode=p_fwd.exitcode,
+            )
+            raise RuntimeError(
+                "A directional registration worker failed; rerun with resume=True to continue "
+                "from its last complete chunk."
+            )
 
+    state["status"] = "complete"
+    state["elapsed_seconds"] = max(0.0, time.monotonic() - run_started)
+    registration_checkpoint.save_json_state(state_path, state)
     log_progress(log_path, run_started, "registration_complete")
 
 
@@ -1510,6 +1742,57 @@ def build_chunks(start_frame, end_frame, window_size, direction):
     return chunks
 
 
+def _read_registered_frame(directory, channel, frame, dimension):
+    image = np.asarray(IO.read_reg_tiff(directory, int(frame), channel))
+    return np.squeeze(image)
+
+
+def _read_reference_image(path):
+    image, _ = IO.readTiff(path)
+    return np.squeeze(np.asarray(image))
+
+
+def _check_checkpoint_frames(
+    frame_ids, out_mem, out_ca, out_mot, dual_channel, save_motion, phase
+):
+    for frame in frame_ids:
+        paths = [os.path.join(out_mem, f"vol_ch1_{int(frame):06d}.tif")]
+        if dual_channel:
+            paths.append(os.path.join(out_ca, f"vol_ch0_{int(frame):06d}.tif"))
+        if save_motion:
+            paths.append(os.path.join(out_mot, f"motion_{int(frame):06d}.h5"))
+        for path in paths:
+            if not os.path.isfile(path) or os.path.getsize(path) == 0:
+                raise RuntimeError(
+                    f"{phase} checkpoint refers to missing/empty output for frame "
+                    f"{frame}: {path}. Restore the file or start a new output root."
+                )
+
+
+def _restore_middle_windows(
+    completed_frame_ids, reference_chunk, dimension, dual_channel,
+    out_mem, out_ca, head_mem, head_ca, tail_mem, tail_ca,
+):
+    if not completed_frame_ids:
+        return
+    head_ids = completed_frame_ids[:reference_chunk]
+    tail_ids = completed_frame_ids[-reference_chunk:] if reference_chunk else []
+    for frame in head_ids:
+        head_mem.append(_read_registered_frame(out_mem, "ch1", frame, dimension))
+        if dual_channel:
+            head_ca.append(_read_registered_frame(out_ca, "ch0", frame, dimension))
+    for frame in tail_ids:
+        tail_mem.append(_read_registered_frame(out_mem, "ch1", frame, dimension))
+        if dual_channel:
+            tail_ca.append(_read_registered_frame(out_ca, "ch0", frame, dimension))
+
+
+def _direction_reference_tag(direction, frame_list, frames):
+    if direction == "forward":
+        return f"{frame_list[frames[0]]}~{frame_list[frames[-1]]}"
+    return f"{frame_list[frames[-1]]}~{frame_list[frames[0]]}"
+
+
 def process_directional_chunks(
     direction,
     frame_list,
@@ -1537,6 +1820,10 @@ def process_directional_chunks(
     motion_init=None,
     log_path=None,
     run_started=None,
+    initial_reference=None,
+    initial_reference_path=None,
+    resume=False,
+    checkpoint_path=None,
 ):
     """
     Process frames in chunks in a specified direction (forward or backward) with batch processing and
@@ -1598,21 +1885,102 @@ def process_directional_chunks(
     if device_id is not None and CUPY_AVAILABLE:
         cp.cuda.Device(device_id).use()
 
-    # -------------------------------
-    # Initialize reference windows as deque
-    # -------------------------------
-    ref_windows_mem = deque(init_mem_windows, maxlen=reference_chunk)
-    ref_windows_ca = deque(init_ca_windows, maxlen=reference_chunk)
-
-    # Build frame chunks
+    # Build frame chunks and restore the active chunk's exact reference/motion seed.
     chunks = build_chunks(
         start_frame=start_frame,
         end_frame=end_frame,
         window_size=window_size_frames,
         direction=direction,
     )
+    ref_windows_mem = deque(init_mem_windows, maxlen=reference_chunk)
+    ref_windows_ca = deque(init_ca_windows, maxlen=reference_chunk)
+    next_chunk = 0
+    pending_reference = None
+    pending_reference_path = None
 
-    for frames in chunks:
+    if resume and checkpoint_path is None:
+        raise ValueError("checkpoint_path is required when resuming directional registration.")
+    if resume and checkpoint_path and os.path.isfile(checkpoint_path):
+        checkpoint_meta, checkpoint_arrays = registration_checkpoint.load_checkpoint(
+            checkpoint_path
+        )
+        next_chunk = int(checkpoint_meta.get("next_chunk", 0))
+        if next_chunk < 0 or next_chunk > len(chunks):
+            raise ValueError(f"{direction} checkpoint chunk index is outside the configured run.")
+        completed_ids = [
+            frame_list[index]
+            for chunk in chunks[:next_chunk]
+            for index in chunk
+        ]
+        _check_checkpoint_frames(
+            completed_ids, out_mem, out_ca, out_mot,
+            config["channels"]["dual_channel"], save_motion, direction,
+        )
+        if "motion_init" in checkpoint_arrays:
+            motion_init = checkpoint_arrays["motion_init"]
+        if next_chunk < len(chunks):
+            pending_reference_path = checkpoint_meta.get("reference_path")
+            if pending_reference_path:
+                pending_reference = _read_reference_image(pending_reference_path)
+            elif "reference" in checkpoint_arrays:
+                pending_reference = checkpoint_arrays["reference"]
+            else:
+                raise RuntimeError(f"{direction} checkpoint is missing its active reference.")
+        else:
+            log_progress(log_path, run_started, f"{direction}_complete")
+            return
+        ref_windows_mem.clear()
+        ref_windows_ca.clear()
+
+    if not chunks:
+        if checkpoint_path:
+            registration_checkpoint.save_checkpoint(
+                checkpoint_path,
+                {
+                    "next_chunk": 0,
+                    "complete": True,
+                    "elapsed_seconds": max(0.0, time.monotonic() - run_started),
+                },
+            )
+        log_progress(log_path, run_started, f"{direction}_complete")
+        return
+
+    if pending_reference is None:
+        if initial_reference_path:
+            pending_reference = _read_reference_image(initial_reference_path)
+            pending_reference_path = initial_reference_path
+        elif initial_reference is not None:
+            pending_reference = np.asarray(initial_reference)
+        else:
+            pending_reference, _ = reference.compute_reference_from_block(
+                list(ref_windows_mem), config, list(ref_windows_ca)
+            )
+        if save_ref and not pending_reference_path:
+            pending_reference_path = IO.write_volume_as_ome_tiff(
+                pending_reference,
+                out_ref,
+                "ref",
+                _direction_reference_tag(direction, frame_list, chunks[0]),
+                configPath,
+            )
+        if checkpoint_path:
+            current_meta = {
+                "next_chunk": 0,
+                "elapsed_seconds": max(0.0, time.monotonic() - run_started),
+            }
+            current_arrays = {}
+            if motion_init is not None:
+                current_arrays["motion_init"] = motion_init
+            if save_ref:
+                current_meta["reference_path"] = pending_reference_path
+            else:
+                current_arrays["reference"] = pending_reference
+            registration_checkpoint.save_checkpoint(
+                checkpoint_path, current_meta, **current_arrays
+            )
+
+    for chunk_index in range(next_chunk, len(chunks)):
+        frames = chunks[chunk_index]
         print(
             f"[{direction}] Processing chunk {frame_list[frames[0]]}~{frame_list[frames[-1]]} (n={len(frames)})"
         )
@@ -1624,31 +1992,28 @@ def process_directional_chunks(
         # -------------------------------
         # Compute reference once per chunk
         # -------------------------------
-        ref_img, indsort = reference.compute_reference_from_block(
-            list(ref_windows_mem), config, list(ref_windows_ca)
-        )
+        if pending_reference is None:
+            pending_reference, _ = reference.compute_reference_from_block(
+                list(ref_windows_mem), config, list(ref_windows_ca)
+            )
+            pending_reference_path = None
+        ref_img = pending_reference
+        reference_path = pending_reference_path
+        pending_reference = None
+        pending_reference_path = None
 
         # renew the windows:
         ref_windows_mem.clear()
         ref_windows_ca.clear()
 
-        if save_ref:
-            if direction == "forward":
-                IO.write_volume_as_ome_tiff(
-                    ref_img.copy(),
-                    out_ref,
-                    "ref",
-                    f"{frame_list[frames[0]]}~{frame_list[frames[-1]]}",
-                    configPath,
-                )
-            else:
-                IO.write_volume_as_ome_tiff(
-                    ref_img.copy(),
-                    out_ref,
-                    "ref",
-                    f"{frame_list[frames[-1]]}~{frame_list[frames[0]]}",
-                    configPath,
-                )
+        if save_ref and not reference_path:
+            reference_path = IO.write_volume_as_ome_tiff(
+                ref_img.copy(),
+                out_ref,
+                "ref",
+                _direction_reference_tag(direction, frame_list, frames),
+                configPath,
+            )
 
         # -------------------------------
         # Process in batches
@@ -1743,4 +2108,50 @@ def process_directional_chunks(
             if CUPY_AVAILABLE:
                 cp.get_default_memory_pool().free_all_blocks()
 
+        if chunk_index + 1 < len(chunks):
+            next_frames = chunks[chunk_index + 1]
+            next_reference, _ = reference.compute_reference_from_block(
+                list(ref_windows_mem), config, list(ref_windows_ca)
+            )
+            next_reference_path = None
+            if save_ref:
+                next_reference_path = IO.write_volume_as_ome_tiff(
+                    next_reference.copy(),
+                    out_ref,
+                    "ref",
+                    _direction_reference_tag(direction, frame_list, next_frames),
+                    configPath,
+                )
+            next_meta = {
+                "next_chunk": chunk_index + 1,
+                "elapsed_seconds": max(0.0, time.monotonic() - run_started),
+            }
+            next_arrays = {}
+            if motion_init is not None:
+                next_arrays["motion_init"] = motion_init
+            if save_ref:
+                next_meta["reference_path"] = next_reference_path
+            else:
+                next_arrays["reference"] = next_reference
+            registration_checkpoint.save_checkpoint(
+                checkpoint_path, next_meta, **next_arrays
+            )
+            pending_reference = next_reference
+            pending_reference_path = next_reference_path
+        else:
+            final_meta = {
+                "next_chunk": chunk_index + 1,
+                "complete": True,
+                "elapsed_seconds": max(0.0, time.monotonic() - run_started),
+            }
+            final_arrays = {}
+            if motion_init is not None:
+                final_arrays["motion_init"] = motion_init
+            if checkpoint_path:
+                registration_checkpoint.save_checkpoint(
+                    checkpoint_path, final_meta, **final_arrays
+                )
+
     print(f"[{direction}] Processing complete.")
+    if log_path is not None and run_started is not None:
+        log_progress(log_path, run_started, f"{direction}_complete")
