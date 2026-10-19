@@ -1,12 +1,14 @@
 import multiprocessing as mp
 import os
 import shutil
+import time
 
 import h5py
 import numpy as np
 import toml
 
 from ..utils import IO, reference, registration
+from ..utils.runlog import log_progress
 
 
 ####################################################################################################################
@@ -555,6 +557,12 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
     # basic params
     output_root = config["file_path"]["registrated_path"]
     movingFilePath = config["file_path"]["input_path"]
+    run_started = time.monotonic()
+    log_path = os.path.join(output_root, "registration.log")
+    log_progress(
+        log_path, run_started, "registration_started",
+        input_path=movingFilePath, parallel_requested=bool(parallel),
+    )
 
     # get basic meta info
     Dim = config["MetaData"]["Dim"]
@@ -620,6 +628,7 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
     # Step A: Process the middle chunk to build initial reference
     # ---------------------------
     print("[INFO]Processing middle chunk to build initial reference...")
+    log_progress(log_path, run_started, "middle_reference_started")
     batch_size = config["processing"][
         "batch_size"
     ]  # Frames per reference update and process frames to save memory
@@ -686,6 +695,11 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
     ref_img, indsort = reference.compute_reference_from_block(
         mem_mid_downsample, config, ca_mid_downsample
     )
+    log_progress(
+        log_path, run_started, "middle_reference_ready",
+        first_frame=int(process_frames[frames_mid[0]]),
+        last_frame=int(process_frames[frames_mid[-1]]),
+    )
     IO.write_volume_as_ome_tiff(
         ref_img,
         out_ref,
@@ -707,6 +721,7 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
 
     # Register the middle block using either 2D or 3D registration based on dataset dimension
     print(f"[INFO]Registering middle block...(every {batch_size} frames as a batch)")
+    log_progress(log_path, run_started, "middle_registration_started")
 
     # storage the head and tail of the middle block, we will use them when we process forward and backward
     from collections import deque
@@ -755,11 +770,11 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
         else:
             ca_batch = None
         if Dim == 3 and len(downsampleZ) > 1:
-            mem_reg, ca_reg, _, _, motion = registration.wbi_registration_3d(
+            mem_reg, ca_reg, _, frame_errors, motion = registration.wbi_registration_3d(
                 mem_batch, configPath, ref_img, frame=batch_frames, moving_Ca_image=ca_batch
             )
         else:
-            mem_reg, ca_reg, _, _, motion = registration.wbi_registration_2d(
+            mem_reg, ca_reg, _, frame_errors, motion = registration.wbi_registration_2d(
                 mem_batch, configPath, ref_img, frame=batch_frames, moving_Ca_image=ca_batch
             )
         if i == 0:
@@ -779,6 +794,12 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
             if save_motion:
                 with h5py.File(os.path.join(out_mot, f"motion_{fid:06d}.h5"), "w") as hf:
                     hf.create_dataset("motion", data=motion[k], compression="gzip")
+            log_progress(
+                log_path, run_started, "middle_frame_complete",
+                frame=int(fid),
+                initial_mse=float(frame_errors[k]["initial_error"]),
+                loss_mse=float(frame_errors[k]["eventual_error"]),
+            )
 
         # ---------- maintain reference windows ----------
         # Top up on every batch (mirrors tail_mem below): batch 0 alone only ever
@@ -798,6 +819,8 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
                 tail_ca.append(ca_reg[k])
 
         del mem_batch, ca_batch, mem_reg, ca_reg, motion
+
+    log_progress(log_path, run_started, "middle_registration_complete")
 
     # ---------------------------
     # Step B & C: Process forward and backward from the middle chunk
@@ -827,6 +850,7 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
     # Process in serial or parallel mode
     # =========================
     if not parallel or num_gpus < 2:
+        log_progress(log_path, run_started, "directional_registration_started", mode="serial")
         # Serial processing: process backward direction first, then forward direction
         print("[INFO]Running in serial mode...")
 
@@ -856,6 +880,8 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
             batch_size=batch_size,  # Batch size for processing
             reference_chunk=reference_chunk,  # Reference chunk size
             motion_init=motion_start,
+            log_path=log_path,
+            run_started=run_started,
         )
 
         # Process forward from middle chunk to end (frames mid_end+1 to total_frames)
@@ -890,9 +916,12 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
             batch_size=batch_size,  # Batch size for processing
             reference_chunk=reference_chunk,  # Reference chunk size
             motion_init=motion_end,
+            log_path=log_path,
+            run_started=run_started,
         )
 
     else:
+        log_progress(log_path, run_started, "directional_registration_started", mode="parallel")
         # Parallel processing: process both directions simultaneously
         print("[INFO]Running in parallel mode...")
 
@@ -924,6 +953,8 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
                 batch_size=batch_size,  # Batch size for processing
                 reference_chunk=reference_chunk,  # Reference chunk size
                 motion_init=motion_start,
+                log_path=log_path,
+                run_started=run_started,
             ),
         )
 
@@ -955,6 +986,8 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
                 batch_size=batch_size,  # Batch size for processing
                 reference_chunk=reference_chunk,  # Reference chunk size
                 motion_init=motion_end,
+                log_path=log_path,
+                run_started=run_started,
             ),
         )
 
@@ -962,6 +995,8 @@ def Registration_v3(configPath="./configs/config.toml", parallel=True):
         p_fwd.start()
         p_bwd.join()
         p_fwd.join()
+
+    log_progress(log_path, run_started, "registration_complete")
 
 
 def ReliableAnalysis(
@@ -1500,6 +1535,8 @@ def process_directional_chunks(
     downsampleXY,
     batch_size=50,
     motion_init=None,
+    log_path=None,
+    run_started=None,
 ):
     """
     Process frames in chunks in a specified direction (forward or backward) with batch processing and
@@ -1579,6 +1616,11 @@ def process_directional_chunks(
         print(
             f"[{direction}] Processing chunk {frame_list[frames[0]]}~{frame_list[frames[-1]]} (n={len(frames)})"
         )
+        if log_path is not None and run_started is not None:
+            log_progress(
+                log_path, run_started, f"{direction}_chunk_started",
+                first_frame=int(frame_list[frames[0]]), last_frame=int(frame_list[frames[-1]]),
+            )
         # -------------------------------
         # Compute reference once per chunk
         # -------------------------------
@@ -1643,7 +1685,7 @@ def process_directional_chunks(
                 ca_batch = None
             # Registration
             if Dim == 3 and len(downsampleZ) > 1:
-                mem_reg, ca_reg, _, _, motion = registration.wbi_registration_3d(
+                mem_reg, ca_reg, _, frame_errors, motion = registration.wbi_registration_3d(
                     mem_batch,
                     configPath,
                     ref_img,
@@ -1653,7 +1695,7 @@ def process_directional_chunks(
                     moving_Ca_image=ca_batch,
                 )
             else:
-                mem_reg, ca_reg, _, _, motion = registration.wbi_registration_2d(
+                mem_reg, ca_reg, _, frame_errors, motion = registration.wbi_registration_2d(
                     mem_batch,
                     configPath,
                     ref_img,
@@ -1675,6 +1717,13 @@ def process_directional_chunks(
                 if save_motion:
                     with h5py.File(os.path.join(out_mot, f"motion_{fid:06d}.h5"), "w") as hf:
                         hf.create_dataset("motion", data=motion[k], compression="gzip")
+                if log_path is not None and run_started is not None:
+                    log_progress(
+                        log_path, run_started, f"{direction}_frame_complete",
+                        frame=int(fid),
+                        initial_mse=float(frame_errors[k]["initial_error"]),
+                        loss_mse=float(frame_errors[k]["eventual_error"]),
+                    )
 
                 # -------------------------------
                 # Update rolling reference window
