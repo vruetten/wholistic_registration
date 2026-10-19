@@ -66,3 +66,6 @@ batch_size = 100
 [save_config]
 save_ref = true
 save_motion = false
+membrane_downsample_xy = 1
+calcium_downsample_xy = 1
+motion_downsample_xy = 1
